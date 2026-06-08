@@ -30,10 +30,24 @@ Pre-built apps you can run right now:
 
 | Platform | Build | Notes |
 |---|---|---|
-| **macOS** | `NOOP.app` (see [Releases](../../releases)) | Apple Silicon + Intel. Drag to Applications. |
+| **macOS** | `NOOP.app` (see [Releases](../../releases)) | Apple Silicon + Intel. Drag to Applications. Not notarized — see **First launch on macOS** below. |
 | **Android** | `NOOP-full.apk` (see [Releases](../../releases)) | The full app. `minSdk 26` (Android 8+). Sideload — enable "install unknown apps". |
 | **Android (demo)** | `NOOP-demo.apk` | Preloaded with sample data so you can explore every screen with no strap. Installs alongside the full app. |
 | **iOS** | — | The shared library is iOS-ready; the app is on the roadmap. |
+
+> **First launch on macOS.** NOOP is **not notarized** by Apple — notarization needs a paid Apple
+> Developer ID tied to a real identity, which doesn't fit an anonymous, free project. The app *is*
+> sandboxed and ad-hoc code-signed, and the full source is here to inspect. Because it isn't notarized,
+> macOS Gatekeeper blocks it on first open (you may see *"damaged"* or *"unverified developer"* — that's
+> the download quarantine flag, not real damage). To open it, do one of these **once**:
+>
+> - **Terminal (most reliable):** drag `NOOP.app` to Applications, then run
+>   `xattr -dr com.apple.quarantine /Applications/NOOP.app` and open NOOP normally.
+> - **No Terminal:** double-click NOOP (it'll be blocked), then open **System Settings → Privacy &
+>   Security**, scroll to the bottom, and click **"Open Anyway"** next to NOOP. (On macOS 14 and
+>   earlier you can also right-click the app → **Open**.)
+>
+> Prefer to avoid this entirely? Build from source — see [Quickstart](#quickstart-macos).
 
 Prefer to build it yourself? See [`docs/BUILD.md`](docs/BUILD.md).
 
