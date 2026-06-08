@@ -156,6 +156,15 @@ class WhoopBleClient(
         val WHOOP5_SERVICE: UUID = UUID.fromString("fd4b0001-cce1-4033-93ce-002d5875f58a")
         // WHOOP 5.0/MG command-write char — takes the static CLIENT_HELLO (EXPERIMENTAL).
         val WHOOP5_CMD_WRITE_CHAR: UUID = UUID.fromString("fd4b0002-cce1-4033-93ce-002d5875f58a")
+        // WHOOP 5.0/MG ("puffin") notify chars — realtime HR rides these as REALTIME_DATA frames, NOT
+        // the standard 0x2A37 profile. They require an encrypted/bonded link, so they're subscribed
+        // only AFTER the CLIENT_HELLO confirmed-write bonds (mirrors macOS whoop5NotifyChars). (#17)
+        private val WHOOP5_NOTIFY_CHARS: List<UUID> = listOf(
+            UUID.fromString("fd4b0003-cce1-4033-93ce-002d5875f58a"),
+            UUID.fromString("fd4b0004-cce1-4033-93ce-002d5875f58a"),
+            UUID.fromString("fd4b0005-cce1-4033-93ce-002d5875f58a"),
+            UUID.fromString("fd4b0007-cce1-4033-93ce-002d5875f58a"),
+        )
 
         // Standard BLE profiles. HR + R-R works UNBONDED; battery is a plain %.
         private val HEART_RATE_SERVICE: UUID = UUID.fromString("0000180d-0000-1000-8000-00805f9b34fb")
@@ -253,8 +262,9 @@ class WhoopBleClient(
     private var gatt: BluetoothGatt? = null
     private var cmdCharacteristic: BluetoothGattCharacteristic? = null
 
-    /** Frame reassembler for the fragmented custom notify chars (port of Reassembler). */
-    private val reassembler = Reassembler()
+    /** Frame reassembler for the fragmented custom notify chars (port of Reassembler). Reassigned per
+     *  connection with the detected family — WHOOP5/MG frames use a different length encoding. */
+    private var reassembler = Reassembler()
 
     /** Rolling command sequence byte; `seq = seq &+ 1` before each send (Swift `seq: UInt8`). */
     private var seq: Int = 0
@@ -492,11 +502,20 @@ class WhoopBleClient(
             log("send(${cmd.name}) ignored — not connected")
             return
         }
-        // WHOOP 5.0/MG uses a different (CRC16/puffin) command framing we don't build yet — never
-        // write a WHOOP4-framed command to a 5/MG strap. Its live HR/battery come from the standard
-        // profiles; the only frame we send it is the static CLIENT_HELLO. (EXPERIMENTAL)
-        if (connectedFamily != DeviceFamily.WHOOP4) {
-            log("send(${cmd.name}) skipped — WHOOP 5/MG has no command framing yet")
+        // WHOOP 5.0/MG uses puffin (CRC16) command framing, not the WHOOP4 frame. We only send the
+        // realtime-HR toggle as puffin — the one command verified to make a bonded 5/MG strap start
+        // streaming HR (issue #17). Other commands have no verified puffin equivalent yet, so they're
+        // dropped rather than written as a blind guess (an unknown command can make the strap tear the
+        // link down). WHOOP 4.0 is unaffected.
+        if (connectedFamily == DeviceFamily.WHOOP5) {
+            if (cmd != CommandNumber.TOGGLE_REALTIME_HR) {
+                log("send(${cmd.name}) skipped — no WHOOP 5/MG framing for this command yet")
+                return
+            }
+            seq = (seq + 1) and 0xFF
+            val frame = Framing.puffinCommandFrame(cmd = cmd.rawValue, seq = seq, payload = payload)
+            enqueueWrite(PendingWrite(frame, withResponse))
+            log("→ ${cmd.name} payload=${payload.toHex()} (puffin)")
             return
         }
         seq = (seq + 1) and 0xFF
@@ -639,14 +658,17 @@ class WhoopBleClient(
                 log("WHOOP 5/MG detected — will send CLIENT_HELLO after subscribing (experimental).")
                 _state.value = _state.value.copy(
                     whoop5Detected = true,
-                    statusNote = "WHOOP 5/MG connected — experimental. Trying to bring up live heart rate " +
-                        "from the standard profile. This isn't verified on 5/MG hardware yet, so HR and " +
-                        "battery may appear but deeper metrics won't. WHOOP 4.0 is fully supported today.",
+                    statusNote = "WHOOP 5/MG connected — experimental. After bonding, NOOP brings up live " +
+                        "heart rate from the strap's realtime stream. Deeper metrics (recovery, strain, " +
+                        "sleep) for 5/MG are still being figured out. WHOOP 4.0 is fully supported today.",
                 )
                 cmdCharacteristic = whoop5.getCharacteristic(WHOOP5_CMD_WRITE_CHAR)
             } else {
                 log("Custom WHOOP service not found on this peripheral")
             }
+            // The reassembler frames per family — 5/MG uses a different length encoding (declLen @[2..4],
+            // total +8) than WHOOP4 (length @[1..3], total +4), so it must match the connected strap.
+            reassembler = Reassembler(connectedFamily)
 
             // 2. Standard HR profile (works unbonded — the reliable HR + R-R source).
             g.getService(HEART_RATE_SERVICE)?.getCharacteristic(HEART_RATE_CHAR)?.let { cccdQueue.add(it) }
@@ -669,13 +691,17 @@ class WhoopBleClient(
                 log("Confirmed write failed: status=$status")
             } else if (!didBond && connectedFamily == DeviceFamily.WHOOP5) {
                 // EXPERIMENTAL (issue #17): the CLIENT_HELLO is now a confirmed write, so this ACK means
-                // just-works bonding completed — the standard HR/battery profiles should start streaming
-                // (the strap won't serve them on an unauthenticated link). Fire the opt-in puffin probe
-                // now that the link is bonded.
+                // just-works bonding completed. Now subscribe the puffin notify chars (realtime HR rides
+                // these as REALTIME_DATA — the strap rejected them on the unauthenticated link), then arm
+                // realtime HR with puffin framing. Mirrors the macOS post-bond flow.
                 didBond = true
                 _state.value = _state.value.copy(bonded = true)
-                log("WHOOP 5/MG: CLIENT_HELLO acked — link established; HR should now stream (experimental).")
-                if (puffinExperiment.isEnabled) cmdCharacteristic?.let { writePuffinRealtimeHrProbe(g, it) }
+                log("WHOOP 5/MG: CLIENT_HELLO acked — link established; subscribing notify chars (experimental).")
+                g.getService(WHOOP5_SERVICE)?.let { svc ->
+                    for (u in WHOOP5_NOTIFY_CHARS) svc.getCharacteristic(u)?.let { cccdQueue.add(it) }
+                }
+                drainCccdQueue(g)
+                if (wantsRealtime) send(CommandNumber.TOGGLE_REALTIME_HR, byteArrayOf(1))
             } else if (!didBond && connectedFamily == DeviceFamily.WHOOP4) {
                 didBond = true
                 _state.value = _state.value.copy(bonded = true)
@@ -740,12 +766,15 @@ class WhoopBleClient(
 
     private fun onInbound(uuid: UUID, bytes: ByteArray) {
         lastDataAtMs = System.currentTimeMillis()   // feeds the keep-alive liveness watchdog
-        when (uuid) {
-            HEART_RATE_CHAR -> parseStandardHr(bytes)               // 0x2A37
-            BATTERY_CHAR -> bytes.firstOrNull()?.let {              // 0x2A19 = percent
+        when {
+            uuid == HEART_RATE_CHAR -> parseStandardHr(bytes)       // 0x2A37
+            uuid == BATTERY_CHAR -> bytes.firstOrNull()?.let {      // 0x2A19 = percent
                 setBattery((it.toInt() and 0xFF).toDouble())
             }
-            CMD_NOTIFY_CHAR, EVENT_NOTIFY_CHAR, DATA_NOTIFY_CHAR -> {
+            // WHOOP4 custom notify chars, OR the WHOOP 5/MG puffin notify chars (fd4b0003/4/5/7) once
+            // bonded — both carry framed records (REALTIME_DATA etc.) through the family-aware reassembler.
+            uuid == CMD_NOTIFY_CHAR || uuid == EVENT_NOTIFY_CHAR || uuid == DATA_NOTIFY_CHAR ||
+                uuid in WHOOP5_NOTIFY_CHARS -> {
                 // Reassemble (no-op for already-complete frames) then route each complete frame.
                 // Port of: for frame in reassembler.feed(bytes) { router.handle(frame:) }.
                 for (frame in reassembler.feed(bytes)) {
@@ -1022,13 +1051,19 @@ class WhoopBleClient(
      */
     fun startRealtime() {
         wantsRealtime = true
-        if (connectedFamily == DeviceFamily.WHOOP4) send(CommandNumber.TOGGLE_REALTIME_HR, byteArrayOf(1))
+        // Both families arm via TOGGLE_REALTIME_HR; send() frames it correctly per family (puffin for
+        // 5/MG). The toggle only reaches a 5/MG strap once bonded — the post-bond branch arms it too.
+        if (connectedFamily == DeviceFamily.WHOOP4 || _state.value.bonded) {
+            send(CommandNumber.TOGGLE_REALTIME_HR, byteArrayOf(1))
+        }
     }
 
     /** The Live screen no longer needs realtime HR; stop re-arming it. Port of `BLEManager.stopRealtime`. */
     fun stopRealtime() {
         wantsRealtime = false
-        if (connectedFamily == DeviceFamily.WHOOP4) send(CommandNumber.TOGGLE_REALTIME_HR, byteArrayOf(0))
+        if (connectedFamily == DeviceFamily.WHOOP4 || _state.value.bonded) {
+            send(CommandNumber.TOGGLE_REALTIME_HR, byteArrayOf(0))
+        }
     }
 
     /**
@@ -1164,35 +1199,6 @@ class WhoopBleClient(
             writeInFlight = false
             log("CLIENT_HELLO write rejected by stack")
         }
-    }
-
-    /**
-     * EXPERIMENTAL WHOOP 5.0/MG probe: a puffin-framed TOGGLE_REALTIME_HR(cmd 3) with payload [0x01],
-     * built via [Framing.puffinCommandFrame] and written WITHOUT a response to the puffin command
-     * characteristic (fd4b0002). Only ever called from the whoop5 path, only when the opt-in
-     * experiment flag is on. Logged clearly as experimental. Port of the macOS opt-in probe.
-     */
-    @SuppressLint("MissingPermission")
-    private fun writePuffinRealtimeHrProbe(g: BluetoothGatt, ch: BluetoothGattCharacteristic) {
-        seq = (seq + 1) and 0xFF
-        val probe = Framing.puffinCommandFrame(
-            cmd = CommandNumber.TOGGLE_REALTIME_HR.rawValue,
-            seq = seq,
-            payload = byteArrayOf(0x01),
-        )
-        log("WHOOP 5/MG EXPERIMENT: sending puffin TOGGLE_REALTIME_HR to fd4b0002 (experimental).")
-        val ok = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            g.writeCharacteristic(ch, probe, BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE) ==
-                BluetoothGatt.GATT_SUCCESS
-        } else {
-            @Suppress("DEPRECATION")
-            run {
-                ch.writeType = BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE
-                ch.value = probe
-                g.writeCharacteristic(ch)
-            }
-        }
-        if (!ok) log("Puffin TOGGLE_REALTIME_HR probe rejected by stack")
     }
 
     /**

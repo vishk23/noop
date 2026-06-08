@@ -297,4 +297,37 @@ class FramingTest {
         assertEquals(RrInterval(ts = 1700000000, rrMs = 850), streams.rr[0])
         assertEquals(RrInterval(ts = 1700000000, rrMs = 870), streams.rr[1])
     }
+
+    // MARK: - WHOOP 5.0/MG REALTIME_DATA (+4) + family-aware reassembly
+
+    private fun fromHex(s: String): ByteArray =
+        ByteArray(s.length / 2) { ((s[it * 2].digitToInt(16) shl 4) or s[it * 2 + 1].digitToInt(16)).toByte() }
+
+    /** A real type-40 REALTIME_DATA frame from a worn WHOOP 5 (same vector as the Swift
+     *  Whoop5RealtimeTests): hr=98, rr=[603,587] ms, ts=1780916382. HR matched the 0x2A37 profile. */
+    private val whoop5RealtimeHex =
+        "aa011800010022e128029ea0266aae4762025b024b020000000001005ed515dc"
+
+    @Test
+    fun whoop5_realtimeData_decodesHrRrAtPlus4() {
+        val f = Framing.parseFrame(fromHex(whoop5RealtimeHex), DeviceFamily.WHOOP5)
+        assertTrue(f.ok)
+        assertEquals("REALTIME_DATA", f.typeName)
+        assertEquals(true, f.crcOk)
+        assertEquals(98, f.parsed["heart_rate"])          // 4.0 @12 → 5.0 @16
+        assertEquals(1780916382, f.parsed["timestamp"])   // 4.0 @6  → 5.0 @10
+        @Suppress("UNCHECKED_CAST")
+        assertEquals(listOf(603, 587), f.parsed["rr_intervals"] as List<Int>)
+    }
+
+    @Test
+    fun whoop5_reassembler_isFamilyAware() {
+        // The WHOOP4 length rule decodes a bogus ~6 KB length for a 5/MG frame and never emits; the
+        // family-aware reassembler frames it correctly (declLen @[2..4], total + 8).
+        val frame = fromHex(whoop5RealtimeHex)
+        val out = Reassembler(DeviceFamily.WHOOP5).feed(frame)
+        assertEquals(1, out.size)
+        assertArrayEquals(frame, out[0])
+        assertTrue(Reassembler(DeviceFamily.WHOOP4).feed(frame).isEmpty())
+    }
 }

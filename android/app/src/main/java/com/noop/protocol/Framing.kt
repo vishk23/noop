@@ -41,7 +41,7 @@ private fun ByteArray.u32(off: Int): Long? {
  * A complete frame is `length + 4` bytes where `length` = u16 LE at buf[1..3]. Leading bytes before
  * the 0xAA SOF are discarded. Mirrors framing.py / Swift `Reassembler`.
  */
-class Reassembler {
+class Reassembler(private val family: DeviceFamily = DeviceFamily.WHOOP4) {
     private val buf = ArrayList<Byte>()
 
     /**
@@ -68,8 +68,19 @@ class Reassembler {
                 repeat(sof) { buf.removeAt(0) }
             }
             if (buf.size < 4) break
-            val length = (buf[1].toInt() and 0xFF) or ((buf[2].toInt() and 0xFF) shl 8)
-            val total = length + 4
+            // Frame length is encoded differently per family: WHOOP4 = u16 @[1..3], total = length + 4;
+            // WHOOP5/MG ("puffin") = declaredLength u16 @[2..4], total = declaredLength + 8 (it counts
+            // the payload + the 4-byte CRC32 trailer, and has 2 extra header bytes). Using the WHOOP4
+            // formula on a 5/MG frame decodes a bogus 6 KB length and the live stream never emits.
+            val length: Int
+            val total: Int
+            if (family == DeviceFamily.WHOOP5) {
+                length = (buf[2].toInt() and 0xFF) or ((buf[3].toInt() and 0xFF) shl 8)
+                total = length + 8
+            } else {
+                length = (buf[1].toInt() and 0xFF) or ((buf[2].toInt() and 0xFF) shl 8)
+                total = length + 4
+            }
             if (total > MAX_FRAME_BYTES) {
                 // A corrupt or misaligned SOF decodes an impossibly large length and we'd wait forever
                 // for bytes that can never arrive over BLE — the live stream would freeze until a
@@ -212,9 +223,35 @@ object Framing {
         val innerStart = 8
         val t = frame[innerStart].toInt() and 0xFF
         val name = typeName(t)
-        // Whoop 5.0 biometric field offsets are a later milestone — expose the inner record without
-        // inventing offsets (matches the Swift port). `parsed` stays empty for now.
-        return ParsedFrame(ok = true, crcOk = check.crc32Ok, typeName = name, parsed = emptyMap())
+        val parsed = LinkedHashMap<String, Any?>()
+        // WHOOP 5.0 field offsets are the 4.0 layout shifted by +4 (inner record starts at byte 8 vs 4).
+        // REALTIME_DATA is hardware-verified at +4 (HR matched the 0x2A37 profile to ~0.4 bpm over 96
+        // worn frames; see the Swift Whoop5RealtimeTests vector). Other types stay envelope-only until
+        // their per-type 5.0 offsets are confirmed on hardware — we don't invent offsets.
+        when (name) {
+            "REALTIME_DATA" -> decodeRealtimeWhoop5(frame, parsed)
+            else -> Unit
+        }
+        return ParsedFrame(ok = true, crcOk = check.crc32Ok, typeName = name, parsed = parsed)
+    }
+
+    /**
+     * REALTIME_DATA (type 40) for WHOOP 5.0 — the 4.0 layout + 4: timestamp@10 (u32),
+     * subseconds@14 (u16), heart_rate@16 (u8), rr_count@17, rr@18.. (u16). Mirrors the Swift
+     * parseFrameWhoop5 realtime decode and is covered by the same real-frame test vector.
+     */
+    private fun decodeRealtimeWhoop5(frame: ByteArray, parsed: MutableMap<String, Any?>) {
+        frame.u32(10)?.let { parsed["timestamp"] = it.toInt() }
+        frame.u16(14)?.let { parsed["subseconds"] = it }
+        frame.u8(16)?.let { parsed["heart_rate"] = it }
+        val rrn = frame.u8(17) ?: 0
+        parsed["rr_count"] = rrn
+        val rrs = ArrayList<Int>()
+        for (i in 0 until rrn) {
+            val v = frame.u16(18 + i * 2)
+            if (v != null && v > 0) rrs.add(v)   // drop 0 ms placeholders, matching 4.0 / Swift
+        }
+        parsed["rr_intervals"] = rrs
     }
 
     // MARK: - per-type decoders (Whoop 4.0). Ported from PostHooks.swift + the static field specs.

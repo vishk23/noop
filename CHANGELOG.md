@@ -17,6 +17,25 @@ approximate; downloads are on the [Releases](https://github.com/NoopApp/noop/rel
 
 ---
 
+## 1.13 — WHOOP 5/MG heart rate on Android
+
+- **Fixed (Android, WHOOP 5/MG): bonded but no heart rate.** Android brought the strap to "Bonded —
+  Streaming" (v1.10) but then listened for HR only on the standard `0x2A37` profile — which a 5/MG
+  strap doesn't stream. Realtime HR rides the puffin notify chars (`fd4b0003/4/5/7`) as `REALTIME_DATA`,
+  exactly as on macOS. NOOP now, on the `.whoop5` path only: (1) subscribes those puffin notify chars
+  **after** the `CLIENT_HELLO` bond (they're rejected on an unauthenticated link); (2) makes the frame
+  reassembler **family-aware** (5/MG framing is `declLen @[2..4]` / total `+8`, vs WHOOP4 `length @[1..3]`
+  / `+4` — the WHOOP4 rule decoded a bogus ~6 KB length and never emitted a frame); (3) decodes `REALTIME_DATA`
+  at the WHOOP5 `+4` offsets (HR @16) — the same hardware-verified decode shipped for macOS in PR #21; and
+  (4) sends the realtime-HR toggle with **puffin command framing** (`send()` dropped every 5/MG command
+  before). Verified by unit tests against a real worn-strap frame (HR=98, R-R=[603,587]); the new decode +
+  reassembler are covered. Still experimental on 5/MG; WHOOP 4.0 is byte-for-byte unaffected (issue #17/#26).
+- **Note:** other 5/MG commands (battery poll, haptic buzz) still need their own verified puffin framing
+  and remain dropped for now — only the realtime-HR toggle is wired, because it's the one confirmed on
+  hardware. So buzz on a 5/MG strap isn't expected to fire yet (issue #28).
+
+---
+
 ## 1.12 — WHOOP 5/MG heart rate on Mac + Readiness anchoring
 
 - **Fixed (macOS, WHOOP 5/MG): the connect bonding and actually streaming live HR.** The v1.5 attempt
