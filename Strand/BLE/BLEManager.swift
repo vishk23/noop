@@ -291,13 +291,14 @@ public final class BLEManager: NSObject, ObservableObject {
             log("send(\(command.label)) ignored — \(reason)")
             return
         }
-        // WHOOP 5.0/MG uses puffin (CRC16) command framing, not the WHOOP4 frame. We only send the
-        // realtime-HR toggle as puffin — it's the one command verified to make a bonded 5/MG strap start
-        // streaming HR (issue #17: confirmed on Android v1.10 and a 5/MG owner's macOS patch). Every other
-        // WHOOP4 command has no verified puffin equivalent, so we still drop it rather than write a blind
-        // guess — an unknown command can make the strap tear the link down. WHOOP 4.0 is unaffected.
+        // WHOOP 5.0/MG uses puffin (CRC16) command framing, not the WHOOP4 frame. The realtime-HR toggle
+        // is hardware-confirmed (issue #17 — a 5/MG owner saw live HR over a public build), which proves
+        // the strap does act on puffin-framed commands. We now also send haptics (buzz) on that same
+        // proven transport — experimental: the strap may or may not honor that specific command, but it's
+        // no longer a blind guess. Everything else stays dropped (the offload commands need the held
+        // historical-offload work). WHOOP 4.0 is unaffected.
         if selectedModel.deviceFamily == .whoop5 {
-            guard command == .toggleRealtimeHR else {
+            guard command == .toggleRealtimeHR || command == .runHapticsPattern else {
                 log("send(\(command.label)) skipped — no WHOOP 5/MG framing for this command yet")
                 return
             }

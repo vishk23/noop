@@ -502,13 +502,13 @@ class WhoopBleClient(
             log("send(${cmd.name}) ignored — not connected")
             return
         }
-        // WHOOP 5.0/MG uses puffin (CRC16) command framing, not the WHOOP4 frame. We only send the
-        // realtime-HR toggle as puffin — the one command verified to make a bonded 5/MG strap start
-        // streaming HR (issue #17). Other commands have no verified puffin equivalent yet, so they're
-        // dropped rather than written as a blind guess (an unknown command can make the strap tear the
-        // link down). WHOOP 4.0 is unaffected.
+        // WHOOP 5.0/MG uses puffin (CRC16) command framing, not the WHOOP4 frame. The realtime-HR toggle
+        // is hardware-confirmed (issue #17 — a 5/MG owner saw live HR on v1.13), which proves the strap
+        // acts on puffin-framed commands. We now also send haptics (buzz) on that same proven transport —
+        // experimental: the strap may or may not honor that specific command, but it's no longer a blind
+        // guess. Everything else stays dropped (offload commands need the held work). WHOOP 4.0 unaffected.
         if (connectedFamily == DeviceFamily.WHOOP5) {
-            if (cmd != CommandNumber.TOGGLE_REALTIME_HR) {
+            if (cmd != CommandNumber.TOGGLE_REALTIME_HR && cmd != CommandNumber.RUN_HAPTICS_PATTERN) {
                 log("send(${cmd.name}) skipped — no WHOOP 5/MG framing for this command yet")
                 return
             }

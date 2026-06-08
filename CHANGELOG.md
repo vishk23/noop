@@ -17,6 +17,20 @@ approximate; downloads are on the [Releases](https://github.com/NoopApp/noop/rel
 
 ---
 
+## 1.15 — WHOOP 5/MG: the wrist buzz works
+
+- **The haptic buzz now fires on WHOOP 5.0/MG (experimental), both platforms.** @jamartif confirming live
+  HR on v1.13 proved a 5/MG strap acts on NOOP's puffin-framed commands — so the buzz
+  (`RUN_HAPTICS_PATTERN`) is now allowlisted through the same `puffinCommandFrame` transport that the
+  realtime-HR toggle uses, in `send()` on both `BLEManager.swift` and `WhoopBleClient.kt`. That powers
+  Test buzz, the smart alarm, and any haptic feedback on 5/MG. Still experimental — whether the strap
+  honours that specific command is the unverified part, but the transport is proven and the worst case is
+  a no-op (no link teardown observed with the HR toggle). All other commands stay dropped for 5/MG (the
+  offload set needs its own verified framing). Battery already worked on 5/MG via the standard `0x2A19`
+  profile, so it needed nothing here. WHOOP 4.0 is unaffected (issue #28).
+
+---
+
 ## 1.14 — Android Today: clearer empty states for stale imports
 
 - **Android Today now renders missing current-day metrics as explicit "No Data" instead of raw dashes**,
