@@ -17,6 +17,19 @@ approximate; downloads are on the [Releases](https://github.com/NoopApp/noop/rel
 
 ---
 
+## 1.30 — Workouts: correct source pill for Health Connect (Android)
+
+- **Fixed (Android): Health Connect workouts showed an "Apple" pill in the Workouts list's Src
+  column** (issue #53, follow-up — the Today page was fixed in 1.28). The `SessionRow` badge was a
+  binary `isWhoop ? "Whoop" : "Apple"`, so every non-WHOOP session (including `health-connect`) fell
+  through to "Apple". It now classifies on the row's stored origin — `deviceId`/`source` of
+  `my-whoop` → "Whoop" (accent), `apple-health`/"Apple Health" → "Apple" (cyan),
+  `health-connect` → **"HC"** (purple, matching the Data Sources / Today tint). "HC" is abbreviated
+  to fit the narrow column, exactly as "Apple" stands in for "Apple Health" there. The classification
+  is a pure `workoutSourceLabel()` helper with a unit test pinning all three importer origins.
+- macOS: lockstep version bump only — Health Connect is Android-only, so macOS workouts are only ever
+  WHOOP or Apple and the existing badge is already correct there.
+
 ## 1.29 — Re-scan actually scans on Android
 
 - **Fixed (Android): Re-scan / Connect could silently do nothing on Android 12+** (issue #1; community
