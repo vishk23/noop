@@ -17,6 +17,22 @@ approximate; downloads are on the [Releases](https://github.com/NoopApp/noop/rel
 
 ---
 
+## 1.33 — Smart alarm time actually reaches the strap
+
+- **Fixed: the Smart-alarm wake time you set didn't always transmit to the strap** (issue #59). The
+  strap's firmware alarm is set over BLE, and the send is gated on bond — but `applySmartAlarm()` was
+  only called from the enable/time-change setters (`setSmartAlarm…` / `AutomationsView.onChange`),
+  **never on (re)connect**. So a time changed while the strap wasn't bonded was silently dropped, and
+  the strap kept its previous time (set 07:15 → still fired at the old 07:00). Both platforms had this
+  gap.
+- **Fix:** re-arm on the bond `false→true` transition. macOS adds a `live.$bonded.removeDuplicates()`
+  sink in `AppModel.init`; Android tracks the bonded transition in `AppViewModel`'s `ble.state`
+  collector. Both gated on `smartAlarmEnabled` so a disabled alarm doesn't disarm on every reconnect.
+  Net effect: every time the strap reconnects, the current wake time is re-sent — so the time you set
+  is the time that fires. (Re-arming on each reconnect also refreshes the next-occurrence epoch.)
+- WHOOP 5/MG note unchanged: `armStrapAlarm` is still dropped by `send()` on 5/MG (its command set
+  isn't verified) — this fix is for the WHOOP 4.0 firmware alarm, same as before.
+
 ## 1.32 — Today trends stay within their window (Mac)
 
 - **Fixed (Mac): Today metric sparklines could draw all-history data under a "14-day trend" label**

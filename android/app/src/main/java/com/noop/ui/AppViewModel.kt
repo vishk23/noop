@@ -98,10 +98,16 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
             .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyList())
 
     init {
-        // Smooth HR from each LiveState emission.
+        // Smooth HR from each LiveState emission, and re-arm the strap's firmware alarm whenever it
+        // (re)bonds. A smart-alarm time changed while the strap was away never reached it — the send
+        // is gated on bond — so the strap kept the OLD time and fired at it (#59). Gated on enabled so
+        // a disabled alarm doesn't disarm on every reconnect.
         viewModelScope.launch {
+            var lastBonded = false
             ble.state.collect { state ->
                 state.heartRate?.let { ingestHr(it) }
+                if (state.bonded && !lastBonded && _smartAlarmEnabled.value) applySmartAlarm()
+                lastBonded = state.bonded
             }
         }
         // Recompute the illness banner + today's row whenever cached days change.
