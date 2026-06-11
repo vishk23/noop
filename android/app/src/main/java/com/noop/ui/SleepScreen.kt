@@ -1,6 +1,8 @@
 package com.noop.ui
 
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -15,6 +17,7 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
@@ -35,6 +38,8 @@ import com.noop.analytics.AnalyticsEngine
 import com.noop.data.DailyMetric
 import com.noop.data.SleepSession
 import org.json.JSONArray
+import java.time.LocalDate
+import java.time.format.DateTimeFormatter
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -70,18 +75,21 @@ import kotlin.math.roundToInt
 fun SleepScreen(vm: AppViewModel) {
     val days by vm.recentDays.collectAsStateWithLifecycle()
     val live by vm.live.collectAsStateWithLifecycle()
+    var selectedDayOffset by remember { mutableIntStateOf(0) }
+    val selectedDay = remember(selectedDayOffset) { LocalDate.now().minusDays(selectedDayOffset.toLong()) }
+    val selectedDayKey = remember(selectedDay) { selectedDay.toString() }
 
     // The latest sleep session (for onset/wake clock + stored efficiency). Loaded once
     // from the repo; the my-whoop daily metrics drive everything else and arrive via the
     // shared recentDays flow.
     var session by remember { mutableStateOf<SleepSession?>(null) }
-    LaunchedEffect(Unit) {
+    LaunchedEffect(selectedDayKey) {
         val now = System.currentTimeMillis() / 1000L
         val from = now - 60L * 24L * 60L * 60L // 60-day lookback
         session = runCatching {
-            // Merged: imported WHOOP sessions win per night; on-device computed
-            // ("my-whoop-noop") sessions gap-fill so strap-only nights still show a clock.
-            vm.repo.sleepSessionsMerged("my-whoop", from, now).maxByOrNull { it.startTs }
+            vm.repo.sleepSessionsMerged("my-whoop", from, now)
+                .filter { AnalyticsEngine.dayString(it.endTs) == selectedDayKey }
+                .maxByOrNull { it.startTs }
         }.getOrNull()
     }
 
@@ -101,23 +109,31 @@ fun SleepScreen(vm: AppViewModel) {
         )
     }
 
-    val model = remember(days, session, imported) { buildSleepModel(days, session, imported) }
+    val model = remember(days, session, imported, selectedDayKey) {
+        buildSleepModel(days, session, imported, selectedDay = selectedDayKey)
+    }
 
     ScreenScaffold(title = "Sleep", subtitle = "Last night, read in two seconds.") {
+        DaySelectorBar(selectedOffset = selectedDayOffset, onSelect = { selectedDayOffset = it })
         if (model == null) {
             // While the strap is mid-offload, say so — "No nights" reads as final otherwise (#77).
             if (live.backfilling) SyncingHistoryNote(chunks = live.syncChunksThisSession)
             SleepEmptyState()
         } else {
             Hero(model)
-            Spacer(Modifier.height(Metrics.sectionGap - 20.dp))
+            Spacer(Modifier.height(Metrics.selectorTopUp))
             MetricGrid(model)
-            Spacer(Modifier.height(Metrics.sectionGap - 20.dp))
+            Spacer(Modifier.height(Metrics.selectorTopUp))
             StagesVsTypical(model)
-            Spacer(Modifier.height(Metrics.sectionGap - 20.dp))
+            Spacer(Modifier.height(Metrics.selectorTopUp))
             DurationTrend(model)
         }
     }
+}
+
+@Composable
+private fun DaySelectorBar(selectedOffset: Int, onSelect: (Int) -> Unit) {
+    ThreeDaySelectorBar(selectedOffset = selectedOffset, onSelect = onSelect)
 }
 
 // MARK: - 1. HERO — stage breakdown
@@ -152,13 +168,13 @@ private fun Hero(m: SleepModel) {
             val segments = m.realSegments ?: stageSegments(s)
             if (segments.isNotEmpty()) {
                 Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
-                    Box(modifier = Modifier.fillMaxWidth().height(34.dp)) {
+                    Box(modifier = Modifier.fillMaxWidth().height(Metrics.stageStripHeight)) {
                         Hypnogram(
                             stages = segments,
-                            modifier = Modifier.fillMaxWidth().height(34.dp),
+                            modifier = Modifier.fillMaxWidth().height(Metrics.stageStripHeight),
                         )
                     }
-                    Row(horizontalArrangement = Arrangement.spacedBy(16.dp)) {
+                    Row(horizontalArrangement = Arrangement.spacedBy(Metrics.space16)) {
                         StageLegend("Deep", Palette.sleepDeep)
                         StageLegend("Light", Palette.sleepLight)
                         StageLegend("REM", Palette.sleepREM)
@@ -179,14 +195,14 @@ private fun Hero(m: SleepModel) {
 @Composable
 private fun StageLegend(label: String, color: Color) {
     Row(
-        horizontalArrangement = Arrangement.spacedBy(5.dp),
+        horizontalArrangement = Arrangement.spacedBy(Metrics.space6),
         verticalAlignment = Alignment.CenterVertically,
     ) {
         Box(
             modifier = Modifier
-                .height(9.dp)
-                .width(9.dp)
-                .clip(RoundedCornerShape(2.dp))
+                .height(Metrics.legendSwatch)
+                .width(Metrics.legendSwatch)
+                .clip(RoundedCornerShape(Metrics.cornerXs))
                 .background(color),
         )
         Text(label, style = NoopType.footnote, color = Palette.textTertiary)
@@ -283,7 +299,7 @@ private fun StagesVsTypical(m: SleepModel) {
     Column(verticalArrangement = Arrangement.spacedBy(Metrics.gap)) {
         SectionHeader("Stages vs typical", overline = "Last night", trailing = "marker = your mean")
         NoopCard {
-            Column(verticalArrangement = Arrangement.spacedBy(14.dp)) {
+            Column(verticalArrangement = Arrangement.spacedBy(Metrics.space14)) {
                 StageRow("Deep", last = s.deep, typical = m.typicalDeepMin, color = Palette.sleepDeep)
                 Hairline()
                 StageRow("REM", last = s.rem, typical = m.typicalRemMin, color = Palette.sleepREM)
@@ -296,7 +312,7 @@ private fun StagesVsTypical(m: SleepModel) {
 
 @Composable
 private fun Hairline() {
-    Box(modifier = Modifier.fillMaxWidth().height(1.dp).background(Palette.hairline))
+    Box(modifier = Modifier.fillMaxWidth().height(Metrics.divider).background(Palette.hairline))
 }
 
 /** One stage bar: last-night minutes filled, with a vertical marker at the typical mean. */
@@ -313,7 +329,7 @@ private fun StageRow(label: String, last: Double, typical: Double?, color: Color
             "$sign${durationText(abs(diff))} vs typ"
         }
     }
-    Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+    Column(verticalArrangement = Arrangement.spacedBy(Metrics.space6)) {
         Row(verticalAlignment = Alignment.CenterVertically) {
             Overline(label, modifier = Modifier.weight(1f))
             Text(durationText(last), style = NoopType.captionNumber, color = Palette.textPrimary)
@@ -322,7 +338,7 @@ private fun StageRow(label: String, last: Double, typical: Double?, color: Color
                     deltaText,
                     style = NoopType.footnote,
                     color = if (last >= (typical ?: last)) Palette.statusPositive else Palette.statusWarning,
-                    modifier = Modifier.padding(start = 8.dp),
+                    modifier = Modifier.padding(start = Metrics.space8),
                 )
             }
         }
@@ -332,8 +348,8 @@ private fun StageRow(label: String, last: Double, typical: Double?, color: Color
         Box(
             modifier = Modifier
                 .fillMaxWidth()
-                .height(10.dp)
-                .clip(RoundedCornerShape(50))
+                .height(Metrics.progressHeight)
+                .clip(RoundedCornerShape(Metrics.cornerPill))
                 .background(Palette.surfaceInset)
                 .drawBehind {
                     // last-night fill
@@ -371,9 +387,9 @@ private fun DrawScope.drawRoundRectFill(color: Color, frac: Float) {
 @Composable
 private fun DurationTrend(m: SleepModel) {
     val pts = m.trendHours
-    val avg = m.typicalTotalMin?.let { it / 60.0 }
+    val avg = pts.averageOrNull()
     Column(verticalArrangement = Arrangement.spacedBy(Metrics.gap)) {
-        SectionHeader("Asleep duration", overline = "Trend", trailing = "Last 14 days")
+        SectionHeader("Trend", overline = "Sleep", trailing = "Last 14 days")
         ChartCard(
             title = "Hours asleep",
             subtitle = "Per night, trailing 14 days",
@@ -390,24 +406,101 @@ private fun DurationTrend(m: SleepModel) {
             },
         ) {
             if (pts.size >= 2) {
-                LineChart(
-                    values = pts,
-                    modifier = Modifier.fillMaxWidth().height(Metrics.chartHeight - 90.dp),
-                    color = Palette.accent,
-                    fill = true,
-                )
+                Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                    LineChart(
+                        values = pts,
+                        modifier = Modifier.fillMaxWidth().height(Metrics.compactChartHeight),
+                        color = Palette.accent,
+                        fill = true,
+                        selectionEnabled = true,
+                    )
+                    DateAxisRow(m.trendDates)
+                }
             } else {
+                TrendPlaceholder()
+            }
+        }
+
+        ChartCard(
+            title = "Sleep Debt",
+            subtitle = "Hours of sleep debt per day",
+            trailing = m.trendDebtHours.lastOrNull()?.let { String.format(Locale.US, "%.1f h", it) },
+            footer = {
+                ChartFooter(
+                    listOf(
+                        "Avg" to (m.trendDebtHours.averageOrNull()?.let { String.format(Locale.US, "%.1f h", it) } ?: "â€”"),
+                        "Max" to (m.trendDebtHours.maxOrNull()?.let { String.format(Locale.US, "%.1f h", it) } ?: "â€”"),
+                        "Days" to "${m.trendDebtHours.size}",
+                    ),
+                )
+            },
+        ) {
+            if (m.trendDebtHours.isNotEmpty()) {
+                Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                    BarChart(
+                        values = m.trendDebtHours,
+                        modifier = Modifier.fillMaxWidth().height(Metrics.compactChartHeight),
+                        color = Palette.metricRose,
+                        selectionEnabled = true,
+                    )
+                    DateAxisRow(m.trendDates)
+                }
+            } else {
+                TrendPlaceholder()
+            }
+        }
+    }
+}
+
+@Composable
+private fun TrendPlaceholder() {
+    Box(
+        modifier = Modifier.fillMaxWidth(),
+        contentAlignment = Alignment.Center,
+    ) {
+        InsetChartPlaceholder(message = "Not enough nights yet.")
+    }
+}
+
+@Composable
+private fun TrendLegend(items: List<Pair<String, Color>>) {
+    Row(horizontalArrangement = Arrangement.spacedBy(Metrics.space14)) {
+        items.forEach { (label, color) ->
+            Row(
+                horizontalArrangement = Arrangement.spacedBy(Metrics.space6),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
                 Box(
                     modifier = Modifier
-                        .fillMaxWidth()
-                        .height(Metrics.chartHeight - 90.dp)
-                        .clip(RoundedCornerShape(12.dp))
-                        .background(Palette.surfaceInset),
-                    contentAlignment = Alignment.Center,
-                ) {
-                    Text("Not enough nights yet.", style = NoopType.subhead, color = Palette.textTertiary)
-                }
+                        .width(Metrics.legendLineWidth)
+                        .height(Metrics.legendLineHeight)
+                        .clip(RoundedCornerShape(Metrics.cornerPill))
+                        .background(color),
+                )
+                Text(label, style = NoopType.footnote, color = Palette.textTertiary)
             }
+        }
+    }
+}
+
+@Composable
+private fun DateAxisRow(days: List<String>) {
+    if (days.isEmpty()) return
+    val labels = listOf(
+        days.firstOrNull(),
+        days.getOrNull(days.lastIndex / 2),
+        days.lastOrNull(),
+    ).map { it?.let(::shortDayLabel).orEmpty() }
+    Row(modifier = Modifier.fillMaxWidth()) {
+        labels.forEach { label ->
+            Text(
+                text = label,
+                style = NoopType.footnote,
+                color = Palette.textTertiary,
+                modifier = Modifier.weight(1f),
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
         }
     }
 }
@@ -427,15 +520,15 @@ private fun ChartCard(
     footer: @Composable () -> Unit,
     chart: @Composable () -> Unit,
 ) {
-    NoopCard(padding = 16.dp) {
-        Column(verticalArrangement = Arrangement.spacedBy(14.dp)) {
+    NoopCard(padding = Metrics.cardPadding) {
+        Column(verticalArrangement = Arrangement.spacedBy(Metrics.space14)) {
             Row(verticalAlignment = Alignment.Top) {
                 Column(modifier = Modifier.weight(1f)) {
                     Text(title, style = NoopType.headline, color = Palette.textPrimary)
                     Text(subtitle, style = NoopType.footnote, color = Palette.textSecondary)
                 }
                 if (trailing != null) {
-                    Text(trailing, style = NoopType.number(18f), color = Palette.textPrimary)
+                    Text(trailing, style = NoopType.chartValue, color = Palette.textPrimary)
                 }
             }
             chart()
@@ -469,7 +562,7 @@ private fun SparkTile(
     spark: List<Double>,
     sparkColor: Color,
 ) {
-    NoopCard(modifier = modifier.height(Metrics.tileHeight), padding = 14.dp) {
+    NoopCard(modifier = modifier.height(Metrics.tileHeight), padding = Metrics.space14) {
         Column(modifier = Modifier.fillMaxWidth()) {
             Overline(label)
             Spacer(Modifier.weight(1f))
@@ -477,7 +570,7 @@ private fun SparkTile(
                 Column(modifier = Modifier.weight(1f)) {
                     Text(
                         value,
-                        style = NoopType.number(24f),
+                        style = NoopType.tileValue,
                         color = accent,
                         maxLines = 1,
                         overflow = TextOverflow.Ellipsis,
@@ -489,18 +582,13 @@ private fun SparkTile(
                             color = Palette.textTertiary,
                             maxLines = 1,
                             overflow = TextOverflow.Ellipsis,
-                            modifier = Modifier.padding(top = 2.dp),
+                            modifier = Modifier.padding(top = Metrics.space2),
                         )
                     }
                 }
                 val tail = spark.takeLast(30)
                 if (tail.size >= 2) {
-                    Box(
-                        modifier = Modifier
-                            .padding(start = 8.dp, bottom = 2.dp)
-                            .width(58.dp)
-                            .height(22.dp),
-                    ) {
+                    SparkTailBox {
                         Sparkline(values = tail, color = sparkColor)
                     }
                 }
@@ -568,6 +656,9 @@ internal data class SleepModel(
     val typicalRemMin: Double?,
     val typicalLightMin: Double?,
     val trendHours: List<Double>,
+    val trendNeedHours: List<Double>,
+    val trendDebtHours: List<Double>,
+    val trendDates: List<String>,
     /** Persisted per-epoch segments as ordered (stage, minutes) weights — the REAL
      *  hypnogram (on-device APPROXIMATE staging) — or null → synthesized fallback. */
     val realSegments: List<Pair<String, Float>>?,
@@ -584,8 +675,13 @@ internal fun buildSleepModel(
     days: List<DailyMetric>,
     session: SleepSession?,
     imported: ImportedSleepSeries = ImportedSleepSeries(),
+    selectedDay: String? = null,
 ): SleepModel? {
-    val latest = days.lastOrNull { (it.deepMin ?: 0.0) + (it.remMin ?: 0.0) + (it.lightMin ?: 0.0) > 0.0 }
+    val effectiveDay = selectedDay ?: days.lastOrNull()?.day ?: return null
+    val windowDays = days.filter { it.day <= effectiveDay }
+    val latest = windowDays.lastOrNull {
+        it.day == effectiveDay && (it.deepMin ?: 0.0) + (it.remMin ?: 0.0) + (it.lightMin ?: 0.0) > 0.0
+    }
         ?: return null
 
     val deep = latest.deepMin ?: 0.0
@@ -597,17 +693,17 @@ internal fun buildSleepModel(
     val effFrac = latest.efficiency?.let { if (it > 1.0) it / 100.0 else it }
     val awake = when {
         effFrac != null && effFrac in 0.01..0.999 -> max(0.0, asleep / effFrac - asleep)
-        latest.disturbances != null -> latest.disturbances!! * 6.0
+        latest.disturbances != null -> latest.disturbances * 6.0
         else -> 0.0
     }
     val stages = Stages(awake = awake, light = light, deep = deep, rem = rem)
     if (stages.total <= 0.0) return null
 
     // Typical = mean across nights with data (mirrors typicalTotalMin / typicalStageMin).
-    val typicalTotalMin = mean(days.mapNotNull { it.totalSleepMin }.filter { it > 0.0 })
-    val typicalDeepMin = mean(days.mapNotNull { it.deepMin }.filter { it > 0.0 })
-    val typicalRemMin = mean(days.mapNotNull { it.remMin }.filter { it > 0.0 })
-    val typicalLightMin = mean(days.mapNotNull { it.lightMin }.filter { it > 0.0 })
+    val typicalTotalMin = mean(windowDays.mapNotNull { it.totalSleepMin }.filter { it > 0.0 })
+    val typicalDeepMin = mean(windowDays.mapNotNull { it.deepMin }.filter { it > 0.0 })
+    val typicalRemMin = mean(windowDays.mapNotNull { it.remMin }.filter { it > 0.0 })
+    val typicalLightMin = mean(windowDays.mapNotNull { it.lightMin }.filter { it > 0.0 })
 
     // Personal sleep need (minutes): mean asleep, floored at 7.5h (450 min).
     val needMin = max(450.0, typicalTotalMin ?: 450.0)
@@ -615,34 +711,34 @@ internal fun buildSleepModel(
     // Per-tile metrics — each a full pass over `days`, exactly as the macOS screen.
     // Where the WHOOP export carried the figure verbatim (metricSeries), it wins per day;
     // the on-device recomputation is the APPROXIMATE fallback for strap-only days.
-    val performance = metric(days) { d ->
+    val performance = metric(windowDays) { d ->
         imported.performance[d.day]   // WHOOP's own 0–100 figure wins per day
             ?: d.totalSleepMin?.takeIf { it > 0.0 && needMin > 0.0 }
                 ?.let { minOf(100.0, it / needMin * 100.0) }   // APPROXIMATE fallback
     }
-    val efficiency = metric(days) { d ->
+    val efficiency = metric(windowDays) { d ->
         d.efficiency?.let { if (it <= 1.0) it * 100.0 else it }
     }
     val consistency = run {
         // Prefer the imported sleep_consistency series, but only when it covers the latest
         // night — otherwise "latest" would silently be a months-old import-era value.
-        val lastDay = days.lastOrNull()?.day
+        val lastDay = windowDays.lastOrNull()?.day
         if (lastDay != null && imported.consistency[lastDay] != null) {
-            val series = days.mapNotNull { imported.consistency[it.day] }
+            val series = windowDays.mapNotNull { imported.consistency[it.day] }
             Metric(series.lastOrNull(), mean(series), series)
-        } else consistencySeries(days)   // APPROXIMATE duration-spread proxy
+        } else consistencySeries(windowDays)   // APPROXIMATE duration-spread proxy
     }
-    val hoursVsNeeded = metric(days) { d ->
+    val hoursVsNeeded = metric(windowDays) { d ->
         val need = imported.needMin[d.day] ?: needMin   // imported need wins per day
         d.totalSleepMin?.takeIf { it > 0.0 && need > 0.0 }?.let { it / need * 100.0 }
     }
-    val restorative = metric(days) { d ->
+    val restorative = metric(windowDays) { d ->
         val dp = d.deepMin; val rm = d.remMin; val sl = d.totalSleepMin
         if (dp != null && rm != null && sl != null && sl > 0.0) (dp + rm) / sl * 100.0 else null
     }
-    val respiratory = metric(days) { it.respRateBpm }
+    val respiratory = metric(windowDays) { it.respRateBpm }
     val sleepDebt = run {
-        val series = days.mapNotNull { d ->
+        val series = windowDays.mapNotNull { d ->
             imported.debtMin[d.day]   // minutes, export-verbatim
                 ?: d.totalSleepMin?.takeIf { it > 0.0 && needMin > 0.0 }
                     ?.let { max(0.0, needMin - it) }   // APPROXIMATE fallback
@@ -650,10 +746,16 @@ internal fun buildSleepModel(
         Metric(series.lastOrNull(), mean(series), series)
     }
 
-    // 14-day asleep-hours trend (falls back to all nights if the window is too sparse).
-    val allHours = days.mapNotNull { it.totalSleepMin?.takeIf { m -> m > 0.0 }?.let { m -> m / 60.0 } }
-    val recentHours = allHours.takeLast(14)
-    val trendHours = if (recentHours.size >= 2) recentHours else allHours
+    // 14-day trend set ending on the selected day.
+    val trendRows = windowDays.filter { (it.totalSleepMin ?: 0.0) > 0.0 }.takeLast(14)
+    val trendHours = trendRows.mapNotNull { it.totalSleepMin?.let { minutes -> minutes / 60.0 } }
+    val trendNeedHours = trendRows.map { row -> ((imported.needMin[row.day] ?: needMin) / 60.0) }
+    val trendDebtHours = trendRows.map { row ->
+        val sleptMin = row.totalSleepMin ?: 0.0
+        val neededMin = imported.needMin[row.day] ?: needMin
+        ((imported.debtMin[row.day] ?: max(0.0, neededMin - sleptMin)) / 60.0)
+    }
+    val trendDates = trendRows.map { it.day }
 
     // Real per-epoch timeline only when the merged session IS this night (UTC end-day
     // match, the same attribution AnalyticsEngine uses); else synthesized fallback. Note:
@@ -680,6 +782,9 @@ internal fun buildSleepModel(
         typicalRemMin = typicalRemMin,
         typicalLightMin = typicalLightMin,
         trendHours = trendHours,
+        trendNeedHours = trendNeedHours,
+        trendDebtHours = trendDebtHours,
+        trendDates = trendDates,
         realSegments = realSegments,
     )
 }
@@ -773,6 +878,14 @@ private fun durationText(minutes: Double): String {
 }
 
 /** "Wed 4 Jun · 22:50–06:48" style trailing label from the session clock, when available. */
+private fun shortDayLabel(day: String): String =
+    runCatching {
+        LocalDate.parse(day).format(DateTimeFormatter.ofPattern("d MMM", Locale.US))
+    }.getOrDefault(day)
+
+private fun List<Double>.averageOrNull(): Double? =
+    if (isEmpty()) null else sum() / size
+
 private fun clockLabel(latest: DailyMetric, session: SleepSession?): String {
     val timeFmt = SimpleDateFormat("HH:mm", Locale.US)
     val dateFmt = SimpleDateFormat("EEE d MMM", Locale.US)

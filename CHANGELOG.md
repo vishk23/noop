@@ -17,6 +17,20 @@ approximate; downloads are on the [Releases](https://github.com/NoopApp/noop/rel
 
 ---
 
+## 1.85 — Browse the last few days, interactive charts, and a Vital Signs screen (Android)
+
+- **New (Android):** browse the last **3 days** on Today, Sleep and Vital Signs — flip between Today,
+  Yesterday and 2 days ago from the same screen.
+- **New (Android):** charts are now **interactive** on Sleep, Trends and the new Vital Signs detail —
+  tap and swipe across the line to read off the exact value at any point.
+- **New (Android):** **Vital Signs** is now a first-class screen reachable from the menu — resting HR,
+  HRV, SpO₂, skin temperature and respiratory rate with their recent history and context in one place.
+- **Improved (Android):** more robust background reconnect — the long-lived connection and its
+  persistent notification come back cleanly after an app update or restart. _(A community
+  contribution — thank you.)_ (Mac: version bump only.)
+
+---
+
 ## 1.84 — Fix the Android freeze after a few nights of data
 
 - **Fixed (Android):** the app could freeze and get ANR-killed ("app isn't responding") once a strap

@@ -1,9 +1,17 @@
 package com.noop.ui
 
 import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.gestures.detectHorizontalDragGestures
+import androidx.compose.foundation.gestures.detectTapGestures
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Brush
@@ -13,8 +21,14 @@ import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.StrokeJoin
 import androidx.compose.ui.graphics.drawscope.DrawScope
 import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.graphics.nativeCanvas
+import androidx.compose.ui.graphics.toArgb
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
+import java.util.Locale
+import kotlin.math.abs
+import kotlin.math.roundToInt
 
 // MARK: - Charts (pure Compose Canvas — dark, instrument-grade, no external library)
 //
@@ -41,17 +55,27 @@ private fun pointsFor(
 ): List<Offset> {
     val clean = values.filter { it.isFinite() }
     if (clean.size < 2 || width <= 0f || height <= 0f) return emptyList()
+    return pointsFor(clean, width, height, topPad, bottomPad, clean.min(), clean.max())
+}
 
-    val minV = clean.min()
-    val maxV = clean.max()
+private fun pointsFor(
+    values: List<Double>,
+    width: Float,
+    height: Float,
+    topPad: Float,
+    bottomPad: Float,
+    minV: Double,
+    maxV: Double,
+): List<Offset> {
+    if (values.size < 2 || width <= 0f || height <= 0f) return emptyList()
+
     val span = (maxV - minV)
     val usableH = (height - topPad - bottomPad).coerceAtLeast(1f)
-    val stepX = if (clean.size > 1) width / (clean.size - 1) else width
+    val stepX = if (values.size > 1) width / (values.size - 1) else width
 
-    return clean.mapIndexed { i, v ->
+    return values.mapIndexed { i, v ->
         val x = stepX * i
         val norm = if (span > 0.0) ((v - minV) / span).toFloat() else 0.5f
-        // y is inverted: higher value → smaller y (toward the top).
         val y = topPad + (1f - norm) * usableH
         Offset(x, y)
     }
@@ -61,7 +85,7 @@ private fun pointsFor(
 private fun DrawScope.drawBaseline(color: Color = Palette.hairline) {
     val y = size.height / 2f
     drawLine(
-        color = color.copy(alpha = 0.6f),
+        color = color.copy(alpha = StrandAlpha.subtleLine),
         start = Offset(0f, y),
         end = Offset(size.width, y),
         strokeWidth = 1f,
@@ -84,7 +108,7 @@ fun Sparkline(
     Canvas(
         modifier = modifier
             .fillMaxWidth()
-            .height(28.dp),
+            .height(Metrics.sparklineHeight),
     ) {
         val strokePx = 2f
         val pad = strokePx
@@ -119,51 +143,207 @@ fun LineChart(
     modifier: Modifier,
     color: Color = Palette.accent,
     fill: Boolean = true,
+    // Default OFF so the long-standing static LineCharts across the app (Today HR, Stress, Apple
+    // Health, Trends Explore, the Health HR section) stay static; the screens that want the new
+    // tap/swipe-to-inspect interaction opt in explicitly (Sleep, Trends, the Vital Signs detail).
+    selectionEnabled: Boolean = false,
+    dragSelectionEnabled: Boolean = true,
 ) {
+    val cleanValues = remember(values) { values.filter { it.isFinite() } }
+    var selectedIndex by remember(cleanValues) { mutableIntStateOf(-1) }
+    val interactiveModifier = if (selectionEnabled) {
+        Modifier
+            .pointerInput(cleanValues) {
+                detectTapGestures(
+                    onTap = { offset ->
+                        if (cleanValues.size >= 2 && size.width > 0) {
+                            selectedIndex = nearestIndexForX(
+                                count = cleanValues.size,
+                                width = size.width.toFloat(),
+                                x = offset.x,
+                            )
+                        }
+                    },
+                )
+            }
+            .then(
+                if (dragSelectionEnabled) {
+                    Modifier.pointerInput(cleanValues) {
+                        detectHorizontalDragGestures(
+                            onDragStart = { start ->
+                                if (cleanValues.size < 2 || size.width <= 0f) return@detectHorizontalDragGestures
+                                selectedIndex = nearestIndexForX(
+                                    count = cleanValues.size,
+                                    width = size.width.toFloat(),
+                                    x = start.x,
+                                )
+                            },
+                            onHorizontalDrag = { change, _ ->
+                                if (cleanValues.size < 2 || size.width <= 0f) return@detectHorizontalDragGestures
+                                selectedIndex = nearestIndexForX(
+                                    count = cleanValues.size,
+                                    width = size.width.toFloat(),
+                                    x = change.position.x,
+                                )
+                                change.consume()
+                            },
+                        )
+                    }
+                } else {
+                    Modifier
+                },
+            )
+    } else {
+        Modifier
+    }
+
+    Box(
+        modifier = modifier
+            .fillMaxWidth()
+            .then(interactiveModifier),
+    ) {
+        Canvas(modifier = Modifier.fillMaxSize()) {
+            val strokePx = 2.5f
+            val topPad = strokePx + 4f
+            val bottomPad = strokePx + 4f
+            val pts = pointsFor(cleanValues, size.width, size.height, topPad, bottomPad)
+            if (pts.isEmpty()) {
+                drawBaseline()
+                return@Canvas
+            }
+
+            // Soft gradient fill under the curve.
+            if (fill) {
+                val fillPath = Path().apply {
+                    moveTo(pts.first().x, size.height)
+                    lineTo(pts.first().x, pts.first().y)
+                    for (i in 1 until pts.size) lineTo(pts[i].x, pts[i].y)
+                    lineTo(pts.last().x, size.height)
+                    close()
+                }
+                drawPath(
+                    path = fillPath,
+                    brush = Brush.verticalGradient(
+                        colors = listOf(
+                            color.copy(alpha = StrandAlpha.chartFillStrong),
+                            color.copy(alpha = StrandAlpha.chartFillSoft),
+                            Color.Transparent,
+                        ),
+                        startY = 0f,
+                        endY = size.height,
+                    ),
+                )
+            }
+
+            // The line itself.
+            val linePath = Path().apply {
+                moveTo(pts.first().x, pts.first().y)
+                for (i in 1 until pts.size) lineTo(pts[i].x, pts[i].y)
+            }
+            drawPath(
+                path = linePath,
+                color = color,
+                style = Stroke(width = strokePx, cap = StrokeCap.Round, join = StrokeJoin.Round),
+            )
+
+            // Tap-to-pinpoint: vertical marker + dot + value text.
+            if (selectionEnabled && selectedIndex in pts.indices) {
+                val p = pts[selectedIndex]
+                drawLine(
+                    color = color.copy(alpha = StrandAlpha.chartMarker),
+                    start = Offset(p.x, 0f),
+                    end = Offset(p.x, size.height),
+                    strokeWidth = 1.5f,
+                    cap = StrokeCap.Round,
+                )
+                drawCircle(color = color, radius = 5f, center = p)
+                drawCircle(color = Palette.surfaceBase.copy(alpha = StrandAlpha.chartShadow), radius = 9f, center = p)
+                drawCircle(color = color, radius = 4.5f, center = p)
+                drawContext.canvas.nativeCanvas.apply {
+                    val paint = android.graphics.Paint().apply {
+                        isAntiAlias = true
+                        textSize = 30f
+                        this.color = color.copy(alpha = StrandAlpha.chartLabel).toArgb()
+                        typeface = android.graphics.Typeface.create(
+                            android.graphics.Typeface.DEFAULT,
+                            android.graphics.Typeface.BOLD,
+                        )
+                    }
+                    val label = formatLineValue(cleanValues[selectedIndex])
+                    drawText(label, 8f, 32f, paint)
+                }
+            }
+        }
+    }
+}
+
+data class LineSeries(
+    val values: List<Double>,
+    val color: Color,
+)
+
+@Composable
+fun MultiLineChart(
+    series: List<LineSeries>,
+    modifier: Modifier,
+) {
+    val cleanSeries = remember(series) {
+        series.map { it.copy(values = it.values.filter { value -> value.isFinite() }) }
+            .filter { it.values.size >= 2 }
+    }
+
     Canvas(modifier = modifier.fillMaxWidth()) {
-        val strokePx = 2.5f
-        val topPad = strokePx + 4f
-        val bottomPad = strokePx + 4f
-        val pts = pointsFor(values, size.width, size.height, topPad, bottomPad)
-        if (pts.isEmpty()) {
+        if (cleanSeries.isEmpty()) {
             drawBaseline()
             return@Canvas
         }
 
-        // Soft gradient fill under the curve.
-        if (fill) {
-            val fillPath = Path().apply {
-                moveTo(pts.first().x, size.height)
-                lineTo(pts.first().x, pts.first().y)
+        val allValues = cleanSeries.flatMap { it.values }
+        val minV = allValues.minOrNull() ?: return@Canvas
+        val maxV = allValues.maxOrNull() ?: return@Canvas
+        val strokePx = 2.5f
+        val topPad = strokePx + 4f
+        val bottomPad = strokePx + 4f
+
+        cleanSeries.forEach { line ->
+            val pts = pointsFor(line.values, size.width, size.height, topPad, bottomPad, minV, maxV)
+            if (pts.isEmpty()) return@forEach
+            val path = Path().apply {
+                moveTo(pts.first().x, pts.first().y)
                 for (i in 1 until pts.size) lineTo(pts[i].x, pts[i].y)
-                lineTo(pts.last().x, size.height)
-                close()
             }
             drawPath(
-                path = fillPath,
-                brush = Brush.verticalGradient(
-                    colors = listOf(
-                        color.copy(alpha = 0.28f),
-                        color.copy(alpha = 0.04f),
-                        Color.Transparent,
-                    ),
-                    startY = 0f,
-                    endY = size.height,
-                ),
+                path = path,
+                color = line.color,
+                style = Stroke(width = strokePx, cap = StrokeCap.Round, join = StrokeJoin.Round),
             )
         }
-
-        // The line itself.
-        val linePath = Path().apply {
-            moveTo(pts.first().x, pts.first().y)
-            for (i in 1 until pts.size) lineTo(pts[i].x, pts[i].y)
-        }
-        drawPath(
-            path = linePath,
-            color = color,
-            style = Stroke(width = strokePx, cap = StrokeCap.Round, join = StrokeJoin.Round),
-        )
     }
+}
+
+private fun nearestIndexForX(count: Int, width: Float, x: Float): Int {
+    if (count <= 1 || width <= 0f) return 0
+    val step = width / (count - 1)
+    val clampedX = x.coerceIn(0f, width)
+    val raw = (clampedX / step).roundToInt()
+    return raw.coerceIn(0, count - 1)
+}
+
+private fun formatLineValue(value: Double): String {
+    if (!value.isFinite()) return "-"
+    val rounded = value.roundToInt().toDouble()
+    return if (abs(value - rounded) < 0.05) {
+        rounded.toInt().toString()
+    } else {
+        String.format(Locale.US, "%.1f", value)
+    }
+}
+
+private fun nearestBarIndexForX(count: Int, width: Float, x: Float): Int {
+    if (count <= 1 || width <= 0f) return 0
+    val slot = width / count
+    val clampedX = x.coerceIn(0f, width)
+    return (clampedX / slot).toInt().coerceIn(0, count - 1)
 }
 
 // MARK: - BarChart
@@ -178,39 +358,79 @@ fun BarChart(
     values: List<Double>,
     modifier: Modifier,
     color: Color = Palette.accent,
+    selectionEnabled: Boolean = false,
 ) {
-    Canvas(modifier = modifier.fillMaxWidth()) {
-        val clean = values.map { if (it.isFinite() && it > 0.0) it else 0.0 }
-        val maxV = clean.maxOrNull() ?: 0.0
-        if (clean.isEmpty() || maxV <= 0.0 || size.width <= 0f || size.height <= 0f) {
-            drawBaseline()
-            return@Canvas
-        }
+    val cleanValues = remember(values) { values.map { if (it.isFinite() && it > 0.0) it else 0.0 } }
+    var selectedIndex by remember(cleanValues) { mutableIntStateOf(-1) }
 
-        val topPad = 4f
-        val usableH = (size.height - topPad).coerceAtLeast(1f)
-        // Slot per bar; bar occupies ~64% of the slot, centered, with rounded caps.
-        val slot = size.width / clean.size
-        val barWidth = (slot * 0.64f).coerceAtLeast(1f)
-        val capRadius = (barWidth / 2f)
+    Box(
+        modifier = modifier
+            .fillMaxWidth()
+            .then(
+                if (selectionEnabled) {
+                    Modifier.pointerInput(cleanValues) {
+                        detectTapGestures(
+                            onTap = { offset ->
+                                if (cleanValues.isNotEmpty() && size.width > 0) {
+                                    selectedIndex = nearestBarIndexForX(
+                                        count = cleanValues.size,
+                                        width = size.width.toFloat(),
+                                        x = offset.x,
+                                    )
+                                }
+                            },
+                        )
+                    }
+                } else {
+                    Modifier
+                },
+            ),
+    ) {
+        Canvas(modifier = Modifier.fillMaxSize()) {
+            val clean = cleanValues
+            val maxV = clean.maxOrNull() ?: 0.0
+            if (clean.isEmpty() || maxV <= 0.0 || size.width <= 0f || size.height <= 0f) {
+                drawBaseline()
+                return@Canvas
+            }
 
-        clean.forEachIndexed { i, v ->
-            val norm = (v / maxV).toFloat().coerceIn(0f, 1f)
-            val barHeight = (norm * usableH).coerceAtLeast(if (v > 0.0) 1f else 0f)
-            if (barHeight <= 0f) return@forEachIndexed
-            val cx = slot * i + slot / 2f
-            val left = cx - barWidth / 2f
-            val top = size.height - barHeight
-            drawLine(
-                color = color,
-                start = Offset(cx, size.height),
-                end = Offset(cx, (top + capRadius).coerceAtMost(size.height)),
-                strokeWidth = barWidth,
-                cap = StrokeCap.Round,
-            )
-            // The drawLine above with a round cap already rounds the top; `left` is
-            // retained for clarity but unused beyond centering math.
-            @Suppress("UNUSED_EXPRESSION") left
+            val topPad = 4f
+            val usableH = (size.height - topPad).coerceAtLeast(1f)
+            val slot = size.width / clean.size
+            val barWidth = (slot * 0.64f).coerceAtLeast(1f)
+            val capRadius = (barWidth / 2f)
+
+            clean.forEachIndexed { i, v ->
+                val norm = (v / maxV).toFloat().coerceIn(0f, 1f)
+                val barHeight = (norm * usableH).coerceAtLeast(if (v > 0.0) 1f else 0f)
+                if (barHeight <= 0f) return@forEachIndexed
+                val cx = slot * i + slot / 2f
+                val left = cx - barWidth / 2f
+                val top = size.height - barHeight
+                drawLine(
+                    color = if (selectionEnabled && i == selectedIndex) color else color.copy(alpha = StrandAlpha.unselectedBar),
+                    start = Offset(cx, size.height),
+                    end = Offset(cx, (top + capRadius).coerceAtMost(size.height)),
+                    strokeWidth = barWidth,
+                    cap = StrokeCap.Round,
+                )
+                @Suppress("UNUSED_EXPRESSION") left
+            }
+
+            if (selectionEnabled && selectedIndex in clean.indices) {
+                drawContext.canvas.nativeCanvas.apply {
+                    val paint = android.graphics.Paint().apply {
+                        isAntiAlias = true
+                        textSize = 30f
+                        this.color = color.copy(alpha = StrandAlpha.chartLabel).toArgb()
+                        typeface = android.graphics.Typeface.create(
+                            android.graphics.Typeface.DEFAULT,
+                            android.graphics.Typeface.BOLD,
+                        )
+                    }
+                    drawText(formatLineValue(clean[selectedIndex]), 8f, 32f, paint)
+                }
+            }
         }
     }
 }
@@ -237,7 +457,7 @@ fun Hypnogram(
     Canvas(
         modifier = modifier
             .fillMaxWidth()
-            .height(18.dp),
+            .height(Metrics.segmentBarHeight),
     ) {
         val w = size.width
         val h = size.height
@@ -285,7 +505,7 @@ fun Hypnogram(
 fun SegmentBar(
     segments: List<Pair<Color, Float>>,
     modifier: Modifier,
-    height: Dp = 18.dp,
+    height: Dp = Metrics.segmentBarHeight,
 ) {
     Canvas(modifier = modifier.fillMaxWidth().height(height)) {
         val w = size.width

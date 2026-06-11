@@ -25,7 +25,7 @@ object AppChangelog {
      * Bump this when you add a release below. The "What's New" sheet shows automatically when the
      * stored last-seen version is behind this. (Decoupled from the bundle version on purpose.)
      */
-    const val CURRENT_VERSION = "1.84"
+    const val CURRENT_VERSION = "1.85"
 
     data class Release(
         val version: String,
@@ -36,6 +36,17 @@ object AppChangelog {
 
     /** Newest first. */
     val releases: List<Release> = listOf(
+        Release(
+            version = "1.85",
+            title = "Browse the last few days, interactive charts, and a Vital Signs screen (Android)",
+            date = "June 2026",
+            items = listOf(
+                "New (Android): browse the last 3 days on Today, Sleep and Vital Signs — flip between Today, Yesterday and 2 days ago from the same screen.",
+                "New (Android): charts are now interactive on Sleep, Trends and the new Vital Signs detail — tap and swipe across the line to read off the exact value at any point.",
+                "New (Android): Vital Signs is now a first-class screen reachable from the menu — your resting HR, HRV, SpO₂, skin temperature and respiratory rate with their recent history and context in one place.",
+                "Improved (Android): more robust background reconnect — the long-lived connection and its persistent notification come back cleanly after an app update or restart. (A community contribution — thank you.) (Mac: version bump only.)",
+            ),
+        ),
         Release(
             version = "1.84",
             title = "Fix the Android freeze after a few nights of data",
