@@ -1,14 +1,52 @@
-# iOS Port — Status, Structure & Lessons
+# iOS — Install & Build
 
-> **Folded into `main` (v1.94), build-from-source only.** The iOS app target (`NOOPiOS` +
-> `NOOPiOSWidgets`) now lives on `main` and builds against current code — `xcodegen generate` then
-> build the `NOOPiOS` scheme in Xcode. There is **no download**: iOS has no anonymous distribution
-> path (App Store and TestFlight both require a real Apple Developer identity), so distribution is
-> impossible while NOOP stays anonymous. Build it yourself in Xcode if you want to run it. A CI job
-> ([`app-build.yml`](../.github/workflows/app-build.yml)) compiles **both** the macOS and iOS targets
-> on every change so iOS can't silently break. (macOS is the reference implementation; Android ships
-> as a full app.) The reconciliation that brought the [PR #42](../../../pull/42) port onto current
-> `main` is summarised in **"Lessons from the fold-in"** below.
+> **iOS is now a direct download (v1.96).** Grab **`NOOP-v<version>-ios.ipa`** from the
+> [Releases](../../../releases) page and install it with **AltStore** or **SideStore** — see
+> **[Install (sideload)](#install-sideload)** below. No Mac, no Xcode, no App Store, and no Apple
+> Developer account needed — **and NOOP stays anonymous**, because the `.ipa` we ship is *unsigned*
+> and **you** sign it on your own iPhone with your own free Apple ID. The app target (`NOOPiOS` +
+> `NOOPiOSWidgets`) also still builds from source in Xcode if you'd rather (**[Build from source](#build-from-source)**).
+> A CI job ([`app-build.yml`](../.github/workflows/app-build.yml)) compiles both the macOS and iOS
+> targets on every change so iOS can't silently break.
+
+## Install (sideload)
+
+The `.ipa` is **unsigned on purpose** — that's what keeps the project anonymous. iOS won't run an
+unsigned app, so a free sideloading tool signs it **on your device, with your own free Apple ID**.
+Nothing about this touches NOOP's identity or Apple's servers on our side.
+
+1. **Install a sideloader on your computer** — [AltStore](https://altstore.io) or
+   [SideStore](https://sidestore.io) (both free). Follow their one-time setup (it installs a helper +
+   AltStore/SideStore onto your iPhone using your own Apple ID).
+2. **Download `NOOP-v<version>-ios.ipa`** from [Releases](../../../releases) to your iPhone (or your
+   computer, then AirDrop/transfer it).
+3. **Open the `.ipa` with AltStore/SideStore** (Share → AltStore, or the app's "+" button). It signs
+   and installs NOOP. First launch may need **Settings → General → VPN & Device Management → trust
+   your Apple ID**.
+
+> ### Two honest limitations of free-Apple-ID sideloading
+> - **7-day expiry.** Apps signed with a *free* Apple ID stop launching after 7 days and need
+>   re-signing. **AltStore/SideStore refresh this automatically** in the background — keep the
+>   sideloader installed and NOOP keeps working.
+> - **Some Apple-only features may be limited.** A free signing identity can't grant certain Apple
+>   entitlements, so **Apple Health (HealthKit) read/write and the Live Activity / lock-screen
+>   widgets may not work** on a free-signed sideload. The core app — pairing your strap, live HR,
+>   recovery/strain/sleep, history, the AI Coach, everything on-device — works regardless. This is an
+>   Apple signing constraint, not a NOOP limitation, and it's why a HealthKit toggle can appear to do
+>   nothing on a sideloaded build. (Building from source with your own Apple ID in Xcode grants these
+>   entitlements normally.)
+
+iOS shares the cross-platform Swift packages with macOS, so the number-crunching (recovery, strain,
+HRV, sleep) is the **same code** and produces the same results. iOS is newer and less battle-tested
+than macOS/Android — live BLE on a real iPhone is still being validated by the community, so reports
+are very welcome.
+
+## Build from source
+
+Prefer to build it yourself (which also grants HealthKit/widgets under your own Apple ID)? Run
+`xcodegen generate`, then build the **`NOOPiOS`** scheme in Xcode. The reconciliation that brought the
+[PR #42](../../../pull/42) port onto current `main` is summarised in **"Lessons from the fold-in"**
+below.
 
 > ℹ️ **Cross-platform engineering lives in [`CROSS_PLATFORM.md`](CROSS_PLATFORM.md)** — the shared-code
 > boundary across the macOS / iOS / Android clients, the `Platform.swift` shim convention, the

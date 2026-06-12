@@ -17,6 +17,23 @@ approximate; downloads are on the [Releases](https://github.com/NoopApp/noop/rel
 
 ---
 
+## 1.96 — iOS is now a direct download
+
+- **New: iOS is a direct download.** You no longer need a Mac and Xcode — the iOS app ships as an
+  **unsigned `.ipa`** you install with **AltStore** or **SideStore**, which signs it on your own
+  iPhone with your own **free Apple ID**. No App Store, no Apple Developer account, no identity
+  attached to the project — NOOP stays anonymous, and you self-sign on-device. See
+  [`docs/IOS.md`](docs/IOS.md) for the 5-minute setup. Two honest notes: a free Apple ID re-signs
+  the app **every 7 days** (AltStore automates this), and some Apple-only integrations (Apple Health,
+  Live Activity widgets) can be limited under a free signing identity.
+- **Fixed (Mac, iOS and Android):** the "your strap's clock has lost sync" warning no longer appears
+  after a single quiet sync — it now waits for several empty syncs in a row, so a healthy strap with
+  one nothing-to-hand-over cycle doesn't trigger a false alarm. (#126)
+- **Fixed (Android):** Health Connect import now respects **partial permissions** — switch off the
+  data types you don't want NOOP to read, and it imports the rest instead of refusing entirely. (#150)
+
+---
+
 ## 1.95 — Sleep and recovery for WHOOP 4.0 straps on the firmware we couldn't read
 
 - **New (Mac and Android):** some WHOOP 4.0 straps run a firmware whose offloaded history NOOP

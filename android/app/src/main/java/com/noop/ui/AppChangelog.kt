@@ -25,7 +25,7 @@ object AppChangelog {
      * Bump this when you add a release below. The "What's New" sheet shows automatically when the
      * stored last-seen version is behind this. (Decoupled from the bundle version on purpose.)
      */
-    const val CURRENT_VERSION = "1.95"
+    const val CURRENT_VERSION = "1.96"
 
     data class Release(
         val version: String,
@@ -36,6 +36,16 @@ object AppChangelog {
 
     /** Newest first. */
     val releases: List<Release> = listOf(
+        Release(
+            version = "1.96",
+            title = "iOS is now a direct download — no Mac or Xcode needed",
+            date = "June 2026",
+            items = listOf(
+                "New: the iOS app is now a **direct download** you install with AltStore or SideStore — it signs on your own iPhone with your own free Apple ID, so there's no App Store, no developer account, and NOOP stays anonymous. You no longer need a Mac and Xcode to run it. (Two notes, stated plainly: a free Apple ID re-signs the app every 7 days — AltStore automates that — and some Apple-only integrations like Apple Health and Live Activity widgets can be limited under a free signing identity.)",
+                "Fixed (Mac, iOS and Android): the \"your strap's clock has lost sync\" warning no longer appears after a single quiet sync. It now waits for several empty syncs in a row before warning, so a healthy strap that simply had nothing new to hand over one cycle doesn't get a false alarm. (#126)",
+                "Fixed (Android): Health Connect import now respects partial permissions — switch off the data types you don't want NOOP to read, and it imports the rest instead of refusing the whole import. (#150)",
+            ),
+        ),
         Release(
             version = "1.95",
             title = "Sleep and recovery for WHOOP 4.0 straps on the firmware we couldn't read",
