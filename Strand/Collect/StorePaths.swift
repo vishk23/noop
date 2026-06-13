@@ -10,6 +10,26 @@ enum StorePaths {
         try fm.createDirectory(at: base, withIntermediateDirectories: true)
         let dbURL = base.appendingPathComponent("whoop.sqlite")
 
+        #if os(iOS)
+        // iOS files default to NSFileProtectionComplete, which makes the SQLite DB and its `-wal`/`-shm`
+        // sidecars cryptographically UNREADABLE while the device is locked. We run background BLE
+        // (UIBackgroundModes: bluetooth-central), so the strap reconnects and opens the store while the
+        // phone is locked — the open then throws SQLITE_IOERR and the strap never syncs; imported data
+        // also appears to "vanish" because every store handle (backfill + import) hits the same wall.
+        // (#222 — NoahMcE.) Drop the store to completeUntilFirstUserAuthentication: readable after the
+        // first unlock-since-boot (the correct level for background collection) and still encrypted at
+        // rest. Set it on the directory so SQLite's freshly-created files inherit it, AND on any
+        // pre-existing files from an install created before this fix (the set only succeeds while
+        // unlocked, which the foreground import provides — from then on the files stay accessible).
+        let protection: [FileAttributeKey: Any] =
+            [.protectionKey: FileProtectionType.completeUntilFirstUserAuthentication]
+        try? fm.setAttributes(protection, ofItemAtPath: base.path)
+        for suffix in ["", "-wal", "-shm"] {
+            let p = dbURL.path + suffix
+            if fm.fileExists(atPath: p) { try? fm.setAttributes(protection, ofItemAtPath: p) }
+        }
+        #endif
+
         #if os(macOS)
         // If we redirected into the sandbox container but the container store is
         // absent/empty while a legacy non-container store exists, migrate the old

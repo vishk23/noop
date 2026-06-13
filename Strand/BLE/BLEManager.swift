@@ -297,8 +297,26 @@ public final class BLEManager: NSObject, ObservableObject {
     /// times — bails out early if the collector is already initialised.
     func bootstrapStore() async {
         guard collector == nil else { return }
-        guard let path = try? StorePaths.defaultDatabasePath() else { return }
-        guard let store = try? await WhoopStore(path: path) else { return }
+        // Surface store-open failures instead of swallowing them with `try?` (#222): a silent failure
+        // here left `backfiller` nil forever and the only visible symptom was the downstream
+        // "store not ready" tick, with no clue why. On iOS a background reconnect that opens the
+        // data-protected store while the device is locked throws SQLITE_IOERR/CANTOPEN — logging the
+        // code proves it; the periodic tick (see beginBackfill) re-attempts so it self-heals on unlock.
+        let path: String
+        do {
+            path = try StorePaths.defaultDatabasePath()
+        } catch {
+            log("Backfill: bootstrap FAILED resolving DB path — \(error)")
+            return
+        }
+        let store: WhoopStore
+        do {
+            store = try await WhoopStore(path: path)
+        } catch {
+            let ns = error as NSError
+            log("Backfill: bootstrap FAILED opening store — \(ns.domain) code=\(ns.code): \(ns.localizedDescription)")
+            return
+        }
         try? await store.upsertDevice(id: deviceId, mac: nil, name: "WHOOP 4.0")
         // Research toggle — OFF by default. When disabled the app is decoded-only and never
         // persists raw frames. Flip "enableRawCapture" in UserDefaults to capture raw again.
@@ -614,9 +632,15 @@ public final class BLEManager: NSObject, ObservableObject {
             return false
         }
         guard let backfiller else {
-            // Store not ready yet. Do NOT force live HR — the type-47 backfill is the metric
-            // source. Just log; the next periodic backfill tick will run once the store is ready.
-            log("Backfill: store not ready — deferring to next periodic tick")
+            // Store not built yet (bootstrapStore failed or hasn't run). Do NOT force live HR — the
+            // type-47 backfill is the metric source. RE-ATTEMPT the bootstrap here so a transient
+            // first-open failure self-heals: on iOS the data-protected store is unreadable while the
+            // phone is locked, so a background-reconnect bootstrap can fail and, with no retry, stay
+            // dead forever (#222). Each periodic tick now retries; the first one that runs after the
+            // device is unlocked rebuilds the store and backfill proceeds. bootstrapStore() guards on
+            // `collector == nil`, so this is a no-op once the store is up.
+            log("Backfill: store not ready — re-attempting bootstrap, will retry next tick")
+            Task { @MainActor in await self.bootstrapStore() }
             return false
         }
         // Capture the family at begin() (not init): selectedModel is reliably set by connect() before any

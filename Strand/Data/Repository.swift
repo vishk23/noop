@@ -157,9 +157,25 @@ final class Repository: ObservableObject {
 
     private func ensureStore() async -> WhoopStore? {
         if let store { return store }
-        guard let path = try? StorePaths.defaultDatabasePath() else { return nil }
-        let s = try? await WhoopStore(path: path)
-        if let s { try? await s.upsertDevice(id: deviceId, mac: nil, name: "WHOOP") }
+        // Don't swallow the open failure with `try?` (#222): an import-time open failure (e.g. the iOS
+        // data-protected store while the device is locked) was previously invisible, surfacing only as a
+        // generic "Couldn't open the local store." Log the real error so the cause is diagnosable.
+        let path: String
+        do {
+            path = try StorePaths.defaultDatabasePath()
+        } catch {
+            NSLog("WhoopStore: ensureStore FAILED resolving DB path — \(error)")
+            return nil
+        }
+        let s: WhoopStore
+        do {
+            s = try await WhoopStore(path: path)
+        } catch {
+            let ns = error as NSError
+            NSLog("WhoopStore: ensureStore FAILED opening store — \(ns.domain) code=\(ns.code): \(ns.localizedDescription)")
+            return nil
+        }
+        try? await s.upsertDevice(id: deviceId, mac: nil, name: "WHOOP")
         store = s
         return s
     }

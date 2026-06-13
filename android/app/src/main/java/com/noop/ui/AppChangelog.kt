@@ -25,7 +25,7 @@ object AppChangelog {
      * Bump this when you add a release below. The "What's New" sheet shows automatically when the
      * stored last-seen version is behind this. (Decoupled from the bundle version on purpose.)
      */
-    const val CURRENT_VERSION = "2.8.2"
+    const val CURRENT_VERSION = "2.8.3"
 
     data class Release(
         val version: String,
@@ -36,6 +36,15 @@ object AppChangelog {
 
     /** Newest first. */
     val releases: List<Release> = listOf(
+        Release(
+            version = "2.8.3",
+            title = "Fixed: imported data and strap sync getting stuck on iOS",
+            date = "June 2026",
+            items = listOf(
+                "Fixed (iOS): after importing your data, the strap could get stuck on \"store not ready\" and never sync — imported history wouldn't appear and backfill never started. On iOS the local database was sealed behind the device's data protection while the phone was locked, so a background reconnect couldn't open it (macOS and Android were never affected). NOOP now stores its database at the right protection level — readable after you first unlock since boot, still encrypted at rest — and retries automatically, so sync proceeds. Thanks @NoahMcE (#222).",
+                "Improved: store-open failures are now written to the strap log with the real reason instead of failing silently, so problems like this are diagnosable at a glance.",
+            ),
+        ),
         Release(
             version = "2.8.2",
             title = "Cross-platform parity — Android now scores identically to macOS & iOS",
