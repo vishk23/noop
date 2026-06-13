@@ -84,6 +84,16 @@ class JournalLogTest {
     }
 
     @Test
+    fun normaliseFoldsUnicodeWhitespaceAndNeverThrows() {
+        // The key normaliser must (a) fold non-ASCII whitespace — non-breaking space U+00A0,
+        // en-space U+2002 — onto the plain-space form, and (b) never throw. The previous
+        // `Regex("(?U)\\s+")` did both on the desktop JVM but threw PatternSyntaxException on
+        // Android's ICU regex engine, crashing the Insights screen (#224/#267).
+        assertEquals("did you take magnesium?", normJournalKey("Did you take magnesium?\n"))
+        assertEquals(normJournalKey("Did you take magnesium?"), normJournalKey("  Did you take magnesium? "))
+    }
+
+    @Test
     fun dayKeyTodayAndYesterday() {
         val today = LocalDate.of(2026, 6, 10)
         assertEquals("2026-06-10", journalDayKey(0, today))

@@ -62,9 +62,24 @@ val STARTER_JOURNAL_QUESTIONS: List<String> = listOf(
  *  so the stored behaviour key the effects engine joins on is untouched.
  *  Kept value-for-value in step with macOS `JournalCatalogStore.norm` (JournalCatalog.swift). */
 internal fun normJournalKey(s: String): String =
-    // `(?U)` makes \s Unicode-aware so non-breaking space (U+00A0) etc. also split, matching the
-    // Swift `.whitespacesAndNewlines` set value-for-value.
-    s.split(Regex("(?U)\\s+")).filter { it.isNotEmpty() }.joinToString(" ").lowercase()
+    // Collapse every run of whitespace to a single space, then trim + lowercase. Uses Kotlin's
+    // `Char.isWhitespace()` (Unicode-aware — it includes non-breaking space U+00A0 etc.) rather than
+    // a regex: the previous `Regex("(?U)\\s+")` compiled on the desktop JVM but THREW
+    // PatternSyntaxException on Android's ICU engine (the `(?U)` inline flag is unsupported there),
+    // crashing the Insights screen for anyone with journal entries to merge (#224/#267). Matches the
+    // Swift `.whitespacesAndNewlines` normalisation value-for-value.
+    buildString {
+        var prevSpace = true // suppress leading whitespace
+        for (c in s) {
+            if (c.isWhitespace()) {
+                if (!prevSpace) append(' ')
+                prevSpace = true
+            } else {
+                append(c)
+                prevSpace = false
+            }
+        }
+    }.trim().lowercase()
 
 /** Catalog = imported questions (exact strings → logged days join imported history), then starter
  *  defaults, then user customs. Case-insensitive dedupe, first casing wins, with `hidden` questions
