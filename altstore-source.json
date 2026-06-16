@@ -18,6 +18,15 @@
       "screenshotURLs": [],
       "versions": [
         {
+          "version": "4.2.9",
+          "buildVersion": "107",
+          "date": "2026-06-16",
+          "localizedDescription": "Respiratory rate & skin temperature in the Trends report.",
+          "downloadURL": "https://github.com/NoopApp/noop/releases/download/v4.2.9/NOOP-v4.2.9-ios.ipa",
+          "size": 8064361,
+          "minOSVersion": "17.0"
+        },
+        {
           "version": "4.2.8",
           "buildVersion": "106",
           "date": "2026-06-16",
@@ -595,12 +604,12 @@
           "NSHealthUpdateUsageDescription": "NOOP writes the metrics it computes from your strap back into Apple Health, on-device and only when you allow it."
         }
       },
-      "version": "4.2.8",
-      "buildVersion": "106",
+      "version": "4.2.9",
+      "buildVersion": "107",
       "versionDate": "2026-06-16",
-      "versionDescription": "Double-tap to log a sleep mark (#461 Phase 1).",
-      "downloadURL": "https://github.com/NoopApp/noop/releases/download/v4.2.8/NOOP-v4.2.8-ios.ipa",
-      "size": 8061216,
+      "versionDescription": "Respiratory rate & skin temperature in the Trends report.",
+      "downloadURL": "https://github.com/NoopApp/noop/releases/download/v4.2.9/NOOP-v4.2.9-ios.ipa",
+      "size": 8064361,
       "minOSVersion": "17.0"
     }
   ],
