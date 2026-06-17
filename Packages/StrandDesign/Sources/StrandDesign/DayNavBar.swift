@@ -54,10 +54,14 @@ public struct DayNavBar: View {
                         .font(StrandFont.caption)
                         .foregroundStyle(StrandPalette.textPrimary)
                         .lineLimit(1)
-                    Text(Self.fullDateFmt.string(from: selectedDay))
-                        .font(StrandFont.captionNumber)
-                        .foregroundStyle(StrandPalette.accent)
-                        .lineLimit(1)
+                    // On today the label already reads "Today"; the full date would just duplicate the
+                    // header, so it's shown only once you've navigated to another day (for orientation).
+                    if selectedOffset > 0 {
+                        Text(Self.fullDateFmt.string(from: selectedDay))
+                            .font(StrandFont.captionNumber)
+                            .foregroundStyle(StrandPalette.accent)
+                            .lineLimit(1)
+                    }
                 }
                 .frame(maxWidth: .infinity)
                 .padding(.vertical, 10)

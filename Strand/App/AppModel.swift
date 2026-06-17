@@ -218,6 +218,9 @@ final class AppModel: ObservableObject {
             // screenshots). No-op in Release (whole seeder is #if DEBUG) and once data already exists.
             if AppleDemoSeeder.requested, let store = await self.repo.storeHandle() {
                 await AppleDemoSeeder.seedIfRequested(into: store)
+                // Give the demo a plausible strap battery so the Today header badge renders (the live
+                // battery is runtime-only and nil without a connected strap).
+                self.live.batteryPct = 68
             }
             #endif
             await self.repo.refresh()                          // surface any imported data at once

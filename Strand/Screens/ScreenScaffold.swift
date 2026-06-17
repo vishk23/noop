@@ -2,8 +2,10 @@ import SwiftUI
 import StrandDesign
 
 /// Standard scrollable screen container: title + dark surface + content column.
-struct ScreenScaffold<Content: View>: View {
-    let title: LocalizedStringKey
+struct ScreenScaffold<Content: View, Trailing: View>: View {
+    /// Optional — when nil (and no subtitle) the header is omitted entirely, so a screen can supply its
+    /// own custom header in `content` (iOS Today's compact top bar).
+    let title: LocalizedStringKey?
     var subtitle: LocalizedStringKey? = nil
     /// Optional pull-to-refresh hook. When set, the scroll view becomes `.refreshable`
     /// (the standard iPhone gesture for a data dashboard). Defaults to nil so callers that
@@ -15,6 +17,9 @@ struct ScreenScaffold<Content: View>: View {
     /// 800+ day imported history (#345). Defaults to `false` so every existing caller keeps
     /// the eager `VStack` and its identical layout/scroll behaviour.
     var lazy: Bool = false
+    /// Optional element pinned to the header's trailing edge (e.g. the strap-battery badge on Today).
+    /// Defaults to `EmptyView` via the convenience init below, so other screens are unaffected.
+    @ViewBuilder var trailing: () -> Trailing
     @ViewBuilder var content: () -> Content
 
     // iPad runs the shared screens full-screen, where an uncapped column gives 120+ character lines
@@ -53,24 +58,41 @@ struct ScreenScaffold<Content: View>: View {
     @ViewBuilder private var column: some View {
         if lazy {
             LazyVStack(alignment: .leading, spacing: 20) {
-                header
+                if title != nil || subtitle != nil { header }
                 content()
             }
         } else {
             VStack(alignment: .leading, spacing: 20) {
-                header
+                if title != nil || subtitle != nil { header }
                 content()
             }
         }
     }
 
     private var header: some View {
-        VStack(alignment: .leading, spacing: 2) {
-            Text(title).font(StrandFont.title1).foregroundStyle(StrandPalette.textPrimary)
-            if let subtitle {
-                Text(subtitle).font(StrandFont.subhead).foregroundStyle(StrandPalette.textSecondary)
+        HStack(alignment: .center, spacing: 12) {
+            VStack(alignment: .leading, spacing: 2) {
+                if let title {
+                    Text(title).font(StrandFont.title1).foregroundStyle(StrandPalette.textPrimary)
+                }
+                if let subtitle {
+                    Text(subtitle).font(StrandFont.subhead).foregroundStyle(StrandPalette.textSecondary)
+                }
             }
+            Spacer(minLength: 0)
+            trailing()
         }
+    }
+}
+
+extension ScreenScaffold where Trailing == EmptyView {
+    /// Convenience init for the common case with no header trailing element — keeps every existing
+    /// call site (which never passed `trailing`) source-compatible.
+    init(title: LocalizedStringKey?, subtitle: LocalizedStringKey? = nil,
+         onRefresh: (() async -> Void)? = nil, lazy: Bool = false,
+         @ViewBuilder content: @escaping () -> Content) {
+        self.init(title: title, subtitle: subtitle, onRefresh: onRefresh, lazy: lazy,
+                  trailing: { EmptyView() }, content: content)
     }
 }
 
