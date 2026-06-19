@@ -21,8 +21,6 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
-import androidx.compose.foundation.rememberScrollState
-import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.CompareArrows
 import androidx.compose.material.icons.automirrored.filled.TrendingUp
@@ -31,6 +29,7 @@ import androidx.compose.material.icons.filled.Alarm
 import androidx.compose.material.icons.filled.AutoAwesome
 import androidx.compose.material.icons.filled.Bedtime
 import androidx.compose.material.icons.filled.Bolt
+import androidx.compose.material.icons.filled.ChevronRight
 import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material.icons.filled.Explore
 import androidx.compose.material.icons.filled.FavoriteBorder
@@ -82,7 +81,6 @@ import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.lifecycle.viewmodel.compose.viewModel
-import androidx.navigation.NavDestination.Companion.hierarchy
 import androidx.navigation.NavGraph.Companion.findStartDestination
 import androidx.navigation.NavHostController
 import androidx.navigation.compose.NavHost
@@ -144,7 +142,11 @@ private enum class Destination(
     FusedRecord("fused_record", "Your Data, Fused", Icons.AutoMirrored.Filled.CompareArrows),
     Notifications("notifications", "Notifications", Icons.Filled.Notifications),
     Support("support", "Support", Icons.Filled.Tune),
-    Settings("settings", "Settings", Icons.Filled.Settings);
+    Settings("settings", "Settings", Icons.Filled.Settings),
+
+    // The "More" tab: its own navigated page (mirroring the iOS More tab) that hosts the full
+    // grouped destination list. It is NOT itself in any [DrawerGroup] — it's the door to them.
+    More("more", "More", Icons.Filled.MoreHoriz);
 
     companion object {
         /** Resolve the destination owning the current back-stack route (defaults to Today). */
@@ -194,7 +196,6 @@ fun AppRoot(viewModel: AppViewModel = viewModel()) {
     val backStack by nav.currentBackStackEntryAsState()
     val currentRoute = backStack?.destination?.route
     val current = Destination.forRoute(currentRoute)
-    var showMoreSheet by remember { mutableStateOf(false) }
     var showQuickActions by remember { mutableStateOf(false) }
     // The Updates inbox sheet (opened by the Today header bell). The store is a process singleton so
     // the Today cards and the import path post to the same inbox this sheet renders.
@@ -208,14 +209,14 @@ fun AppRoot(viewModel: AppViewModel = viewModel()) {
             bottomBar = {
                 // One unified "glass" bar: four evenly-spaced tabs — Today · Trends · Sleep · More
                 // (matches the iOS FloatingTabBar). The quick-action "+" lives in the Today header's
-                // top-right (balancing the avatar), so the bar is clean tabs only. "More" opens a sheet
-                // that reaches every grouped destination, so no destination is lost without the drawer.
+                // top-right (balancing the avatar), so the bar is clean tabs only. "More" navigates to
+                // its own page (mirroring the iOS More tab) that reaches every grouped destination, so no
+                // destination is lost without the drawer.
                 GlassBottomBar(
                     current = current,
                     onTabSelected = { dest ->
                         if (dest.route != currentRoute) nav.navigateTopLevel(dest.route)
                     },
-                    onMore = { showMoreSheet = true },
                 )
             },
         ) { inner ->
@@ -317,61 +318,10 @@ fun AppRoot(viewModel: AppViewModel = viewModel()) {
                 composable(Destination.DataSources.route) { DataSourcesScreen(viewModel) }
                 composable(Destination.Notifications.route) { NotificationsSettingsScreen(viewModel) }
                 composable(Destination.Settings.route) { SettingsScreen(viewModel) }
-            }
-        }
-
-        // "More" — every destination, grouped exactly like the drawer, one thumb away. The drawer
-        // itself stays for anyone used to the hamburger; both routes lead to the same screens.
-        if (showMoreSheet) {
-            ModalBottomSheet(
-                onDismissRequest = { showMoreSheet = false },
-                containerColor = Palette.surfaceRaised,
-                contentColor = Palette.textPrimary,
-            ) {
-                Column(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .verticalScroll(rememberScrollState())
-                        .padding(horizontal = 12.dp)
-                        .padding(bottom = 24.dp),
-                ) {
-                    drawerGroups.forEachIndexed { index, group ->
-                        if (index > 0) {
-                            HorizontalDivider(
-                                color = Palette.hairline,
-                                modifier = Modifier.padding(vertical = 8.dp),
-                            )
-                        }
-                        Overline(
-                            group.header,
-                            modifier = Modifier.padding(start = 16.dp, top = 4.dp, bottom = 6.dp),
-                            color = Palette.textTertiary,
-                        )
-                        group.items.forEach { dest ->
-                            val selected = backStack?.destination?.hierarchy
-                                ?.any { it.route == dest.route } == true
-                            NavigationDrawerItem(
-                                selected = selected,
-                                onClick = {
-                                    showMoreSheet = false
-                                    if (dest.route != currentRoute) {
-                                        nav.navigateTopLevel(dest.route)
-                                    }
-                                },
-                                icon = { Icon(dest.icon, contentDescription = null) },
-                                label = { Text(dest.title, style = NoopType.body) },
-                                colors = NavigationDrawerItemDefaults.colors(
-                                    selectedContainerColor = Palette.surfaceOverlay, // subtle neutral lift, no gold wash
-                                    unselectedContainerColor = Palette.surfaceRaised,
-                                    selectedIconColor = Palette.accent,
-                                    unselectedIconColor = Palette.textSecondary,
-                                    selectedTextColor = Palette.textPrimary,
-                                    unselectedTextColor = Palette.textSecondary,
-                                ),
-                                modifier = Modifier.padding(NavigationDrawerItemDefaults.ItemPadding),
-                            )
-                        }
-                    }
+                // The "More" page — the iOS More tab's twin: a navigated ScreenScaffold page hosting the
+                // full grouped destination list (was a pull-up sheet). A row navigates top-level.
+                composable(Destination.More.route) {
+                    MoreScreen(onNavigate = { nav.navigateTopLevel(it) })
                 }
             }
         }
@@ -450,6 +400,66 @@ fun AppRoot(viewModel: AppViewModel = viewModel()) {
     }
 }
 
+// MARK: - More page
+//
+// The "More" tab's destination — a full navigated page (mirroring the iOS More tab's NavigationStack
+// List), replacing the old pull-up ModalBottomSheet. It hosts the SAME grouped destinations
+// ([drawerGroups]) inside a [ScreenScaffold], with the exact section-header + row styling the sheet
+// used (uppercase [Overline] group labels, icon + label [NavigationDrawerItem] rows) — now with a
+// trailing chevron so each row reads as a navigation push, matching the iOS disclosure rows. Tapping a
+// row navigates top-level; there is no sheet to dismiss. The floating bottom bar stays visible because
+// this is just another NavHost destination under the same Scaffold.
+
+/** The full grouped destination list as a navigated page (the iOS More tab's twin). */
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun MoreScreen(onNavigate: (String) -> Unit) {
+    ScreenScaffold(
+        title = "More",
+        subtitle = "Everything else, one tap away",
+    ) {
+        drawerGroups.forEachIndexed { index, group ->
+            if (index > 0) {
+                HorizontalDivider(
+                    color = Palette.hairline,
+                    modifier = Modifier.padding(vertical = 8.dp),
+                )
+            }
+            Overline(
+                group.header,
+                modifier = Modifier.padding(start = 16.dp, top = 4.dp, bottom = 6.dp),
+                color = Palette.textTertiary,
+            )
+            group.items.forEach { dest ->
+                NavigationDrawerItem(
+                    // A page row is a plain navigation entry — nothing is "selected" here (the active
+                    // tab is the More bar slot itself), so the rows read uniformly, like the iOS List.
+                    selected = false,
+                    onClick = { onNavigate(dest.route) },
+                    icon = { Icon(dest.icon, contentDescription = null) },
+                    label = { Text(dest.title, style = NoopType.body) },
+                    // Trailing disclosure chevron — the row pushes a screen, mirroring the iOS More
+                    // List's NavigationLink chevrons.
+                    badge = {
+                        Icon(
+                            Icons.Filled.ChevronRight,
+                            contentDescription = null,
+                            tint = Palette.textTertiary,
+                            modifier = Modifier.size(Metrics.iconSmall),
+                        )
+                    },
+                    colors = NavigationDrawerItemDefaults.colors(
+                        unselectedContainerColor = Palette.surfaceBase,
+                        unselectedIconColor = Palette.textSecondary,
+                        unselectedTextColor = Palette.textSecondary,
+                    ),
+                    modifier = Modifier.padding(NavigationDrawerItemDefaults.ItemPadding),
+                )
+            }
+        }
+    }
+}
+
 // MARK: - Glass bottom bar
 //
 // The signature bar, ported from iOS's FloatingTabBar: ONE rounded "glass" island holding four
@@ -478,7 +488,6 @@ private val barTrailingTabs = listOf(
 private fun GlassBottomBar(
     current: Destination,
     onTabSelected: (Destination) -> Unit,
-    onMore: () -> Unit,
 ) {
     val barShape = RoundedCornerShape(50)
     Box(
@@ -534,12 +543,13 @@ private fun GlassBottomBar(
                 BarSlot(
                     icon = Icons.Filled.MoreHoriz,
                     label = "More",
-                    // Lights up whenever the current screen isn't one of the bar's own tabs, so the bar
-                    // never looks like you're nowhere.
+                    // Selected on the More page itself, and also kept lit whenever the current screen is
+                    // one reached THROUGH More (i.e. not one of the bar's own three tabs) — so drilling
+                    // into any grouped destination still reads as "you're in More", never "nowhere".
                     active = current != Destination.Today && current != Destination.Trends &&
                         current != Destination.Sleep,
                     modifier = Modifier.weight(1f),
-                    onClick = onMore,
+                    onClick = { onTabSelected(Destination.More) },
                 )
             }
         }

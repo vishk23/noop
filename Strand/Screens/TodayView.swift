@@ -490,11 +490,8 @@ struct TodayView: View {
         // this path is unavailable (no nav bar on a primary tab) and the 560pt panel would overflow
         // iPhone, so the in-content `supportRow` + auto-sized `.sheet` below take over instead.
         .toolbar {
-            // The Updates "ringer" in the window toolbar (iOS hosts it in the compact top bar instead).
-            ToolbarItem {
-                updateBell.help("Updates")
-            }
-            ToolbarItem {
+            // Support heart on the LEADING (left) edge of the window toolbar.
+            ToolbarItem(placement: .navigation) {
                 Button { showingSupport = true } label: {
                     Image(systemName: "heart.fill")
                         .foregroundStyle(StrandPalette.metricRose)
@@ -502,6 +499,11 @@ struct TodayView: View {
                 }
                 .help("Support NOOP — donate or get in touch")
                 .accessibilityLabel("Support NOOP — donate or get in touch")
+            }
+            // The Updates "ringer" on the TRAILING (top-right) edge, separated from the heart (iOS hosts
+            // it in the compact top bar instead).
+            ToolbarItem(placement: .primaryAction) {
+                updateBell.help("Updates")
             }
         }
         .overlay {
