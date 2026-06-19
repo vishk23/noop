@@ -29,7 +29,11 @@ Nothing about this touches NOOP's identity or Apple's servers on our side.
 So you never have to manually re-download, add NOOP's **source** to AltStore/SideStore once — new
 releases then show up (and re-sign) automatically:
 
-**Source URL:** `https://raw.githubusercontent.com/NoopApp/noop/main/altstore-source.json`
+**Source URL:** `https://noop.fans/NoopApp/noop/raw/branch/main/altstore-source.json`
+
+> If a sideloader says **"given data not valid JSON"** when you add the source, you've used the old
+> GitHub URL — that host is gone, so it returns an error page instead of the file. Use the `noop.fans`
+> URL above.
 
 - **AltStore:** open AltStore → **Browse** tab → tap **＋** (top-left) → paste the URL → **Add Source**.
   NOOP appears under the source; tap **Free** / **Get** to install. From then on it updates itself on
