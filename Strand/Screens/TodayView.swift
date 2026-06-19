@@ -27,6 +27,8 @@ struct TodayView: View {
     @EnvironmentObject var live: LiveState
     @EnvironmentObject var profile: ProfileStore
     @EnvironmentObject var router: NavRouter
+    /// The "update ringer" — the bell in the top bar opens this inbox; dismissed Today cards post into it.
+    @EnvironmentObject var updateStore: UpdateStore
 
     // Imperial/Metric display preference (D#103). Only the Weight tile carries a convertible unit here.
     @AppStorage(UnitPrefs.systemKey) private var unitSystemRaw = UnitSystem.metric.rawValue
@@ -88,6 +90,19 @@ struct TodayView: View {
     // iOS top-bar state: the date-jump popover and the profile/settings sheet.
     @State private var showDayPicker = false
     @State private var showSettings = false
+    /// The Updates inbox sheet (opened by the header bell). Shared across both platforms.
+    @State private var showUpdatesInbox = false
+
+    /// The day-count seen on the previous load, so a refresh that brings in NEW days can post a single
+    /// honest `.reading` update ("New data — N days added") to the inbox. nil until the first load
+    /// establishes a baseline (so the very first load never posts — we only announce genuine growth).
+    @State private var lastSeenDayCount: Int?
+
+    // Per-card "dismissed into the inbox" flags for the two Today info-cards. A small × on each card
+    // sets these (and posts a `.dismissedCard` update); "Restore to Today" in the inbox flips them back
+    // (via the shared `TodayCardDismissal.flagKey`). @AppStorage matches the file's existing prefs style.
+    @AppStorage(TodayCardDismissal.flagKey("scoresBuilding")) private var scoresBuildingDismissed = false
+    @AppStorage(TodayCardDismissal.flagKey("newHere")) private var newHereDismissed = false
 
     // Memoized repo-derived values that are expensive (a full-history sort + per-call
     // `repo.days.map`) yet INDEPENDENT of the ~1 Hz live-HR ticks that re-evaluate `body`
@@ -308,6 +323,8 @@ struct TodayView: View {
                 .accessibilityLabel("Profile and settings")
                 Spacer()
                 StrapBatteryBadge(pct: live.batteryPct)
+                // Updates "ringer" — between the battery badge and the +. Bell with a gold unread badge.
+                updateBell.padding(.leading, 6)
                 // Quick-action "+" — moved here from the tab bar to balance the avatar on the left and
                 // free the bottom bar to four clean tabs. Routes to the shell's quick-action sheet.
                 Button { router.requestQuickActions() } label: {
@@ -356,6 +373,36 @@ struct TodayView: View {
     }
     #endif
 
+    /// The Updates "ringer": a bell button (~30pt) with a small gold unread-count badge. Tapping opens
+    /// the Updates inbox sheet. Shared by the iOS top bar and the macOS toolbar.
+    private var updateBell: some View {
+        Button { showUpdatesInbox = true } label: {
+            Image(systemName: updateStore.unreadCount > 0 ? "bell.badge" : "bell")
+                .font(.system(size: 18))
+                .symbolRenderingMode(.hierarchical)
+                .foregroundStyle(StrandPalette.textSecondary)
+                .frame(width: 30, height: 30)
+                .overlay(alignment: .topTrailing) {
+                    if updateStore.unreadCount > 0 {
+                        Text("\(min(updateStore.unreadCount, 99))")
+                            .font(.system(size: 10, weight: .bold, design: .rounded))
+                            .monospacedDigit()
+                            .foregroundStyle(StrandPalette.goldDeepText)
+                            .padding(.horizontal, 4).padding(.vertical, 1)
+                            .frame(minWidth: 15)
+                            .background(Capsule().fill(StrandPalette.gold))
+                            .offset(x: 6, y: -4)
+                            .accessibilityHidden(true)
+                    }
+                }
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel(updateStore.unreadCount > 0
+                            ? "Updates, \(updateStore.unreadCount) unread"
+                            : "Updates")
+    }
+
     var body: some View {
         ScreenScaffold(title: scaffoldTitle, onRefresh: { await repo.refresh() }) {
             VStack(alignment: .leading, spacing: NoopMetrics.sectionGap) {
@@ -374,14 +421,28 @@ struct TodayView: View {
                 if selectedDayOffset == 0 && repo.today?.recovery == nil {
                     // While the strap is mid-offload, say so — empty tiles read as final otherwise (#77).
                     if live.backfilling { SyncingHistoryNote(chunks: live.syncChunksThisSession) }
-                    DataPendingNote(
-                        title: "Live now. Your scores are building.",
-                        message: "Your live heart rate is working from the strap, and charge, effort and rest build from it over your next few nights of wear, sharpening as it learns your baseline. Want your full history instantly? Import your WHOOP export in Data Sources and it backfills in about a minute."
-                    )
+                    if !scoresBuildingDismissed {
+                        DataPendingNote(
+                            title: "Live now. Your scores are building.",
+                            message: "Your live heart rate is working from the strap, and charge, effort and rest build from it over your next few nights of wear, sharpening as it learns your baseline. Want your full history instantly? Import your WHOOP export in Data Sources and it backfills in about a minute."
+                        )
+                        // A small × dismisses the card INTO the Updates inbox (restorable from there).
+                        .overlay(alignment: .topTrailing) {
+                            todayCardDismissButton {
+                                dismissTodayCard(
+                                    id: "scoresBuilding",
+                                    title: "Live now. Your scores are building.",
+                                    message: "Charge, Effort and Rest build over your next few nights of wear."
+                                )
+                            }
+                        }
+                        .transition(.opacity.combined(with: .scale(scale: 0.97)))
+                    }
                 }
                 // One-time pointer to the scoring guide, shown once scores exist.
-                if selectedDayOffset == 0 && repo.today?.recovery != nil && !scoringGuideCardSeen {
+                if selectedDayOffset == 0 && repo.today?.recovery != nil && !scoringGuideCardSeen && !newHereDismissed {
                     scoringGuideFirstRunCard
+                        .transition(.opacity.combined(with: .scale(scale: 0.97)))
                 }
                 #if os(iOS)
                 // Pull the rings up under the compact top bar — the full section gap left too much air
@@ -429,6 +490,10 @@ struct TodayView: View {
         // this path is unavailable (no nav bar on a primary tab) and the 560pt panel would overflow
         // iPhone, so the in-content `supportRow` + auto-sized `.sheet` below take over instead.
         .toolbar {
+            // The Updates "ringer" in the window toolbar (iOS hosts it in the compact top bar instead).
+            ToolbarItem {
+                updateBell.help("Updates")
+            }
             ToolbarItem {
                 Button { showingSupport = true } label: {
                     Image(systemName: "heart.fill")
@@ -459,6 +524,59 @@ struct TodayView: View {
         .sheet(isPresented: $showGuideTop) {
             ScoringGuideView(onClose: { showGuideTop = false })
         }
+        // The Updates inbox (the header bell). Both platforms.
+        .sheet(isPresented: $showUpdatesInbox) {
+            UpdatesInboxView(onClose: { showUpdatesInbox = false })
+        }
+        // Honour a "Restore to Today" tap from the inbox: flip the matching dismissed flag back so the
+        // card reappears (the inbox also clears the @AppStorage key directly, but this covers an
+        // already-mounted Today). Cleared once handled.
+        .onChangeCompat(of: updateStore.restoreRequest) { payload in
+            guard let payload else { return }
+            withAnimation(StrandMotion.interactive) { restoreTodayCard(payload) }
+            updateStore.restoreRequest = nil
+        }
+    }
+
+    /// Flip a Today info-card's dismissed flag back to false so it reappears (driven by the inbox's
+    /// "Restore to Today"). Keyed on the card id stored in the update's `restorePayload`.
+    private func restoreTodayCard(_ cardID: String) {
+        switch cardID {
+        case "scoresBuilding": scoresBuildingDismissed = false
+        case "newHere":        newHereDismissed = false
+        default:               break
+        }
+    }
+
+    /// Dismiss a Today info-card INTO the inbox: set its @AppStorage flag (so it stays gone) and post a
+    /// `.dismissedCard` update carrying the card id so it can be restored.
+    private func dismissTodayCard(id: String, title: String, message: String) {
+        StrandHaptic.selection.play()
+        switch id {
+        case "scoresBuilding": scoresBuildingDismissed = true
+        case "newHere":        newHereDismissed = true
+        default:               break
+        }
+        updateStore.post(UpdateItem(
+            kind: .dismissedCard,
+            title: title,
+            message: message,
+            restorePayload: id
+        ))
+    }
+
+    /// A small top-trailing × for a Today info-card that has no built-in dismiss control (the shared
+    /// `DataPendingNote`). Matches the "New here?" card's × styling.
+    private func todayCardDismissButton(_ action: @escaping () -> Void) -> some View {
+        Button { withAnimation(StrandMotion.interactive) { action() } } label: {
+            Image(systemName: "xmark")
+                .font(.system(size: 12, weight: .semibold))
+                .foregroundStyle(StrandPalette.textTertiary)
+                .padding(8)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel("Dismiss to Updates")
     }
 
     // MARK: First-run scoring-guide card (one-time, dismissible)
@@ -494,7 +612,14 @@ struct TodayView: View {
                 }
                 Spacer(minLength: 0)
                 Button {
-                    scoringGuideCardSeen = true
+                    // Dismiss INTO the Updates inbox (restorable), rather than permanently hiding.
+                    withAnimation(StrandMotion.interactive) {
+                        dismissTodayCard(
+                            id: "newHere",
+                            title: "New here?",
+                            message: "How Charge, Effort and Rest are calculated — and how they differ from WHOOP."
+                        )
+                    }
                 } label: {
                     Image(systemName: "xmark")
                         .font(.system(size: 12, weight: .semibold))
@@ -1548,6 +1673,27 @@ struct TodayView: View {
         sleepToday = await repo.allSleepSessions(days: selectedDayOffset + 2)
             .filter { $0.endTs > windowStart && $0.startTs < windowEnd }
             .max(by: { ($0.endTs - $0.startTs) < ($1.endTs - $1.startTs) })
+
+        announceNewDaysIfNeeded()
+    }
+
+    /// Post a single honest `.reading` update to the inbox when a refresh brought in NEW days (a WHOOP
+    /// import or an overnight backfill). The count is real — the growth in `repo.days` since the last
+    /// load — never fabricated. Only announces genuine growth: the FIRST load (nil baseline) just sets
+    /// the baseline silently, and a navigated past day is ignored. Links to Trends.
+    private func announceNewDaysIfNeeded() {
+        let count = repo.days.count
+        defer { lastSeenDayCount = count }
+        guard selectedDayOffset == 0, let previous = lastSeenDayCount else { return }
+        let added = count - previous
+        guard added > 0 else { return }
+        updateStore.post(UpdateItem(
+            kind: .reading,
+            title: "New data added",
+            message: added == 1 ? "1 new day of history landed. Open Trends to see it."
+                                : "\(added) new days of history landed. Open Trends to see them.",
+            deepLink: NavRouter.Destination.trends.rawValue
+        ))
     }
 
     /// Trailing-window values for a metric — NO fall back to all history. The section is labelled a

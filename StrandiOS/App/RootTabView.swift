@@ -85,6 +85,10 @@ struct RootTabView: View {
             case .insightsHub, .labBook, .fusedRecord, .rhythm:
                 routedPillar = dest
                 router.requestedDestination = nil
+            case .trends:
+                // Trends is a primary tab on iPhone (not a pillar sheet) — switch to it.
+                withAnimation(.timingCurve(0.22, 1, 0.36, 1, duration: 0.24)) { selectedTab = 1 }
+                router.requestedDestination = nil
             case nil:
                 break
             }
@@ -109,6 +113,10 @@ struct RootTabView: View {
                 case .fusedRecord: FusedRecordHost()
                 case .rhythm: RhythmHost(onClose: { routedPillar = nil })
                 case .devices: DevicesView()
+                // .trends is never presented as a pillar sheet on iPhone (it's a primary tab — the
+                // requestedDestination handler switches `selectedTab` instead), but the switch must stay
+                // exhaustive. Fall back to Trends inside the sheet host if it ever arrives here.
+                case .trends: TrendsView()
                 }
             }
             .background(StrandPalette.surfaceBase.ignoresSafeArea())

@@ -43,7 +43,12 @@ struct ContentView: View {
         // The Terms gate must stay "over everything" — don't pop What's New on top of it after a
         // combined terms+version update. Gate on terms being current, and re-check when they're
         // accepted (onAppear already fired before acceptance), so What's New shows right after.
-        .onAppear { showWhatsNewIfDue() }
+        .onAppear {
+            showWhatsNewIfDue()
+            // Seed the current What's New into the Updates inbox (idempotent per version) so the bell
+            // collects it even if the user dismisses the auto sheet.
+            UpdateStore.shared.seedWhatsNewIfNeeded()
+        }
         .onChangeCompat(of: acceptedTerms) { _ in showWhatsNewIfDue() }
     }
 

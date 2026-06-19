@@ -23,6 +23,7 @@ struct StrandApp: App {
                 .environmentObject(model.intelligence)
                 .environmentObject(model.coach)
                 .environmentObject(router)
+                .environmentObject(UpdateStore.shared)
                 // v5 L3: the shared stress check-in nudge surface, so the Breathe screen's passive
                 // card observes the SAME instance the central detector (AppModel.evaluateStress) posts to.
                 .environment(\.stressNudgeCenter, model.stressNudgeCenter)

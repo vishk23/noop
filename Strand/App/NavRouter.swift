@@ -24,8 +24,16 @@ final class NavRouter: ObservableObject {
         case labBook
         case fusedRecord
         case rhythm
+        case trends
 
         var id: String { rawValue }
+
+        /// Map a stored `UpdateItem.deepLink` route key to a Destination, if it names one. Lets the
+        /// Updates inbox route a tapped item generically (e.g. a `.reading` item's "trends") without the
+        /// inbox knowing every shell. Unknown keys return nil → the inbox just dismisses.
+        init?(deepLinkKey: String) {
+            self.init(rawValue: deepLinkKey)
+        }
     }
 
     /// The destination a screen has asked the shell to open, or nil once handled. Published so the
@@ -49,4 +57,6 @@ final class NavRouter: ObservableObject {
     func openFusedRecord() { requestedDestination = .fusedRecord }
     /// Open the experimental Rhythm visualization (self-gates on its own consent).
     func openRhythm() { requestedDestination = .rhythm }
+    /// Open the Trends screen (where a "new data" reading deep-links).
+    func openTrends() { requestedDestination = .trends }
 }

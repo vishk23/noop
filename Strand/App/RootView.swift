@@ -148,6 +148,7 @@ struct RootView: View {
             case .labBook: selection = .labBook
             case .fusedRecord: selection = .fusedRecord
             case .rhythm: selection = .rhythm
+            case .trends: selection = .trends
             case nil: break
             }
             if dest != nil { router.requestedDestination = nil }
