@@ -42,6 +42,7 @@ import androidx.compose.material.icons.filled.FileUpload
 import androidx.compose.material.icons.filled.Lock
 import androidx.compose.material.icons.filled.MonitorHeart
 import androidx.compose.material.icons.filled.Notifications
+import androidx.compose.material.icons.filled.Palette
 import androidx.compose.material.icons.filled.Sensors
 import androidx.compose.material.icons.filled.Storage
 import androidx.compose.material3.Button
@@ -193,6 +194,7 @@ fun OnboardingScreen(viewModel: AppViewModel, onFinished: () -> Unit) {
                     OnboardingPage.Profile -> ProfileStep()
                     OnboardingPage.Import -> ImportStep(viewModel)
                     OnboardingPage.Notifications -> NotificationsStep()
+                    OnboardingPage.Appearance -> AppearanceStep()
                     OnboardingPage.Done -> DoneStep()
                 }
             }
@@ -230,6 +232,7 @@ private enum class OnboardingPage(val cta: String) {
     Profile("Save & continue"),
     Import("Continue"),
     Notifications("Continue"),
+    Appearance("Continue"),
     Done("Enter NOOP");
 
     /** The Bevel colour world the step's scenic hero is tinted toward — a gentle rotation so the
@@ -238,7 +241,7 @@ private enum class OnboardingPage(val cta: String) {
         get() = when (this) {
             Welcome, WhatItDoes, Wear, Bonded, Done -> DomainTheme.Charge
             Bluetooth, Connect -> DomainTheme.Effort
-            Expectations, Profile, Notifications -> DomainTheme.Rest
+            Expectations, Profile, Notifications, Appearance -> DomainTheme.Rest
             Import -> DomainTheme.Stress
         }
 }
@@ -880,6 +883,152 @@ private fun NotificationsStep() {
             Checkline("Wrist alerts — strain nudges and your smart alarm — arrive as notifications too.")
             Checkline("When Android asks, allow notifications so NOOP can keep you informed.")
         }
+    }
+}
+
+// A late step that tells new users NOOP's look is theirs to set — the same System / Light / Dark
+// choice that lives in Settings → Appearance, with a live preview. Writing the choice flips the whole
+// app immediately (AppearancePrefs.mode is snapshot state; Palette re-resolves live), so the picker
+// IS the preview — and two mini swatches show both the warm-paper Light and signature navy Dark looks.
+@Composable
+private fun AppearanceStep() {
+    val context = LocalContext.current
+    var mode by remember { mutableStateOf(AppearancePrefs.mode) }
+
+    StepShell(
+        title = "Make it yours",
+        subtitle = "NOOP follows your system by default — or pick Light or Dark. You can change this any time in Settings → Appearance.",
+    ) {
+        Column(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalAlignment = Alignment.CenterHorizontally,
+            verticalArrangement = Arrangement.spacedBy(18.dp),
+        ) {
+            // Two mini look-swatches so the choice is concrete: warm-paper Light and signature navy
+            // Dark. The one matching the live theme carries a gold accent rim; System shows whichever
+            // the phone is currently on.
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(Metrics.gap),
+            ) {
+                ThemeSwatch(
+                    title = "Light",
+                    tokens = LightTokens,
+                    selected = Palette.isLight,
+                    modifier = Modifier.weight(1f),
+                )
+                ThemeSwatch(
+                    title = "Dark",
+                    tokens = DarkTokens,
+                    selected = !Palette.isLight,
+                    modifier = Modifier.weight(1f),
+                )
+            }
+
+            NoopCard(padding = 18.dp) {
+                Column(verticalArrangement = Arrangement.spacedBy(14.dp)) {
+                    ProfileFieldRow(label = "Theme") {
+                        SegmentedPillControl(
+                            items = listOf(AppearanceMode.SYSTEM, AppearanceMode.LIGHT, AppearanceMode.DARK),
+                            selection = mode,
+                            label = { it.label },
+                            onSelect = {
+                                mode = it
+                                // Persist + flip live — the rest of the onboarding (and the app) re-themes
+                                // instantly, so the user sees their choice land before tapping Continue.
+                                AppearancePrefs.set(context, it)
+                            },
+                        )
+                    }
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(10.dp),
+                    ) {
+                        Icon(
+                            Icons.Filled.Palette,
+                            contentDescription = null,
+                            tint = Palette.accent,
+                            modifier = Modifier.size(17.dp),
+                        )
+                        Text(
+                            when (mode) {
+                                AppearanceMode.SYSTEM -> "Following your phone's light/dark setting."
+                                AppearanceMode.LIGHT -> "Gold on warm paper."
+                                AppearanceMode.DARK -> "The signature navy."
+                            },
+                            style = NoopType.footnote,
+                            color = Palette.textTertiary,
+                        )
+                    }
+                }
+            }
+        }
+    }
+}
+
+/** A small fixed-palette look-swatch (a surface chip + accent ring + hairline) so the user can see a
+ *  theme without switching to it. Uses the passed token set directly (not the live Palette) so Light
+ *  always renders Light and Dark always renders Dark, whatever the current theme. */
+@Composable
+private fun ThemeSwatch(
+    title: String,
+    tokens: PaletteTokens,
+    selected: Boolean,
+    modifier: Modifier = Modifier,
+) {
+    Column(
+        modifier = modifier,
+        horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.spacedBy(6.dp),
+    ) {
+        Box(
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(76.dp)
+                .clip(RoundedCornerShape(14.dp))
+                .background(tokens.surfaceBase)
+                .border(
+                    width = if (selected) 2.dp else 1.dp,
+                    color = if (selected) Palette.accent else tokens.hairline,
+                    shape = RoundedCornerShape(14.dp),
+                )
+                .padding(12.dp),
+            contentAlignment = Alignment.CenterStart,
+        ) {
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(10.dp),
+            ) {
+                // A mini recovery bead in the theme's gold, on the theme's raised card.
+                Box(
+                    modifier = Modifier
+                        .size(26.dp)
+                        .clip(CircleShape)
+                        .background(tokens.gold),
+                )
+                Column(verticalArrangement = Arrangement.spacedBy(5.dp)) {
+                    Box(
+                        modifier = Modifier
+                            .width(46.dp)
+                            .height(7.dp)
+                            .clip(RoundedCornerShape(50))
+                            .background(tokens.surfaceRaised),
+                    )
+                    Box(
+                        modifier = Modifier
+                            .width(32.dp)
+                            .height(7.dp)
+                            .clip(RoundedCornerShape(50))
+                            .background(tokens.hairlineStrong),
+                    )
+                }
+            }
+        }
+        Text(
+            title,
+            style = NoopType.footnote,
+            color = if (selected) Palette.accent else Palette.textTertiary,
+        )
     }
 }
 

@@ -491,7 +491,9 @@ private fun BreathingOrb(progress: Float, bpm: Int?, modifier: Modifier = Modifi
                 .clip(CircleShape)
                 .border(1.dp, Palette.restColor.copy(alpha = 0.28f), CircleShape),
         )
-        // Outer halo — a Rest-world bloom that brightens as the orb expands.
+        // Outer halo — a Rest-world bloom that brightens as the orb expands. Roughly HALVED to match
+        // the iOS refresh (less glow, crisper): the peak alpha is ~0.15 and it scales with the orb's
+        // expansion (an envelope, like iOS's 0.55 + 0.45·progress) so it stays calm rather than blooming.
         Box(
             modifier = Modifier
                 .fillMaxWidth(scale * 1.35f)
@@ -499,7 +501,10 @@ private fun BreathingOrb(progress: Float, bpm: Int?, modifier: Modifier = Modifi
                 .clip(CircleShape)
                 .background(
                     Brush.radialGradient(
-                        colors = listOf(Palette.restBright.copy(alpha = 0.30f), Color.Transparent),
+                        colors = listOf(
+                            Palette.restBright.copy(alpha = 0.15f * scale.coerceIn(0f, 1f)),
+                            Color.Transparent,
+                        ),
                     ),
                 ),
         )

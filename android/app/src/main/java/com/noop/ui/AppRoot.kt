@@ -5,13 +5,16 @@ import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
-import androidx.compose.foundation.layout.offset
+import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.CircleShape
@@ -24,6 +27,7 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.CompareArrows
+import androidx.compose.material.icons.automirrored.filled.ShowChart
 import androidx.compose.material.icons.automirrored.filled.TrendingUp
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Air
@@ -34,13 +38,13 @@ import androidx.compose.material.icons.filled.Bolt
 import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material.icons.filled.Explore
 import androidx.compose.material.icons.filled.FavoriteBorder
-import androidx.compose.material.icons.filled.GridView
 import androidx.compose.material.icons.filled.FitnessCenter
 import androidx.compose.material.icons.filled.HealthAndSafety
 import androidx.compose.material.icons.filled.Home
 import androidx.compose.material.icons.filled.Insights
 import androidx.compose.material.icons.filled.Menu
 import androidx.compose.material.icons.filled.MonitorHeart
+import androidx.compose.material.icons.filled.MoreHoriz
 import androidx.compose.material.icons.filled.Notifications
 import androidx.compose.material.icons.filled.Psychology
 import androidx.compose.material.icons.filled.Sensors
@@ -49,22 +53,19 @@ import androidx.compose.material.icons.filled.Spa
 import androidx.compose.material.icons.filled.Storage
 import androidx.compose.material.icons.filled.Timeline
 import androidx.compose.material.icons.filled.Tune
+import androidx.compose.material.icons.outlined.GridView
 import androidx.compose.material3.DrawerValue
 import androidx.compose.material3.ExperimentalMaterial3Api
-import androidx.compose.material3.FloatingActionButton
-import androidx.compose.material3.FloatingActionButtonDefaults
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.ModalDrawerSheet
 import androidx.compose.material3.ModalNavigationDrawer
-import androidx.compose.material3.NavigationBar
-import androidx.compose.material3.NavigationBarItem
-import androidx.compose.material3.NavigationBarItemDefaults
 import androidx.compose.material3.NavigationDrawerItem
 import androidx.compose.material3.NavigationDrawerItemDefaults
 import androidx.compose.material3.Scaffold
+import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.TopAppBarDefaults
@@ -83,13 +84,16 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Brush
-import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import com.noop.BuildConfig
 import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.navigation.NavDestination.Companion.hierarchy
@@ -104,8 +108,8 @@ import kotlinx.coroutines.launch
 // MARK: - Navigation model
 //
 // The macOS app's sidebar holds many sections; on Android we mirror that with a
-// ModalNavigationDrawer (hamburger in the top bar) for the full grouped list, plus a
-// bottom NavigationBar for the four everyday screens (Today/Trends/Live/Sleep) with a
+// ModalNavigationDrawer (hamburger in the top bar) for the full grouped list, plus a unified
+// "glass" bottom bar (Today · Trends · [add] · Sleep · More) for the everyday screens, with a
 // "More" sheet that reuses the same groups — both routes reach every destination.
 // Destinations are grouped exactly as the sidebar groups them. Routes whose screens
 // belong to later waves point at a ComingSoon placeholder so the app compiles today.
@@ -191,16 +195,8 @@ private val drawerGroups: List<DrawerGroup> = listOf(
     )),
 )
 
-/** The everyday screens that earn a permanent bottom tab. Three tabs + a "More" item flank the
- *  raised centre FAB so it sits in a real gap (between Trends and Sleep) rather than on top of a
- *  tab. Live (real-time HR) is a "watch it now" action — it lives on the FAB's quick-action sheet
- *  and in the drawer, not on the bar. */
-private val bottomTabs = listOf(
-    Destination.Today, Destination.Trends, Destination.Sleep,
-)
-
 /**
- * App shell: a bottom [NavigationBar] (Today/Trends/Live/Sleep + a "More" sheet) and a
+ * App shell: a unified [GlassBottomBar] (Today · Trends · [add] · Sleep · More) and a
  * [ModalNavigationDrawer] (hamburger in a [TopAppBar] titled with the current screen),
  * both driving one [NavHost]. A single [AppViewModel] is created here and shared with
  * every screen, so the BLE connection and cached metrics stay app-wide singletons.
@@ -335,60 +331,18 @@ fun AppRoot(viewModel: AppViewModel = viewModel()) {
                 )
             },
             bottomBar = {
-                // One-thumb navigation for the four everyday screens plus a raised gold centre FAB
-                // for quick actions — mirroring the macOS/iOS tab bar. The drawer stays (same
+                // One unified "glass" bar: Today · Trends · [add] · Sleep · More. The add button is a
+                // small CONTAINED gold disc inline in the middle slot — not a big floating FAB, no
+                // overlap, no glow (matches the iOS FloatingTabBar refresh). The drawer stays (same
                 // destinations, grouped) so nothing moved for existing users; the bar is additive.
-                Box(contentAlignment = Alignment.TopCenter) {
-                    NavigationBar(containerColor = Palette.surfaceRaised) {
-                        bottomTabs.forEach { dest ->
-                            NavigationBarItem(
-                                selected = current == dest,
-                                onClick = {
-                                    if (dest.route != currentRoute) nav.navigateTopLevel(dest.route)
-                                },
-                                icon = { Icon(dest.icon, contentDescription = dest.title) },
-                                label = { Text(dest.title, style = NoopType.footnote) },
-                                colors = navBarItemColors(),
-                            )
-                        }
-                        NavigationBarItem(
-                            // Lights up whenever the current screen ISN'T one of the four tabs, so the
-                            // bar never looks like you're nowhere.
-                            selected = bottomTabs.none { it == current },
-                            onClick = { showMoreSheet = true },
-                            icon = { Icon(Icons.Filled.GridView, contentDescription = "More screens") },
-                            label = { Text("More", style = NoopType.footnote) },
-                            colors = navBarItemColors(),
-                        )
-                    }
-                    // Raised gold-gradient centre FAB, lifted ~20dp above the bar (spec: margin-top:-20px).
-                    // Opens a bottom sheet of quick actions routing to existing destinations.
-                    FloatingActionButton(
-                        onClick = { showQuickActions = true },
-                        containerColor = Color.Transparent,
-                        contentColor = Palette.goldDeepText,
-                        shape = CircleShape,
-                        // Flat — no Material drop shadow; the redesign keeps glow low (the gold
-                        // gradient alone reads as raised against the navy bar).
-                        elevation = FloatingActionButtonDefaults.elevation(
-                            defaultElevation = 0.dp,
-                            pressedElevation = 0.dp,
-                            focusedElevation = 0.dp,
-                            hoveredElevation = 0.dp,
-                        ),
-                        modifier = Modifier
-                            .offset(y = (-20).dp)
-                            .size(46.dp)
-                            .clip(CircleShape)
-                            .background(Brush.linearGradient(*Palette.goldGradient.toTypedArray())),
-                    ) {
-                        Icon(
-                            Icons.Filled.Add,
-                            contentDescription = "Quick actions",
-                            tint = Palette.goldDeepText,
-                        )
-                    }
-                }
+                GlassBottomBar(
+                    current = current,
+                    onTabSelected = { dest ->
+                        if (dest.route != currentRoute) nav.navigateTopLevel(dest.route)
+                    },
+                    onMore = { showMoreSheet = true },
+                    onAdd = { showQuickActions = true },
+                )
             },
         ) { inner ->
             NavHost(
@@ -582,6 +536,162 @@ fun AppRoot(viewModel: AppViewModel = viewModel()) {
     }
 }
 
+// MARK: - Glass bottom bar
+//
+// The signature bar, ported from iOS's FloatingTabBar: ONE rounded "glass" island holding five
+// inline slots — Today · Trends · [add] · Sleep · More. The add button is a small contained gold
+// disc that sits in the middle slot (no floating FAB, no overlap, no glow). The "glass" feel is a
+// translucent raised surface with a low elevation and a subtle hairline border — frosted, not a hard
+// opaque slab and not a glow. Each nav slot is an icon over a small label; active = gold accent,
+// inactive = textSecondary. All routing is unchanged: the four tabs switch the same destinations and
+// the add button opens the existing quick-action sheet.
+
+/** A single bottom-bar nav slot: the destination it switches to, plus the bar-specific icon/label. */
+private data class BarTab(val dest: Destination, val icon: ImageVector, val label: String)
+
+/** The four nav slots flanking the centre add disc, in iOS order: Today · Trends · [add] · Sleep · More.
+ *  More is special-cased (it opens the sheet rather than a route), so it is appended at the call site. */
+private val barLeadingTabs = listOf(
+    BarTab(Destination.Today, Icons.Outlined.GridView, "Today"),
+    BarTab(Destination.Trends, Icons.AutoMirrored.Filled.ShowChart, "Trends"),
+)
+private val barTrailingTabs = listOf(
+    BarTab(Destination.Sleep, Icons.Filled.Bedtime, "Sleep"),
+)
+
+@Composable
+private fun GlassBottomBar(
+    current: Destination,
+    onTabSelected: (Destination) -> Unit,
+    onMore: () -> Unit,
+    onAdd: () -> Unit,
+) {
+    val barShape = RoundedCornerShape(50)
+    Box(
+        modifier = Modifier
+            .fillMaxWidth()
+            .navigationBarsPadding()
+            .padding(horizontal = 22.dp)
+            .padding(bottom = 4.dp, top = 4.dp),
+        contentAlignment = Alignment.Center,
+    ) {
+        Surface(
+            shape = barShape,
+            // "Glass": a translucent raised surface — a frosted island, not a hard slab. Low elevation
+            // (tonal + a soft drop shadow) reads as floating without a glow; the hairline rim crisps it.
+            color = Palette.surfaceRaised.copy(alpha = 0.92f),
+            tonalElevation = 2.dp,
+            shadowElevation = 6.dp,
+            modifier = Modifier
+                .fillMaxWidth()
+                .border(0.5.dp, Palette.hairline.copy(alpha = 0.6f), barShape),
+        ) {
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 8.dp, vertical = 7.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(2.dp),
+            ) {
+                barLeadingTabs.forEach { tab ->
+                    BarSlot(
+                        icon = tab.icon,
+                        label = tab.label,
+                        active = current == tab.dest,
+                        modifier = Modifier.weight(1f),
+                        onClick = { onTabSelected(tab.dest) },
+                    )
+                }
+                AddDisc(modifier = Modifier.weight(1f), onClick = onAdd)
+                barTrailingTabs.forEach { tab ->
+                    BarSlot(
+                        icon = tab.icon,
+                        label = tab.label,
+                        active = current == tab.dest,
+                        modifier = Modifier.weight(1f),
+                        onClick = { onTabSelected(tab.dest) },
+                    )
+                }
+                BarSlot(
+                    icon = Icons.Filled.MoreHoriz,
+                    label = "More",
+                    // Lights up whenever the current screen isn't one of the bar's own tabs, so the bar
+                    // never looks like you're nowhere.
+                    active = current != Destination.Today && current != Destination.Trends &&
+                        current != Destination.Sleep,
+                    modifier = Modifier.weight(1f),
+                    onClick = onMore,
+                )
+            }
+        }
+    }
+}
+
+/** One nav slot: an icon over a small label. Active = gold accent (semibold), inactive = textSecondary.
+ *  No selection pill, no glow — just the colour swap, matching the iOS bar. */
+@Composable
+private fun BarSlot(
+    icon: ImageVector,
+    label: String,
+    active: Boolean,
+    modifier: Modifier = Modifier,
+    onClick: () -> Unit,
+) {
+    val tint = if (active) Palette.accent else Palette.textSecondary
+    Column(
+        modifier = modifier
+            .clip(RoundedCornerShape(14.dp))
+            .clickable(
+                interactionSource = remember { MutableInteractionSource() },
+                indication = null,
+                onClick = onClick,
+            )
+            .padding(vertical = 3.dp)
+            .semantics { contentDescription = label },
+        horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.spacedBy(3.dp),
+    ) {
+        Icon(icon, contentDescription = null, tint = tint, modifier = Modifier.size(20.dp))
+        Text(
+            label,
+            style = NoopType.footnote.copy(
+                fontSize = 10.sp,
+                fontWeight = if (active) FontWeight.SemiBold else FontWeight.Medium,
+            ),
+            color = tint,
+        )
+    }
+}
+
+/** The small CONTAINED gold quick-action disc that sits inline in the middle slot — the same gold
+ *  language as the old FAB, differentiated, but ~38dp and not hogging the bar (no float, no glow). */
+@Composable
+private fun AddDisc(modifier: Modifier = Modifier, onClick: () -> Unit) {
+    Box(modifier = modifier, contentAlignment = Alignment.Center) {
+        Box(
+            modifier = Modifier
+                .size(38.dp)
+                .clip(CircleShape)
+                .background(Brush.linearGradient(*Palette.goldGradient.toTypedArray()))
+                .border(0.5.dp, Palette.goldLight.copy(alpha = 0.5f), CircleShape)
+                .clickable(
+                    interactionSource = remember { MutableInteractionSource() },
+                    indication = null,
+                    onClick = onClick,
+                )
+                .semantics { contentDescription = "Quick actions" },
+            contentAlignment = Alignment.Center,
+        ) {
+            Icon(
+                Icons.Filled.Add,
+                contentDescription = null,
+                tint = Palette.goldDeepText,
+                modifier = Modifier.size(20.dp),
+            )
+        }
+    }
+}
+
 /** A centre-FAB quick action: a display title, an icon and the destination route it opens. */
 private data class QuickAction(val title: String, val icon: ImageVector, val route: String)
 
@@ -592,17 +702,6 @@ private val quickActions: List<QuickAction> = listOf(
     QuickAction("Start workout", Icons.Filled.FitnessCenter, Destination.Workouts.route),
     QuickAction("Log journal", Icons.Filled.Edit, Destination.Insights.route),
     QuickAction("Breathe", Icons.Filled.Air, Destination.Breathe.route),
-)
-
-/** Bottom-bar item colours, matching the drawer's accent-on-raised selection treatment. */
-@Composable
-private fun navBarItemColors() = NavigationBarItemDefaults.colors(
-    selectedIconColor = Palette.accent,
-    selectedTextColor = Palette.textPrimary,
-    indicatorColor = Color.Transparent, // no gold pill behind the selected tab — just the gold icon
-
-    unselectedIconColor = Palette.textSecondary,
-    unselectedTextColor = Palette.textSecondary,
 )
 
 // MARK: - Navigation motion (README §Motion)

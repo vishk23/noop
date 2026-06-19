@@ -40,6 +40,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.shadow
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.Path
@@ -758,6 +759,9 @@ internal fun PrimaryActionButton(
         modifier = Modifier
             .fillMaxWidth()
             .height(46.dp)
+            // A crisp, subtle NEUTRAL elevation (soft dark lift, no gold bloom) — matching the iOS
+            // .noopPrimary refresh, which traded the old gold cast-glow for a clean neutral shadow.
+            .let { if (enabled) it.shadow(elevation = 4.dp, shape = shape, clip = false) else it }
             .clip(shape)
             .background(container)
             .let { if (enabled) it.clickable(onClick = onClick) else it }

@@ -37,7 +37,7 @@ public struct OnboardingWizard: View {
     // handles the bond→celebration transition without re-rendering the root.
 
     private enum Step: Int, CaseIterable {
-        case welcome, what, expectations, bluetooth, wear, scan, bonded, profile, importData, notifications, done
+        case welcome, what, expectations, bluetooth, wear, scan, bonded, profile, importData, notifications, appearance, done
 
         var isFirst: Bool { self == .welcome }
         var isLast: Bool { self == .done }
@@ -70,6 +70,7 @@ public struct OnboardingWizard: View {
                     case .profile:    ProfileStep()
                     case .importData: ImportStep()
                     case .notifications: NotificationsStep()
+                    case .appearance: AppearanceStep()
                     case .done:       DoneStep()
                     }
                 }
@@ -188,6 +189,7 @@ public struct OnboardingWizard: View {
         case .profile:    return "Save & Continue"
         case .importData: return "Continue"
         case .notifications: return "Continue"
+        case .appearance: return "Continue"
         case .done:       return "Enter NOOP"
         }
     }
@@ -993,6 +995,36 @@ private struct DoneStep: View {
 }
 
 // MARK: - Step shell (shared layout for each page)
+
+/// Lets a brand-new user pick the app's look up front (and learn it's changeable) — the same
+/// System / Light / Dark setting that lives in Settings → Appearance. Selecting re-themes the whole
+/// app live (the shared `@AppStorage(AppearanceMode.storageKey)` drives `preferredColorScheme`), so
+/// the wizard itself IS the preview.
+private struct AppearanceStep: View {
+    @AppStorage(AppearanceMode.storageKey) private var appearanceRaw = AppearanceMode.system.rawValue
+    private var binding: Binding<AppearanceMode> {
+        Binding(get: { AppearanceMode(rawValue: appearanceRaw) ?? .system },
+                set: { appearanceRaw = $0.rawValue })
+    }
+    var body: some View {
+        StepShell(title: "Make it yours",
+                  subtitle: "Choose how NOOP looks — the whole app updates as you tap. You can change this any time in Settings → Appearance.") {
+            VStack(spacing: 28) {
+                Image(systemName: "circle.lefthalf.filled")
+                    .font(.system(size: 56, weight: .light))
+                    .foregroundStyle(StrandPalette.accent)
+                    .frame(height: 96)
+                SegmentedPillControl(AppearanceMode.allCases, selection: binding) { $0.label }
+                    .frame(maxWidth: 320)
+                Text("System follows your \(Platform.deviceNoun)'s light or dark setting.")
+                    .font(StrandFont.footnote)
+                    .foregroundStyle(StrandPalette.textTertiary)
+                    .multilineTextAlignment(.center)
+            }
+            .frame(maxWidth: 460)
+        }
+    }
+}
 
 private struct StepShell<Content: View>: View {
     var title: String? = nil

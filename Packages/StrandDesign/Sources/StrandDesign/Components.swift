@@ -302,8 +302,11 @@ public struct SegmentedPillControl<T: Hashable>: View {
                         // white ink (so the light theme's selection matches its blue chrome, not gold).
                         .foregroundStyle(sel ? (scheme == .light ? Color.white : StrandPalette.goldDeepText)
                                              : StrandPalette.textTertiary)
-                        .frame(minWidth: 32)
-                        .padding(.vertical, 6).padding(.horizontal, 11)
+                        // Fill the segment height so the selected pill has EQUAL margins to the track
+                        // on every side. (The old compact pill inside a taller 44pt touch frame left
+                        // more vertical margin than horizontal — it read as off-centre.)
+                        .frame(minWidth: 32, maxHeight: .infinity)
+                        .padding(.horizontal, 12)
                         .background(
                             Capsule(style: .continuous)
                                 .fill(sel ? (scheme == .light
@@ -311,20 +314,15 @@ public struct SegmentedPillControl<T: Hashable>: View {
                                              : AnyShapeStyle(LinearGradient(gradient: StrandPalette.goldGradient, startPoint: .top, endPoint: .bottom)))
                                           : AnyShapeStyle(Color.clear))
                         )
-                        // On iOS guarantee the ≥44pt touch target (height only — width is
-                        // already ≥54pt) without bloating the denser Mac control, then make
-                        // the whole area tappable so the transparent margin counts as a hit.
-                        #if os(iOS)
-                        .frame(minHeight: 44)
-                        #endif
-                        .contentShape(Rectangle())
+                        .contentShape(Capsule(style: .continuous))
                 }
                 .buttonStyle(.plain)
+                .frame(height: 36)   // segment height; the pill fills it for an even inset
                 // Announce the active range to VoiceOver and give a non-colour cue.
                 .accessibilityAddTraits(sel ? .isSelected : [])
             }
         }
-        .padding(3)
+        .padding(4)
         .background(StrandPalette.surfaceInset, in: Capsule(style: .continuous))
         .overlay(Capsule(style: .continuous).strokeBorder(StrandPalette.hairline, lineWidth: 1))
     }

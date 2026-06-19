@@ -25,6 +25,7 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
@@ -520,13 +521,19 @@ fun <T> SegmentedPillControl(
     modifier: Modifier = Modifier,
 ) {
     val outerShape = RoundedCornerShape(50)
+    // The track is a fixed-height pill; the selected pill FILLS that height so its inset is EQUAL on
+    // every side (container padding 4, pill horizontal padding only). The old compact pill inside a
+    // taller row left more vertical margin than horizontal — it read as off-centre. Mirrors iOS's
+    // SegmentedPillControl refresh (segment height 36, pill fills it for an even inset).
     Row(
         modifier = modifier
+            .height(36.dp)
             .clip(outerShape)
             .background(Palette.surfaceInset)
             .border(1.dp, Palette.hairline, outerShape)
-            .padding(3.dp),
+            .padding(4.dp),
         horizontalArrangement = Arrangement.spacedBy(4.dp),
+        verticalAlignment = Alignment.CenterVertically,
     ) {
         items.forEach { item ->
             val selected = item == selection
@@ -540,16 +547,26 @@ fun <T> SegmentedPillControl(
             } else {
                 Modifier
             }
-            Text(
-                text = label(item),
-                style = NoopType.captionNumber,
-                color = if (selected) (if (Palette.isLight) androidx.compose.ui.graphics.Color.White else Palette.goldDeepText) else Palette.textTertiary,
+            Box(
                 modifier = Modifier
+                    // Fill the track height so the pill's inset is equal top/bottom/left/right.
+                    .fillMaxHeight()
                     .clip(pillShape)
                     .then(pillBg)
                     .clickableNoRipple { onSelect(item) }
-                    .padding(horizontal = 11.dp, vertical = 6.dp),
-            )
+                    .padding(horizontal = 12.dp),
+                contentAlignment = Alignment.Center,
+            ) {
+                Text(
+                    text = label(item),
+                    style = NoopType.captionNumber,
+                    color = if (selected) {
+                        if (Palette.isLight) androidx.compose.ui.graphics.Color.White else Palette.goldDeepText
+                    } else {
+                        Palette.textTertiary
+                    },
+                )
+            }
         }
     }
 }
@@ -599,15 +616,10 @@ fun BevelGauge(
         animationSpec = tween(Motion.durationSlow, easing = Motion.drawIn),
         label = "ringFill",
     )
-    val breathe = rememberInfiniteTransition(label = "bloom")
-    val bloomPulse by breathe.animateFloat(
-        initialValue = 0.78f, targetValue = 1.0f,
-        animationSpec = infiniteRepeatable(
-            tween(Motion.breathPeriodMs, easing = Motion.easeInOut), RepeatMode.Reverse,
-        ),
-        label = "bloomPulse",
-    )
-    val bloomOpacity = (0.16f + 0.40f * frac) * bloomPulse
+    // Outer bloom — a faint, STATIC glow. The breathing pulse is gone (matching iOS): it sits calm so
+    // the ring reads flat/Material, not glowing. Strength tracks the iOS bloomOpacity (0.05 + 0.13·frac)
+    // — a restrained additive halo, well down from the old (0.16 + 0.40·frac) pulse.
+    val bloomOpacity = 0.05f + 0.13f * frac
     val sweep = Brush.sweepGradient(*stops.toTypedArray())
 
     Box(
@@ -642,6 +654,7 @@ fun BevelGauge(
                     // Outer bloom — a soft, lower-opacity wide arc (drawn first, under the track).
                     // A glow only reads on the dark canvas; on the white light card it just smears the
                     // edge, so it's suppressed there (the deepened arc carries the ring on its own).
+                    // Drawn at the restrained, static [bloomOpacity] (≈0.05–0.18) — crisp, not glowing.
                     if (animatedFraction > 0.001f && !Palette.isLight) {
                         drawArc(
                             brush = sweep,
@@ -651,7 +664,7 @@ fun BevelGauge(
                             topLeft = topLeft,
                             size = arcSize,
                             style = Stroke(width = stroke * 1.15f, cap = StrokeCap.Round),
-                            alpha = bloomOpacity * 0.4f,
+                            alpha = bloomOpacity,
                         )
                     }
 
