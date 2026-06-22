@@ -100,6 +100,20 @@ class Backfiller(
 ) {
 
     /**
+     * #547 SESSION-RELATIVE gate: the strap's own GET_DATA_RANGE oldest/newest banked-record markers for
+     * the CURRENT offload, set by [WhoopBleClient] when the range reply lands. A record dated months outside
+     * this window is wandering-clock pollution even if it clears the absolute 2023-11 floor, so the ingest
+     * gate rejects it. null (both) until the range is known — the gate then falls back to the absolute floor
+     * only, so behaviour is unchanged on the no-range / replay paths. Cleared in [begin]. Volatile because
+     * it's written from the BLE callback thread and read in [finishChunk]. Mirrors Swift Backfiller fields.
+     */
+    @Volatile
+    var sessionOldestUnix: Long? = null
+
+    @Volatile
+    var sessionNewestUnix: Long? = null
+
+    /**
      * Strap family for the CURRENT offload, set at [begin] — drives the family-aware frame parse
      * (5/MG inner record is +4) and the +4 end_data slice. The Backfiller is constructed once at
      * client init (before the family is known), so this is settable per-offload rather than a
@@ -172,6 +186,15 @@ class Backfiller(
     private var loggedImplausibleClock = false
 
     /**
+     * #547 RE-POLLUTION signal: running count of records this session the ingest gate dropped for an
+     * implausible timestamp (a bad/wandering strap clock). Read by [WhoopBleClient.exitBackfilling] to arm a
+     * heal re-run — if the strap is bad-clock THIS session it may have banked similar garbage on an OLDER
+     * build whose gate was weaker. Reset in [begin]. Mirrors Swift `Backfiller.sessionDroppedImplausible`.
+     */
+    var sessionDroppedImplausible = 0
+        private set
+
+    /**
      * Called by [WhoopBleClient] when the strap signals a historical offload is beginning.
      * chunkOpen starts TRUE: the biometric replay streams records immediately and sends one
      * HISTORY_START then repeated HISTORY_ENDs, so we must accumulate from the outset.
@@ -186,6 +209,12 @@ class Backfiller(
         loggedNoCursor = false
         loggedLayoutVersions.clear()
         loggedImplausibleClock = false
+        sessionDroppedImplausible = 0
+        // #547: the range markers belong to a connection's GET_DATA_RANGE, which the client re-sets per
+        // connect; clear them so a fresh session never reuses a previous strap's window (the client
+        // re-publishes them as soon as the range reply arrives).
+        sessionOldestUnix = null
+        sessionNewestUnix = null
         synchronized(chunkLock) {
             chunk.clear()
             chunkOpen = true
@@ -251,7 +280,10 @@ class Backfiller(
         var committed: StreamBatch? = null
         if (frames.isNotEmpty()) {
             val ref = clockRef
-            val decoded = extractHistoricalStreams(frames, ref.device, ref.wall, family)
+            val decoded = extractHistoricalStreams(
+                frames, ref.device, ref.wall, family,
+                sessionOldestUnix = sessionOldestUnix, sessionNewestUnix = sessionNewestUnix,
+            )
             // Observability (PR #241): which historical layout does this strap emit? Only the unmapped/
             // reject path logged a version before, so a healthy sync never revealed v24/v25 (4.0) or
             // v18/v26 (5/MG). Sample the chunk's first genuine record (null ⇒ console/CRC-fail); log
@@ -262,6 +294,7 @@ class Backfiller(
             // far-past, a year-2027 spike, or future-dated `unix`). The ingest gate dropped them so they
             // can't pollute the day-windowed analytics; surface it ONCE per session so a bad-clock strap
             // is visible in a shared log (the strap clock is genuinely bad — this is NOOP being robust).
+            sessionDroppedImplausible += decoded.droppedImplausibleTs
             if (decoded.droppedImplausibleTs > 0 && !loggedImplausibleClock) {
                 loggedImplausibleClock = true
                 log(

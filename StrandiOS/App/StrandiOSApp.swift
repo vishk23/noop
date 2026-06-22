@@ -83,6 +83,14 @@ struct StrandiOSApp: App {
                         connected: isConnected
                     )
                 }
+                // #581: the `noop://import-health` deep link the iOS Shortcut opens after building the
+                // HealthKit-free payload. Filter on the host so other future schemes don't trip the
+                // importer; macOS never registers the scheme so this stays iOS-only.
+                .onOpenURL { url in
+                    if url.host == "import-health" {
+                        model.handleHealthImportURL(url)
+                    }
+                }
         }
         // HealthKit authorization is intentionally NOT requested on launch. The system permission
         // dialog without prior in-app rationale violates Apple HIG / App Review guidance — the user

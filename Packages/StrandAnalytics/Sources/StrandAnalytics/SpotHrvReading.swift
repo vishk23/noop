@@ -53,10 +53,17 @@ public enum SpotHrvReading {
     /// -> (n-1) RMSSD), so the value matches the nightly HRV math. Returns `.insufficient` rather than a
     /// number when too few clean beats survive — never a fabricated figure.
     ///
-    /// - Parameter rrMs: the raw R-R intervals in milliseconds, in capture order (untrusted BLE input —
-    ///   the analyzer's range filter bounds-checks each to `HRVAnalyzer.rrMinMs`...`HRVAnalyzer.rrMaxMs`).
-    public static func compute(_ rrMs: [Int]) -> Outcome {
-        let result = HRVAnalyzer.analyze(rawRR: rrMs.map(Double.init))
+    /// - Parameters:
+    ///   - rrMs: the raw R-R intervals in milliseconds, in capture order (untrusted BLE input — the
+    ///     analyzer's range filter bounds-checks each to `HRVAnalyzer.rrMinMs`...`HRVAnalyzer.rrMaxMs`).
+    ///   - maxRejectedFraction: the spot honesty gate (#585) — refuse the reading when more than this
+    ///     fraction of beats was dropped as noise (out-of-range / ectopic), even if `minBeats` clean
+    ///     beats survive. Defaults to `HRVAnalyzer.defaultSpotMaxRejectedFraction` (0.35). The nightly
+    ///     windowed path does NOT use this, so overnight HRV is unchanged.
+    public static func compute(_ rrMs: [Int],
+                               maxRejectedFraction: Double = HRVAnalyzer.defaultSpotMaxRejectedFraction) -> Outcome {
+        let result = HRVAnalyzer.analyze(rawRR: rrMs.map(Double.init),
+                                         maxRejectedFraction: maxRejectedFraction)
         guard let rmssd = result.rmssd else {
             return .insufficient(clean: result.nClean, needed: HRVAnalyzer.minBeats, input: result.nInput)
         }

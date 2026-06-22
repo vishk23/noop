@@ -133,7 +133,7 @@ fun HrvSnapshotScreen(
             secondsRemaining -= 1
         }
         // End the capture and run the full cleaning analysis over everything collected.
-        result = HrvAnalyzer.analyzeRaw(captureBuffer.value.map { it.toDouble() })
+        result = HrvAnalyzer.analyzeRaw(captureBuffer.value.map { it.toDouble() }, HrvAnalyzer.DEFAULT_SPOT_MAX_REJECTED_FRACTION)
         phase = HrvPhase.Done
     }
 

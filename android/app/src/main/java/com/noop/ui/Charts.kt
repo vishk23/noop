@@ -3,6 +3,7 @@ package com.noop.ui
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.gestures.detectHorizontalDragGestures
 import androidx.compose.foundation.gestures.detectTapGestures
+import androidx.compose.foundation.gestures.detectTransformGestures
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
@@ -562,4 +563,154 @@ private fun stageColor(name: String): Color = when (name.trim().lowercase()) {
     "light" -> Palette.sleepLight
     "awake", "wake" -> Palette.sleepAwake
     else -> Palette.sleepLight
+}
+
+// MARK: - Deep Timeline chart (#575) — time-indexed, zoom + pan
+//
+// A time-aware line (each point carries its own unix-second timestamp, unlike the evenly-spaced
+// LineChart) over a visible [windowStart, windowEnd] window, with pinch-to-zoom + drag-to-pan via
+// detectTransformGestures. The Swift twin is OverviewHRChart's zoom binding. The point COUNT stays low
+// because the read layer downsamples to the zoom window (TimelinePoint list is ~targetPoints) — the
+// chart never receives ~86k points. Mirrors macOS OverviewHRChart's gesture-driven x-domain.
+
+/** One timeline sample: a unix-second timestamp + a value (bpm, °C, ms, …). */
+data class TimelinePoint(val ts: Long, val value: Double)
+
+/**
+ * Pure adaptive-resolution decision shared with the macOS `Repository.timelineBucketSeconds`: the bucket
+ * width (seconds) to read for a `[from, to]` window that should yield ABOUT [targetPoints] points. A
+ * bucket of 1 means "read raw per-second rows". A day-scale window picks a coarse bucket (never raw); a
+ * few-minute zoom drops to 1. Kept in Charts.kt so it's unit-testable without Room or a clock.
+ */
+fun timelineBucketSeconds(spanSeconds: Long, targetPoints: Int): Long {
+    val span = spanSeconds.coerceAtLeast(1L)
+    val target = targetPoints.coerceAtLeast(1)
+    val ideal = span / target
+    if (ideal <= 1L) return 1L
+    val steps = longArrayOf(2, 5, 10, 15, 30, 60, 120, 300, 600, 1800, 3600)
+    for (s in steps) if (s >= ideal) return s
+    return steps.last()
+}
+
+/**
+ * Scale [base] window about [anchorFraction] (0…1) by [scale] (>1 zooms in), clamped into [bounds] and
+ * floored at [minSpan] seconds. Pure — the Compose twin of OverviewHRChart.zoomed.
+ */
+fun zoomedWindow(
+    base: LongRange,
+    scale: Float,
+    anchorFraction: Float,
+    bounds: LongRange,
+    minSpan: Long = 60L,
+): LongRange {
+    val span = (base.last - base.first).coerceAtLeast(1L)
+    if (scale <= 0f) return base
+    val pivot = base.first + (span * anchorFraction.coerceIn(0f, 1f)).toLong()
+    val boundsSpan = (bounds.last - bounds.first).coerceAtLeast(minSpan)
+    val newSpan = (span / scale).toLong().coerceIn(minSpan, boundsSpan)
+    var newLo = pivot - ((pivot - base.first).toDouble() * newSpan / span).toLong()
+    var newHi = newLo + newSpan
+    if (newLo < bounds.first) { newLo = bounds.first; newHi = newLo + newSpan }
+    if (newHi > bounds.last) { newHi = bounds.last; newLo = newHi - newSpan }
+    newLo = newLo.coerceAtLeast(bounds.first)
+    return newLo..(newLo + newSpan).coerceAtLeast(newLo + 1)
+}
+
+/** Pan [base] by [deltaSeconds], clamped into [bounds] (span preserved). Pure — twin of OverviewHRChart.panned. */
+fun pannedWindow(base: LongRange, deltaSeconds: Long, bounds: LongRange): LongRange {
+    val span = base.last - base.first
+    var newLo = base.first + deltaSeconds
+    newLo = newLo.coerceIn(bounds.first, (bounds.last - span).coerceAtLeast(bounds.first))
+    return newLo..(newLo + span)
+}
+
+/**
+ * The Deep Timeline chart: a line over [points] within the visible [windowStart, windowEnd], pinch to
+ * zoom + drag to pan (both clamped to [bounds]). Reports the settled window via [onWindowChange] so the
+ * host can re-read at the new resolution. Empty-safe: with no points it draws a faint baseline.
+ */
+@Composable
+fun TimelineChart(
+    points: List<TimelinePoint>,
+    windowStart: Long,
+    windowEnd: Long,
+    bounds: LongRange,
+    color: Color,
+    modifier: Modifier,
+    onWindowChange: (LongRange) -> Unit,
+) {
+    val span = (windowEnd - windowStart).coerceAtLeast(1L)
+    val vis = remember(points, windowStart, windowEnd) {
+        points.filter { it.ts in windowStart..windowEnd && it.value.isFinite() }
+    }
+
+    Box(
+        modifier = modifier
+            .fillMaxWidth()
+            .clipToBounds()
+            .pointerInput(bounds) {
+                detectTransformGestures { centroid, pan, zoom, _ ->
+                    val width = size.width.toFloat().coerceAtLeast(1f)
+                    var window = windowStart..windowEnd
+                    // Pinch zooms about the gesture centroid; pan shifts the window.
+                    if (zoom != 1f) {
+                        val frac = (centroid.x / width).coerceIn(0f, 1f)
+                        window = zoomedWindow(window, zoom, frac, bounds)
+                    }
+                    if (pan.x != 0f) {
+                        val curSpan = window.last - window.first
+                        val secPerPx = curSpan.toDouble() / width
+                        window = pannedWindow(window, (-pan.x * secPerPx).toLong(), bounds)
+                    }
+                    onWindowChange(window)
+                }
+            },
+    ) {
+        Canvas(modifier = Modifier.fillMaxSize()) {
+            val strokePx = 2.5f
+            val topPad = strokePx + 4f
+            val bottomPad = strokePx + 4f
+            if (vis.size < 2 || size.width <= 0f || size.height <= 0f) {
+                drawBaseline()
+                return@Canvas
+            }
+            val minV = vis.minOf { it.value }
+            val maxV = vis.maxOf { it.value }
+            val range = (maxV - minV).takeIf { it > 0.0 } ?: 1.0
+            val usable = (size.height - topPad - bottomPad).coerceAtLeast(1f)
+
+            fun px(ts: Long): Float = ((ts - windowStart).toFloat() / span) * size.width
+            fun py(v: Double): Float = topPad + ((maxV - v) / range).toFloat() * usable
+
+            val linePath = Path().apply {
+                moveTo(px(vis.first().ts), py(vis.first().value))
+                for (i in 1 until vis.size) lineTo(px(vis[i].ts), py(vis[i].value))
+            }
+            // Soft gradient fill under the curve.
+            val fillPath = Path().apply {
+                moveTo(px(vis.first().ts), size.height)
+                lineTo(px(vis.first().ts), py(vis.first().value))
+                for (i in 1 until vis.size) lineTo(px(vis[i].ts), py(vis[i].value))
+                lineTo(px(vis.last().ts), size.height)
+                close()
+            }
+            drawPath(
+                path = fillPath,
+                brush = Brush.verticalGradient(
+                    colors = listOf(
+                        color.copy(alpha = StrandAlpha.chartFillStrong),
+                        color.copy(alpha = StrandAlpha.chartFillSoft),
+                        Color.Transparent,
+                    ),
+                    startY = 0f,
+                    endY = size.height,
+                ),
+            )
+            drawPath(
+                path = linePath,
+                color = color,
+                style = Stroke(width = strokePx, cap = StrokeCap.Round, join = StrokeJoin.Round),
+            )
+        }
+    }
 }

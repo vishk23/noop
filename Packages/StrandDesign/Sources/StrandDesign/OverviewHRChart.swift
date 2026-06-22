@@ -62,6 +62,13 @@ public struct OverviewHRChart: View {
     public var valueFormat: (Double) -> String
     public var dateFormat: (Date) -> String
 
+    /// Deep-Timeline zoom/pan window. When bound (Deep Timeline only), it OVERRIDES `xRange`/data extent
+    /// as the visible x-domain, and pinch-magnify (iOS) / scroll-to-zoom (macOS) + drag-pan mutate it.
+    /// `bounds` is the full clamp the window can never escape (the day's full extent). nil on every other
+    /// call site, so the existing static chart is byte-for-byte unchanged.
+    @Binding public var zoomDomain: ClosedRange<Date>?
+    public var zoomBounds: ClosedRange<Date>?
+
     /// Tint for the workout glyph badges (NOOP's warm strain accent by default).
     public var workoutTint: Color
 
@@ -79,6 +86,8 @@ public struct OverviewHRChart: View {
         height: CGFloat = 220,
         showsHover: Bool = true,
         workoutTint: Color = StrandPalette.strain033,
+        zoomDomain: Binding<ClosedRange<Date>?> = .constant(nil),
+        zoomBounds: ClosedRange<Date>? = nil,
         valueFormat: @escaping (Double) -> String = { String(Int($0.rounded())) },
         dateFormat: @escaping (Date) -> String = { TrendChart.defaultDateString($0) }
     ) {
@@ -94,6 +103,8 @@ public struct OverviewHRChart: View {
         self.height = height
         self.showsHover = showsHover
         self.workoutTint = workoutTint
+        self._zoomDomain = zoomDomain
+        self.zoomBounds = zoomBounds
         self.valueFormat = valueFormat
         self.dateFormat = dateFormat
         self.averageValue = sorted.isEmpty
@@ -102,6 +113,51 @@ public struct OverviewHRChart: View {
     }
 
     @State private var hoverX: CGFloat? = nil
+    /// The zoom window captured at the start of a magnify/drag gesture, so the gesture is applied
+    /// against a stable anchor instead of compounding each frame.
+    @State private var gestureAnchorDomain: ClosedRange<Date>? = nil
+
+    /// Smallest zoom window we allow (1 minute) — past this the line is just two points and pinch jitters.
+    public static let minZoomSpan: TimeInterval = 60
+
+    // MARK: Zoom / pan math (pure, testable in isolation)
+
+    /// The visible domain after scaling `base` about `anchorFraction` (0…1 across the window) by
+    /// `scale` (>1 zooms in), clamped into `bounds` and floored at `minZoomSpan`. Pure.
+    public static func zoomed(_ base: ClosedRange<Date>, scale: Double, anchorFraction: Double,
+                              bounds: ClosedRange<Date>, minSpan: TimeInterval = minZoomSpan) -> ClosedRange<Date> {
+        let lo = base.lowerBound.timeIntervalSince1970
+        let hi = base.upperBound.timeIntervalSince1970
+        let span = hi - lo
+        guard span > 0, scale > 0 else { return base }
+        let pivot = lo + span * min(max(anchorFraction, 0), 1)
+        let boundsSpan = bounds.upperBound.timeIntervalSince1970 - bounds.lowerBound.timeIntervalSince1970
+        let newSpan = min(max(span / scale, minSpan), max(boundsSpan, minSpan))
+        var newLo = pivot - (pivot - lo) * (newSpan / span)
+        var newHi = newLo + newSpan
+        // Clamp inside bounds, preserving span.
+        if newLo < bounds.lowerBound.timeIntervalSince1970 {
+            newLo = bounds.lowerBound.timeIntervalSince1970; newHi = newLo + newSpan
+        }
+        if newHi > bounds.upperBound.timeIntervalSince1970 {
+            newHi = bounds.upperBound.timeIntervalSince1970; newLo = newHi - newSpan
+        }
+        newLo = max(newLo, bounds.lowerBound.timeIntervalSince1970)
+        return Date(timeIntervalSince1970: newLo)...Date(timeIntervalSince1970: max(newLo + 1, newHi))
+    }
+
+    /// The visible domain after panning `base` by `deltaSeconds`, clamped into `bounds` (span preserved). Pure.
+    public static func panned(_ base: ClosedRange<Date>, deltaSeconds: Double,
+                              bounds: ClosedRange<Date>) -> ClosedRange<Date> {
+        let lo = base.lowerBound.timeIntervalSince1970
+        let hi = base.upperBound.timeIntervalSince1970
+        let span = hi - lo
+        var newLo = lo + deltaSeconds
+        newLo = min(max(newLo, bounds.lowerBound.timeIntervalSince1970),
+                    bounds.upperBound.timeIntervalSince1970 - span)
+        newLo = max(newLo, bounds.lowerBound.timeIntervalSince1970)
+        return Date(timeIntervalSince1970: newLo)...Date(timeIntervalSince1970: newLo + span)
+    }
 
     // MARK: Geometry helpers
 
@@ -110,6 +166,17 @@ public struct OverviewHRChart: View {
     /// axis silently collapsing to the data extent. Otherwise it's pinned to the HR data so markers
     /// (sleep onset the night before, etc.) can't stretch the timeline. Safe even for sparse input.
     private var xDomain: ClosedRange<Date> {
+        // Deep Timeline: the bound zoom window wins over everything (it's what gestures drive).
+        if let zoomDomain, zoomDomain.upperBound > zoomDomain.lowerBound { return zoomDomain }
+        if let xRange, xRange.upperBound > xRange.lowerBound { return xRange }
+        let lo = points.first?.date ?? Date(timeIntervalSince1970: 0)
+        let hi = points.last?.date ?? lo.addingTimeInterval(3600)
+        return hi > lo ? lo...hi : lo...lo.addingTimeInterval(3600)
+    }
+
+    /// The hard clamp a zoom/pan window may never escape: the caller-supplied bounds, else the data extent.
+    private var zoomClampBounds: ClosedRange<Date> {
+        if let zoomBounds, zoomBounds.upperBound > zoomBounds.lowerBound { return zoomBounds }
         if let xRange, xRange.upperBound > xRange.lowerBound { return xRange }
         let lo = points.first?.date ?? Date(timeIntervalSince1970: 0)
         let hi = points.last?.date ?? lo.addingTimeInterval(3600)
@@ -314,6 +381,22 @@ public struct OverviewHRChart: View {
             }
         }
         .frame(height: height)
+        // Deep-Timeline zoom/pan: only active when a zoom binding is supplied (the Deep Timeline). Every
+        // other call site passes the default `.constant(nil)`, so the static chart keeps its exact gestures.
+        .modifier(ZoomPanModifier(
+            isActive: zoomDomain != nil,
+            current: { xDomain },
+            bounds: zoomClampBounds,
+            anchor: $gestureAnchorDomain,
+            apply: { newDomain in zoomDomain = newDomain },
+            zoom: { base, scale, frac, bounds in Self.zoomed(base, scale: scale, anchorFraction: frac, bounds: bounds) },
+            pan: { base, dx, plotWidth, bounds in
+                // Map a horizontal drag (points) to seconds across the current visible span.
+                let span = base.upperBound.timeIntervalSince1970 - base.lowerBound.timeIntervalSince1970
+                let secPerPoint = plotWidth > 0 ? span / Double(plotWidth) : 0
+                return Self.panned(base, deltaSeconds: -dx * secPerPoint, bounds: bounds)
+            }
+        ))
         // Collapse the Charts marks into ONE meaningful VoiceOver element with a summary, instead of
         // letting VoiceOver walk every line/area/rule/rect mark as a separate, contextless axis value
         // (matches the sibling TrendChart). The only datum affordance otherwise is hover, which is
@@ -410,6 +493,58 @@ private struct SleepBandLabel: View {
         )
         .fixedSize()
         .allowsHitTesting(false)
+    }
+}
+
+// MARK: - Zoom / pan gesture host
+//
+// Kept as a standalone modifier so the chart body stays readable and so the platform split (pinch on
+// iOS, scroll-to-zoom on macOS; drag-pan on both) lives in one place. No-op when `isActive` is false.
+
+private struct ZoomPanModifier: ViewModifier {
+    let isActive: Bool
+    let current: () -> ClosedRange<Date>
+    let bounds: ClosedRange<Date>
+    @Binding var anchor: ClosedRange<Date>?
+    let apply: (ClosedRange<Date>) -> Void
+    let zoom: (ClosedRange<Date>, Double, Double, ClosedRange<Date>) -> ClosedRange<Date>
+    let pan: (ClosedRange<Date>, CGFloat, CGFloat, ClosedRange<Date>) -> ClosedRange<Date>
+
+    @State private var plotWidth: CGFloat = 1
+
+    func body(content: Content) -> some View {
+        guard isActive else { return AnyView(content) }
+        let drag = DragGesture(minimumDistance: 6)
+            .onChanged { value in
+                let base = anchor ?? current()
+                if anchor == nil { anchor = base }
+                apply(pan(base, value.translation.width, plotWidth, bounds))
+            }
+            .onEnded { _ in anchor = nil }
+
+        let magnify = MagnificationGesture()
+            .onChanged { scale in
+                let base = anchor ?? current()
+                if anchor == nil { anchor = base }
+                // Pinch zooms about the window centre (we don't get a focal point from MagnificationGesture).
+                apply(zoom(base, Double(scale), 0.5, bounds))
+            }
+            .onEnded { _ in anchor = nil }
+
+        let measured = content.background(
+            GeometryReader { geo in
+                Color.clear.onAppear { plotWidth = geo.size.width }
+                    .onChangeCompat(of: geo.size.width) { plotWidth = $0 }
+            }
+        )
+
+        #if os(macOS)
+        // macOS has no pinch in this context; drag pans. Scroll-to-zoom is handled by the Deep Timeline
+        // host's scroll modifier (it owns the NSEvent monitor); here we wire pan + a double-tap reset.
+        return AnyView(measured.gesture(drag))
+        #else
+        return AnyView(measured.gesture(magnify).simultaneousGesture(drag))
+        #endif
     }
 }
 

@@ -65,9 +65,16 @@ object SpotHrvReading {
      *
      * @param rrMs the raw R-R intervals in milliseconds, in capture order (untrusted BLE input — the
      *   analyzer's range filter bounds-checks each to [HrvAnalyzer.RR_MIN_MS]..[HrvAnalyzer.RR_MAX_MS]).
+     * @param maxRejectedFraction the spot honesty gate (#585) — refuse the reading when more than this
+     *   fraction of beats was dropped as noise (out-of-range / ectopic), even if [HrvAnalyzer.MIN_BEATS]
+     *   clean beats survive. Defaults to [HrvAnalyzer.DEFAULT_SPOT_MAX_REJECTED_FRACTION] (0.35). The
+     *   nightly windowed path does NOT use this, so overnight HRV is unchanged.
      */
-    fun compute(rrMs: List<Int>): Outcome {
-        val result = HrvAnalyzer.analyzeRaw(rrMs.map { it.toDouble() })
+    fun compute(
+        rrMs: List<Int>,
+        maxRejectedFraction: Double = HrvAnalyzer.DEFAULT_SPOT_MAX_REJECTED_FRACTION,
+    ): Outcome {
+        val result = HrvAnalyzer.analyzeRaw(rrMs.map { it.toDouble() }, maxRejectedFraction)
         val rmssd = result.rmssd
         return if (rmssd == null) {
             Outcome.Insufficient(clean = result.nClean, needed = HrvAnalyzer.MIN_BEATS, input = result.nInput)

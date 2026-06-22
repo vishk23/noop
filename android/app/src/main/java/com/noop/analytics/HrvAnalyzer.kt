@@ -48,6 +48,14 @@ object HrvAnalyzer {
      */
     const val ECTOPIC_WINDOW_RADIUS: Int = 2
 
+    /**
+     * Default ceiling on the fraction of input beats the cleaning pipeline may reject before a SPOT
+     * reading is refused as too noisy (#585). Spot-only: passed by the on-demand callers, never by the
+     * nightly windowed path. 0.35 == refuse once more than 35% of beats were dropped as out-of-range or
+     * ectopic, even if [MIN_BEATS] clean intervals survive — a quiet honesty gate on a short live capture.
+     */
+    const val DEFAULT_SPOT_MAX_REJECTED_FRACTION: Double = 0.35
+
     /** Result of an HRV computation over a window. Mirrors Swift `HRVResult`. */
     data class HrvResult(
         /** RMSSD in milliseconds, or null when too few valid beats. */
@@ -169,12 +177,26 @@ object HrvAnalyzer {
     /**
      * Compute HRV from raw RR-interval values (ms), applying the full cleaning
      * pipeline. Returns an empty result when fewer than [MIN_BEATS] survive.
+     *
+     * @param maxRejectedFraction SPOT-ONLY honesty gate (#585). When non-null, the reading is ALSO refused
+     *   (empty result) if the fraction of input beats dropped by cleaning exceeds this value — even when
+     *   [MIN_BEATS] clean intervals survive — because a short live capture that threw away most of its
+     *   beats is too noisy to trust. null (the default, and what the NIGHTLY windowed path passes) skips
+     *   the gate entirely, so the nightly RMSSD is byte-identical to before this parameter existed.
      */
-    fun analyzeRaw(rawRR: List<Double>): HrvResult {
+    fun analyzeRaw(rawRR: List<Double>, maxRejectedFraction: Double? = null): HrvResult {
         val nInput = rawRR.size
         val clean = cleanRR(rawRR)
         if (clean.size < MIN_BEATS) {
             return HrvResult.empty(nInput)
+        }
+        // Spot-only: refuse when too large a fraction of beats was noise (out-of-range or ectopic). Only
+        // applied when a ceiling is supplied; nInput > 0 holds implicitly (clean.size ≥ MIN_BEATS > 0).
+        if (maxRejectedFraction != null && nInput > 0) {
+            val rejectedFraction = 1.0 - clean.size.toDouble() / nInput.toDouble()
+            if (rejectedFraction > maxRejectedFraction) {
+                return HrvResult.empty(nInput)
+            }
         }
         val rmssd = rmssdRaw(clean)
         val sdnn = sdnnRaw(clean)

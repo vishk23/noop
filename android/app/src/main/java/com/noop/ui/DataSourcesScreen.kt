@@ -27,6 +27,7 @@ import androidx.compose.material.icons.filled.FitnessCenter
 import androidx.compose.material.icons.filled.Map
 import androidx.compose.material.icons.filled.MonitorHeart
 import androidx.compose.material.icons.filled.Restaurant
+import androidx.compose.material.icons.filled.SettingsInputAntenna
 import androidx.compose.material.icons.filled.Watch
 import androidx.compose.material3.Icon
 import androidx.compose.material3.Switch
@@ -728,6 +729,32 @@ fun DataSourcesScreen(vm: AppViewModel) {
                         contentDescription = "Broadcast heart rate as a Bluetooth sensor"
                     },
                 )
+            }
+
+            // #573: leaving broadcast on keeps the radio advertising continuously, which drains the
+            // battery faster — make that visible and persistent so it isn't left on by accident. Mirrors
+            // the Swift broadcast-HR warning (SettingsView).
+            if (hrBroadcast) {
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .semantics(mergeDescendants = true) {},
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                ) {
+                    Icon(
+                        Icons.Filled.SettingsInputAntenna,
+                        contentDescription = null,
+                        tint = Palette.statusWarning,
+                        modifier = Modifier.size(16.dp),
+                    )
+                    Text(
+                        "Broadcast HR is ON. Your strap is advertising its heart rate continuously, " +
+                            "which keeps its radio hot and drains the battery faster. Turn it off when " +
+                            "you're not using it with another device.",
+                        style = NoopType.caption,
+                        color = Palette.statusWarning,
+                    )
+                }
             }
         }
 

@@ -101,6 +101,31 @@ final class SpotHrvReadingTests: XCTestCase {
         XCTAssertEqual(clean, 0)
     }
 
+    func testSpotGateRefusesNoisyCaptureByDefault() {
+        // #585: a capture where too many beats were noise must be refused even though >= minBeats clean
+        // beats survive. 24 valid 850 ms + 16 out-of-range (10 ms) → 16/40 = 0.40 rejected > the default
+        // 0.35 ceiling → .insufficient (an honest "sit still and try again"), never a fabricated number.
+        var rr = knownCleanSeries()            // 24 clean
+        rr.append(contentsOf: Array(repeating: 10, count: 16))   // 16 out-of-range → range-dropped
+        guard case let .insufficient(clean, needed, input) = SpotHrvReading.compute(rr) else {
+            return XCTFail("0.40 rejected must be refused by the default spot gate")
+        }
+        XCTAssertEqual(needed, HRVAnalyzer.minBeats)
+        XCTAssertEqual(input, 40)
+        XCTAssertEqual(clean, 0)               // refusal reports the empty result's nClean
+    }
+
+    func testSpotGateRelaxedAllowsTheSameNoisyCapture() {
+        // Passing a permissive ceiling (> 0.40) lets the same 24-clean capture through — proving the gate,
+        // not the clean-beat count, is what refused it above.
+        var rr = knownCleanSeries()
+        rr.append(contentsOf: Array(repeating: 10, count: 16))
+        guard case let .reading(_, _, beats, _) = SpotHrvReading.compute(rr, maxRejectedFraction: 0.5) else {
+            return XCTFail("a 0.5 ceiling must allow the 0.40-rejected capture")
+        }
+        XCTAssertEqual(beats, 24)
+    }
+
     func testMeanHrFromNnMatchesDefinition() {
         XCTAssertEqual(SpotHrvReading.meanHrFromNN(1000.0)!, 60.0, accuracy: 1e-9)
         XCTAssertEqual(SpotHrvReading.meanHrFromNN(800.0)!, 75.0, accuracy: 1e-9)

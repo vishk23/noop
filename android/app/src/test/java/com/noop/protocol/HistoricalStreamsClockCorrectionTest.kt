@@ -127,4 +127,62 @@ class HistoricalStreamsClockCorrectionTest {
         assertEquals(floor, atFloor.hr.first().ts)
         assertEquals(0, atFloor.droppedImplausibleTs)
     }
+
+    // ── #547 SESSION-RELATIVE gate (re-pollution by a wandering clock) ────────────────────────────────
+    // A wandering-clock strap re-sends records whose `unix` clears the absolute 2023-11 floor but is months
+    // OUTSIDE the strap's own GET_DATA_RANGE [oldest, newest] window for THIS sync (e.g. 2024-12-25 against a
+    // 2026 strap). Those are dropped session-relatively; a legitimately-old record WITHIN the window is kept.
+    // Mirrors the Swift HistoricalTimestampGateTests session-relative cases 1:1 (same SESSION_RANGE_MARGIN).
+
+    @Test fun sessionRelativeBoundsMatchSwift() {
+        assertEquals(7L * 86_400L, SESSION_RANGE_MARGIN)
+    }
+
+    @Test fun sessionRelativeDropsFloorClearingOutOfWindowRecord() {
+        // 2024-12-25 record (clears the 2023-11 floor) arriving against a 2026 fortnight strap window.
+        val newest = 1_780_916_150L                       // strap's newest banked record
+        val oldest = newest - 14 * 86_400                 // strap banked a ~2-week window
+        val badYule = 1_735_084_800L                      // 2024-12-25 00:00 UTC — months before `oldest`
+        val st = extractHistoricalStreams(
+            listOf(wornV18WithUnix(badYule)), 0, 0, DeviceFamily.WHOOP5,
+            wallNow = newest, sessionOldestUnix = oldest, sessionNewestUnix = newest,
+        )
+        assertTrue("a floor-clearing record months before the strap's own window is dropped", st.hr.isEmpty())
+        assertEquals(1, st.droppedImplausibleTs)
+    }
+
+    @Test fun sessionRelativeKeepsLegitimatelyOldInWindowBackfill() {
+        // A real deep-backfill record WITHIN the strap's banked window must be KEPT (session-relative).
+        val newest = 1_780_916_150L
+        val oldest = newest - 30 * 86_400                 // a month of banked backlog
+        val realOld = oldest + 2 * 86_400                 // 2 days into the window — real history
+        val st = extractHistoricalStreams(
+            listOf(wornV18WithUnix(realOld)), 0, 0, DeviceFamily.WHOOP5,
+            wallNow = newest, sessionOldestUnix = oldest, sessionNewestUnix = newest,
+        )
+        assertEquals(realOld, st.hr.first().ts)
+        assertEquals(0, st.droppedImplausibleTs)
+    }
+
+    @Test fun sessionRelativeFallsBackToAbsoluteWithoutMarkers() {
+        // No range markers → absolute-only gate, unchanged: a 2024-12-25 record SURVIVES (clears the floor).
+        val badYule = 1_735_084_800L
+        val st = extractHistoricalStreams(
+            listOf(wornV18WithUnix(badYule)), 0, 0, DeviceFamily.WHOOP5, wallNow = badYule + 3_600,
+        )
+        assertEquals(badYule, st.hr.first().ts)
+        assertEquals(0, st.droppedImplausibleTs)
+    }
+
+    @Test fun sessionRelativeIgnoresMalformedMarkers() {
+        // A below-floor (wrong-epoch) oldest marker must NEVER reject real data — fall back to absolute-only.
+        val newest = 1_780_916_150L
+        val realRecent = newest - 3600
+        val st = extractHistoricalStreams(
+            listOf(wornV18WithUnix(realRecent)), 0, 0, DeviceFamily.WHOOP5,
+            wallNow = newest, sessionOldestUnix = 12_345L, sessionNewestUnix = newest,
+        )
+        assertEquals(realRecent, st.hr.first().ts)
+        assertEquals(0, st.droppedImplausibleTs)
+    }
 }

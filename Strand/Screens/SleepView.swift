@@ -64,6 +64,13 @@ struct SleepView: View {
     /// keeps the existing cold-start overnight-band fallback. (#547) Refreshed with `allSessions`.
     @State private var habitualMidsleepSec: Int? = nil
 
+    /// Persisted per-epoch MOTION series keyed by each session's detected `startTs` (#407). Loaded in the
+    /// same `.task` as `allSessions` from `repo.sessionMotions(starts:)`, then laid along the hypnogram for
+    /// the SAME main-night GROUP blocks the hero resolved (mergeDay's group) — we do NOT re-resolve the
+    /// night, only read the already-chosen group's stored motion. A block with no stored series stays absent
+    /// (honest empty state for older rows whose `motionJSON` is NULL). Refreshed with `allSessions`.
+    @State private var motionByStart: [Int: [Double]] = [:]
+
     /// Draw-in fraction for the Rest hero gauge — owned here so the gauge animates the arc on appear /
     /// when the sleep-performance score changes, exactly as TodayView drives its rings. Presentation-only.
     @State private var heroFraction: Double = 0
@@ -158,6 +165,9 @@ struct SleepView: View {
                 // Load the learned habitual midsleep the engine used, so the main-night pick aligns to it
                 // (a shift/late sleeper) instead of only the cold-start band. nil under threshold. (#547)
                 habitualMidsleepSec = await repo.habitualMidsleepSec()
+                // Per-epoch motion for every block (#407), keyed by detected start. mergeDay reads only the
+                // already-resolved group's entries — this just pre-fetches them all so the model build is sync.
+                motionByStart = await repo.sessionMotions(starts: allSessions.map { $0.startTs })
                 nightOffset = 0
                 navNight = nil
                 modelKey = dataKey
@@ -563,6 +573,14 @@ struct SleepView: View {
                     ])
                 }
             )
+            // #407 — subordinate movement/restlessness trace UNDER the hypnogram, on the SAME timeline, for
+            // the SAME main-night GROUP blocks the hero resolved (mergeDay's group). Shown only for a real
+            // (≥2-segment) hypnogram so the strip aligns with a genuine timeline; the proportional stage-bar
+            // fallback has no timeline to anchor to. Placed OUTSIDE the fixed-height ChartCard so it doesn't
+            // clip the hypnogram. Honest empty state inside `motionStrip` when no group fragment has motion.
+            if intervals.count >= 2 {
+                motionStrip(night)
+            }
             // H9 — when the engine's Rest confidence flags this night's staging as low-confidence (a
             // high-efficiency night whose deep+REM share is implausibly low → a likely staging miss, not
             // a real night with no restorative sleep), say so honestly under the breakdown rather than
@@ -572,6 +590,34 @@ struct SleepView: View {
                 stageLowConfidenceNote
             }
         }
+    }
+
+    /// #407 — the per-epoch movement/restlessness strip drawn UNDER the hypnogram, on the SAME timeline.
+    /// Reads the already-resolved main-night GROUP's persisted motion off `night.motionEpochs` (laid
+    /// fragment-by-fragment in `mergeDay`, NO re-resolution of the night). The left inset (44pt axis + 12pt
+    /// spacing) matches the Hypnogram's `HStack` so the strip's plot lines up under the stage bands above.
+    /// When the night has no persisted motion (older rows whose `motionJSON` is NULL) it shows an HONEST
+    /// empty note rather than a fabricated flat zero trace.
+    @ViewBuilder
+    private func motionStrip(_ night: Night) -> some View {
+        HStack(alignment: .center, spacing: 0) {
+            // 44 = Hypnogram axis width; 12 = its HStack spacing — keep the strip's plot under the bands.
+            Text("Move")
+                .font(StrandFont.footnote)
+                .foregroundStyle(StrandPalette.textTertiary)
+                .frame(width: 44, alignment: .trailing)
+            Spacer().frame(width: 12)
+            if night.motionEpochs.count >= 2 {
+                MotionTrace(epochs: night.motionEpochs, height: 40, tint: StrandPalette.restColor)
+            } else {
+                Text("No movement detail for this night")
+                    .font(StrandFont.footnote)
+                    .foregroundStyle(StrandPalette.textTertiary)
+                    .frame(maxWidth: .infinity, minHeight: 40, alignment: .leading)
+                    .accessibilityLabel(Text("No movement detail recorded for this night"))
+            }
+        }
+        .accessibilityElement(children: .contain)
     }
 
     /// H9 — true when this night's staging is LOW-CONFIDENCE: a high-efficiency night (lots of measured
@@ -1270,6 +1316,11 @@ struct SleepView: View {
         let onset = first.effectiveStartTs, wake = last.endTs
         var stages = Stages(awake: 0, light: 0, deep: 0, rem: 0)
         var segs: [SleepInterval] = []
+        // #407: lay the GROUP's per-epoch motion fragment-by-fragment in the SAME order the stage timeline
+        // is laid, reading the already-chosen group's stored series (NOT a re-resolution). The detected key
+        // (`startTs`, not `effectiveStartTs`) is the motion store's key. A fragment with no persisted series
+        // contributes nothing; if NO fragment has one, `motionEpochs` stays empty → honest empty state.
+        var motion: [Double] = []
         for frag in group {
             if let seg = decodeSegments(frag.stagesJSON, sessionStart: frag.effectiveStartTs), seg.stages.total > 0 {
                 stages.awake += seg.stages.awake; stages.light += seg.stages.light
@@ -1281,6 +1332,7 @@ struct SleepView: View {
                 stages.awake += st.awake; stages.light += st.light
                 stages.deep  += st.deep;  stages.rem   += st.rem
             }
+            if let m = motionByStart[frag.startTs] { motion.append(contentsOf: m) }
         }
         guard stages.asleep > 0 else { return nil }
         let eff = stages.total > 0 ? stages.asleep / stages.total : nil
@@ -1288,7 +1340,7 @@ struct SleepView: View {
                                        restingHr: nil, avgHrv: nil, stagesJSON: nil)
         let realSegs = segs.count >= 2 ? segs.sorted { $0.start < $1.start } : nil
         return Night(session: synth, stages: stages, realSegments: realSegs, sourceBlocks: sessions,
-                     habitualMidsleepSec: habitualMidsleepSec)
+                     motionEpochs: motion, habitualMidsleepSec: habitualMidsleepSec)
     }
 
     /// The real stored blocks composing the day at `offset` (for the stage-less stub Night, so its edit
@@ -1775,6 +1827,12 @@ private struct Night {
     /// merge for display; an edit must target a real row, so it resolves it from here by identity
     /// rather than re-scanning by wake time. (#318)
     var sourceBlocks: [CachedSleepSession] = []
+
+    /// Per-epoch MOTION for the MAIN-night GROUP, laid fragment-by-fragment in the SAME order `intervals`
+    /// lays the group's stage timeline (#407). Empty when no group fragment has a persisted `motionJSON`
+    /// (older rows) — the Sleep tab then shows an honest empty state instead of a fabricated zero trace.
+    /// This is read off the already-resolved group, NOT a re-resolution of the night.
+    var motionEpochs: [Double] = []
 
     /// The LEARNED habitual midsleep (local time-of-day seconds) the owning view loaded for the user — the
     /// SAME value the engine threaded into the daily total — so `editTarget` resolves the SAME main block

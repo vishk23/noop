@@ -712,6 +712,36 @@ class MainNightConsistencyTest {
         assertEquals(listOf(0, 2), SleepStageTotals.mainNightGroupIndices(blocks, 0L))
     }
 
+    /**
+     * IRON-RULE REGRESSION GUARD (#547 / #407 lanes): the 6.1.1 bridged main-night SELECTION must NOT move
+     * when the upstream ingest gate (#547) or the downstream motion trace (#407) change. Pins
+     * `mainNightGroupIndices` for a biphasic main night to a BYTE-IDENTICAL frozen golden so any edit that
+     * perturbs the bridge/selection is caught. Kotlin twin of the Swift
+     * `testMainNightGroupIndicesByteIdenticalForBiphasicNight`.
+     */
+    @Test
+    fun mainNightGroupIndicesByteIdenticalForBiphasicNight() {
+        // Two night fragments split by a 35-min wake gap (bridges) + a far afternoon nap (does NOT bridge).
+        val a = atMin(23, 10) - 86_400L            // 23:10 → 01:30 (140 min)
+        val aEnd = a + 140 * 60
+        val b = aEnd + 35 * 60                       // 02:05, 35-min gap → bridges
+        val bEnd = b + 275 * 60                      // → 06:40
+        val nap = atHour(15)                         // 15:00 → 16:20 (far → no bridge)
+        val blocks = listOf(
+            SleepStageTotals.NightBlock(a, aEnd),    // idx 0
+            SleepStageTotals.NightBlock(b, bEnd),    // idx 1
+            SleepStageTotals.NightBlock(nap, nap + 80 * 60), // idx 2
+        )
+        // FROZEN GOLDEN: the two bridged night fragments are the group; the nap is excluded. A change here
+        // means the 6.1.1 main-night selection moved — STOP and investigate (the iron rule).
+        assertEquals(listOf(0, 1), SleepStageTotals.mainNightGroupIndices(blocks, 0L))
+        // Cold-start and learned-habitual both land identically (duration dominates), proving neither path
+        // perturbs the bridge.
+        val habitualMid = ((a + 70 * 60) % 86_400L)
+        assertEquals(listOf(0, 1), SleepStageTotals.mainNightGroupIndices(blocks, 0L, habitualMid))
+        assertTrue(SleepStageTotals.mainNightIndex(blocks, 0L) in listOf(0, 1))
+    }
+
     /** The stages-path seam SUMS the bridged biphasic group (analyzeDay parity), not the longest fragment. */
     @Test
     fun honoringEditsSumsBiphasicGroup() {

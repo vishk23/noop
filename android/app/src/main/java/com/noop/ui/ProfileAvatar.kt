@@ -5,6 +5,7 @@ import android.content.SharedPreferences
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.Matrix
+import android.media.ExifInterface
 import android.net.Uri
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.size
@@ -115,7 +116,8 @@ object ProfileAvatarStore {
     /**
      * Decode [uri] into a Bitmap whose longest edge is at most [MAX_DIMEN]. Uses a two-pass decode: a
      * bounds-only pass to pick an `inSampleSize`, then the real decode, then an exact down-fit so a
-     * non-power-of-two source still lands at the cap. Returns null if the stream can't be read/decoded.
+     * non-power-of-two source still lands at the cap, then an EXIF-orientation correction so a photo
+     * taken sideways lands upright. Returns null if the stream can't be read/decoded.
      */
     private fun decodeDownscaled(ctx: Context, uri: Uri): Bitmap? {
         val resolver = ctx.contentResolver
@@ -127,6 +129,15 @@ object ProfileAvatarStore {
         val srcH = bounds.outHeight
         if (srcW <= 0 || srcH <= 0) return null
 
+        // EXIF orientation — read BEFORE the bitmap decode (BitmapFactory drops EXIF). The pixels come
+        // off the sensor un-rotated; the orientation tag says how to spin them upright. We read it from a
+        // fresh stream now and apply the rotation AFTER the down-fit below. iOS already lands upright.
+        val orientation = runCatching {
+            resolver.openInputStream(uri)?.use {
+                ExifInterface(it).getAttributeInt(ExifInterface.TAG_ORIENTATION, ExifInterface.ORIENTATION_NORMAL)
+            }
+        }.getOrNull() ?: ExifInterface.ORIENTATION_NORMAL
+
         // Pass 2: sub-sampled decode (power-of-two) to get under ~2× the cap cheaply.
         var sample = 1
         while (srcW / (sample * 2) >= MAX_DIMEN && srcH / (sample * 2) >= MAX_DIMEN) {
@@ -137,14 +148,50 @@ object ProfileAvatarStore {
             BitmapFactory.decodeStream(it, null, decodeOpts)
         } ?: return null
 
-        // Exact down-fit: scale the longest edge to MAX_DIMEN (never upscale a small source).
+        // Exact down-fit: scale the longest edge to MAX_DIMEN (never upscale a small source), folding
+        // the EXIF rotate/flip into the SAME matrix so it's one createBitmap. A small source that skips
+        // scaling (factor 1) still gets oriented if the EXIF tag is non-trivial.
         val longest = maxOf(decoded.width, decoded.height)
-        if (longest <= MAX_DIMEN) return decoded
-        val factor = MAX_DIMEN.toFloat() / longest.toFloat()
-        val matrix = Matrix().apply { postScale(factor, factor) }
-        val scaled = Bitmap.createBitmap(decoded, 0, 0, decoded.width, decoded.height, matrix, true)
-        if (scaled !== decoded) decoded.recycle()
-        return scaled
+        val factor = if (longest > MAX_DIMEN) MAX_DIMEN.toFloat() / longest.toFloat() else 1f
+        val matrix = Matrix().apply {
+            if (factor != 1f) postScale(factor, factor)
+            applyExifOrientation(this, orientation)
+        }
+        if (matrix.isIdentity) return decoded
+        val out = Bitmap.createBitmap(decoded, 0, 0, decoded.width, decoded.height, matrix, true)
+        if (out !== decoded) decoded.recycle()
+        return out
+    }
+
+    /** One post-concatenated step of an EXIF correction: either a clockwise rotate or an axis scale. */
+    internal sealed interface ExifOp {
+        data class Rotate(val degrees: Float) : ExifOp
+        data class Scale(val sx: Float, val sy: Float) : ExifOp
+    }
+
+    /**
+     * The ordered list of post-concatenations that brings an EXIF [orientation] upright (empty = no-op).
+     * Pure + Android-free (only int tag constants, which are compile-time literals) so the tag→ops table
+     * is unit-testable without a real [Matrix], which is stubbed in JVM unit tests. The op sequences are
+     * the literal operations [applyExifOrientation] used to call inline, so behaviour is unchanged.
+     */
+    internal fun exifOps(orientation: Int): List<ExifOp> = when (orientation) {
+        ExifInterface.ORIENTATION_FLIP_HORIZONTAL -> listOf(ExifOp.Scale(-1f, 1f))
+        ExifInterface.ORIENTATION_ROTATE_180 -> listOf(ExifOp.Rotate(180f))
+        ExifInterface.ORIENTATION_FLIP_VERTICAL -> listOf(ExifOp.Scale(1f, -1f))
+        ExifInterface.ORIENTATION_TRANSPOSE -> listOf(ExifOp.Rotate(90f), ExifOp.Scale(-1f, 1f))
+        ExifInterface.ORIENTATION_ROTATE_90 -> listOf(ExifOp.Rotate(90f))
+        ExifInterface.ORIENTATION_TRANSVERSE -> listOf(ExifOp.Rotate(270f), ExifOp.Scale(-1f, 1f))
+        ExifInterface.ORIENTATION_ROTATE_270 -> listOf(ExifOp.Rotate(270f))
+        else -> emptyList() // ORIENTATION_NORMAL / UNDEFINED — no transform
+    }
+
+    /** Post-concatenate the EXIF correction for [orientation] onto [matrix] (after any down-scale). */
+    private fun applyExifOrientation(matrix: Matrix, orientation: Int) {
+        for (op in exifOps(orientation)) when (op) {
+            is ExifOp.Rotate -> matrix.postRotate(op.degrees)
+            is ExifOp.Scale -> matrix.postScale(op.sx, op.sy)
+        }
     }
 }
 

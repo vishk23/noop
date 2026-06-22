@@ -90,4 +90,42 @@ final class StepsEstimateEngineTests: XCTestCase {
         let cal = StepsEstimateEngine.Calibration(coefficient: 1_000_000, sampleDays: 5, confidence: 0.1, manual: false)
         XCTAssertEqual(StepsEstimateEngine.estimate(motion: 100, calibration: cal), StepsEstimateEngine.maxDailySteps)
     }
+
+    // MARK: calibration status (#589 — explain a blank tile instead of going silent)
+
+    func testStatusNeedsMoreDaysCountsUsableDays() {
+        // Two usable overlapping days (< minCalibrationDays 3) → needsMoreDays with have=2, message says
+        // "Need 1 more day". A near-still day and a zero-step day don't count toward `have`.
+        let pts = [
+            (0.2, 5000.0),     // below minMotionForFit → not usable
+            (10.0, 0.0),       // zero steps → not usable
+            (10.0, 1000.0), (20.0, 2000.0),
+        ].map { StepsEstimateEngine.CalibrationPoint(motion: $0.0, steps: $0.1) }
+        let status = StepsEstimateEngine.status(pts)
+        XCTAssertEqual(status, .needsMoreDays(have: 2, need: 3))
+        XCTAssertFalse(status.canEstimate)
+        XCTAssertEqual(status.headline, "Need 1 more day where your phone also counted steps")
+    }
+
+    func testStatusCalibratedOnceEnoughDays() {
+        let pts = (0..<3).map { _ in StepsEstimateEngine.CalibrationPoint(motion: 10, steps: 1000) }
+        let status = StepsEstimateEngine.status(pts)
+        guard case let .calibrated(coefficient, sampleDays, confidence) = status else {
+            return XCTFail("3 usable days must report .calibrated, got \(status)")
+        }
+        XCTAssertEqual(coefficient, 100, accuracy: 1e-9)
+        XCTAssertEqual(sampleDays, 3)
+        XCTAssertGreaterThan(confidence, 0)
+        XCTAssertTrue(status.canEstimate)
+        XCTAssertEqual(status.headline, "Estimated from 3 days your phone also counted")
+    }
+
+    func testStatusManualOverrideWinsEvenWithNoDays() {
+        // A hand-set coefficient reports .manual regardless of how few overlapping days exist (the whole
+        // point of the manual path — a user with no phone history can still get an estimate).
+        let status = StepsEstimateEngine.status([], manualOverride: 42)
+        XCTAssertEqual(status, .manual(coefficient: 42, sampleDays: 0))
+        XCTAssertTrue(status.canEstimate)
+        XCTAssertEqual(status.headline, "Calibrated by hand")
+    }
 }

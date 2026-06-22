@@ -865,6 +865,32 @@ struct SettingsView: View {
         rawSensorDiagnosticsCard
     }
 
+    /// The R22 "send enable sequence" button is structurally impossible on macOS — a Mac can't form the
+    /// encrypted bond a 5/MG needs to accept the write (BLEManager forms a live-HR-only link there), so it
+    /// stays disabled regardless of bond/wear state (#587). On iOS/Android it gates on the real bond + wear.
+    private var deepDataButtonDisabled: Bool {
+        #if os(macOS)
+        return true
+        #else
+        return !live.encryptedBond || !live.worn
+        #endif
+    }
+
+    /// The reason line under the R22 button. macOS gets an explicit "needs an iPhone/Android" message
+    /// rather than the misleading "needs the full encrypted bond" one (a Mac can never get that bond).
+    private var deepDataButtonReason: String {
+        #if os(macOS)
+        return "Deep data (R22) needs an iPhone or Android — a Mac can't form the encrypted bond a 5/MG requires."
+        #else
+        if !live.encryptedBond {
+            return "Needs the full encrypted bond — close the official WHOOP app and pair the strap to NOOP first (a live-HR-only link can't carry the unlock)."
+        }
+        return live.worn
+            ? "Wear the strap, tap once, then let it sync and share your strap log."
+            : "Put the strap on first — the deep stream is on-wrist only."
+        #endif
+    }
+
     private var fiveMGCard: some View {
         SettingsSection(
             icon: "flask.fill",
@@ -908,8 +934,8 @@ struct SettingsView: View {
                     }
                     .buttonStyle(.borderedProminent)
                     .tint(StrandPalette.accent)
-                    .disabled(!live.encryptedBond || !live.worn)
-                    Text(live.encryptedBond ? (live.worn ? "Wear the strap, tap once, then let it sync and share your strap log." : "Put the strap on first — the deep stream is on-wrist only.") : "Needs the full encrypted bond — close the official WHOOP app and pair the strap to NOOP first (a live-HR-only link can't carry the unlock).")
+                    .disabled(deepDataButtonDisabled)
+                    Text(deepDataButtonReason)
                         .font(StrandFont.caption)
                         .foregroundStyle(StrandPalette.textTertiary)
 
@@ -949,6 +975,22 @@ struct SettingsView: View {
                     .font(StrandFont.caption)
                     .foregroundStyle(StrandPalette.textTertiary)
                     .fixedSize(horizontal: false, vertical: true)
+
+                // #573: leaving broadcast on keeps the strap radio advertising continuously, which drains
+                // the strap faster — make that visible and persistent so it isn't left on by accident.
+                if broadcastHrEnabled {
+                    HStack(alignment: .top, spacing: 8) {
+                        Image(systemName: "antenna.radiowaves.left.and.right")
+                            .foregroundStyle(StrandPalette.statusWarning)
+                            .accessibilityHidden(true)
+                        Text("Broadcast HR is ON. Your strap is advertising its heart rate continuously, which keeps its radio hot and drains the battery faster. Turn it off when you're not using it with another device.")
+                            .font(StrandFont.caption)
+                            .foregroundStyle(StrandPalette.statusWarning)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .accessibilityElement(children: .combine)
+                }
 
                 Toggle(isOn: $puffinCapture) {
                     Text("Record puffin frames to a file")
@@ -1481,6 +1523,36 @@ struct SettingsView: View {
                 .buttonStyle(.plain)
                 .accessibilityLabel("How your scores work")
 
+                // Storage (#590) — on-device space breakdown (database, leftover import Inbox, stranded
+                // temp files) plus a one-tap clean-up. iOS is where "Documents & Data" can balloon after
+                // an Apple Health import; it compiles + reads fine on macOS too, so the link is unconditional.
+                NavigationLink {
+                    StorageView()
+                } label: {
+                    HStack(spacing: 10) {
+                        Image(systemName: "internaldrive")
+                            .foregroundStyle(StrandPalette.accent)
+                            .accessibilityHidden(true)
+                        VStack(alignment: .leading, spacing: 1) {
+                            Text("Storage")
+                                .font(StrandFont.body)
+                                .foregroundStyle(StrandPalette.textPrimary)
+                            Text("Where NOOP's on-device space is going — and a one-tap clean-up.")
+                                .font(StrandFont.footnote)
+                                .foregroundStyle(StrandPalette.textTertiary)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
+                        Spacer()
+                        Image(systemName: "chevron.right")
+                            .font(.system(size: 12, weight: .semibold))
+                            .foregroundStyle(StrandPalette.textTertiary)
+                            .accessibilityHidden(true)
+                    }
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("Storage")
+
                 #if os(iOS)
                 // iOS reality & diagnostics — honest expectations for a sideloaded iPhone build, plus a
                 // one-tap environment dump (device, iOS+build, Data Protection, background refresh,
@@ -1917,6 +1989,13 @@ struct StepsCalibrationSheet: View {
     @State private var draftManual: Double = 0
     @State private var didLoad = false
 
+    /// #589: how many phone-counted days we've actually matched against strap motion so far. Set during
+    /// `loadIfNeeded()` from the SAME overlapping-days scan the accuracy table uses. Feeds the
+    /// "Need N more days…" countdown in `currentFitCard` so an un-calibrated user knows exactly how close
+    /// they are, not just "a few days". (If Lane D ships a richer post-heal steps-state API, swap this read
+    /// for it — see crossLaneNotes; the rendered headline already comes from StepsEstimateEngine.)
+    @State private var usableMatchedDays = 0
+
     /// The coefficient the slider's max anchors to — generous headroom over whatever the auto-fit found so
     /// a manual nudge in either direction is reachable. Floor keeps the slider usable before any fit.
     private var sliderMax: Double {
@@ -2057,7 +2136,14 @@ struct StepsCalibrationSheet: View {
                     Text("Not calibrated yet")
                         .font(StrandFont.bodyNumber)
                         .foregroundStyle(StrandPalette.textPrimary)
-                    Text("We need a few days where your phone also counted steps (at least \(StepsEstimateEngine.minCalibrationDays)), or set it manually below.")
+                    // #589: a concrete countdown instead of a vague "a few days". Headline comes straight
+                    // from the engine's needsMoreDays state so the wording matches the Today steps tile.
+                    Text(StepsEstimateEngine.CalibrationStatus
+                        .needsMoreDays(have: usableMatchedDays, need: StepsEstimateEngine.minCalibrationDays)
+                        .headline)
+                        .font(StrandFont.bodyNumber)
+                        .foregroundStyle(StrandPalette.accent)
+                    Text("These are the days where your phone also counted steps, so NOOP can learn how your motion maps to steps. Or set the coefficient manually below.")
                         .font(StrandFont.footnote)
                         .foregroundStyle(StrandPalette.textTertiary)
                         .fixedSize(horizontal: false, vertical: true)
@@ -2231,6 +2317,9 @@ struct StepsCalibrationSheet: View {
             if rows.count >= 7 { break }
         }
         comparison = rows
+        // #589: the matched-day count drives the "Need N more days…" countdown. These are exactly the
+        // phone-counted days we could pair with strap motion (the engine's "usable overlapping days").
+        usableMatchedDays = rows.count
 
         // Typical recent day's motion for the live preview = median of the motions we just measured.
         if !motions.isEmpty {

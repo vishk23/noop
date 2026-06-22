@@ -59,8 +59,10 @@ import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.drawscope.DrawScope
+import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.nativeCanvas
 import androidx.compose.ui.graphics.toArgb
 import androidx.compose.ui.platform.LocalContext
@@ -169,6 +171,17 @@ fun SleepScreen(
         habitualMidsleep = runCatching { vm.repo.habitualMidsleepSec("my-whoop") }.getOrNull()
     }
 
+    // Persisted per-epoch MOTION keyed by each session's detected startTs (#407). Loaded alongside
+    // `sleeps`; `selectNight` reads only the ALREADY-resolved main-night GROUP's entries (no re-resolution)
+    // and lays them along the hypnogram's timeline. A block with no stored series stays absent (honest empty
+    // state for older rows whose motionJSON is NULL). Mirrors iOS SleepView.motionByStart.
+    var motionByStart by remember { mutableStateOf<Map<Long, List<Double>>>(emptyMap()) }
+    LaunchedEffect(sleeps) {
+        motionByStart = runCatching {
+            vm.repo.sessionMotions("my-whoop", sleeps.map { it.startTs })
+        }.getOrDefault(emptyMap())
+    }
+
     // Export-verbatim sleep figures (sleep_performance / consistency / need / debt) — the
     // headline tiles prefer them over the on-device approximations. Keyed on `days` so a
     // fresh import (which always rewrites dailyMetric too) reloads; metricSeries has no Flow.
@@ -271,8 +284,8 @@ fun SleepScreen(
     // The navigated night, decoded once per (offset, data) change — chevron taps re-pick
     // instantly without re-parsing stagesJSON on every recomposition. The offset now indexes
     // DAYS (navDays), so a day with a detected night always resolves to that night. (#160, #59)
-    val night = remember(nightOffset, navDays, days, habitualMidsleep) {
-        selectNight(navDays, days, nightOffset, habitualMidsleep)
+    val night = remember(nightOffset, navDays, days, habitualMidsleep, motionByStart) {
+        selectNight(navDays, days, nightOffset, habitualMidsleep, motionByStart)
     }
 
     // The HERO follows the selected night (its stage breakdown comes from that day's row); the
@@ -382,6 +395,7 @@ fun SleepScreen(
                 onPickNightDate = onPickNightDate,
                 napBlocks = night?.napBlocks ?: emptyList(),
                 habitualMidsleepSec = habitualMidsleep,
+                motionEpochs = night?.groupMotion ?: emptyList(),
             )
             if (model != null) {
                 Spacer(Modifier.height(Metrics.selectorTopUp))
@@ -544,6 +558,9 @@ private fun Hero(
     // selector so the "why this is your main sleep" reason matches the block the hero shows — for a
     // shift/late sleeper too. null = cold-start band. Mirrors iOS SleepView.habitualMidsleepSec. (C1)
     habitualMidsleepSec: Long? = null,
+    // Per-epoch MOTION for the main-night GROUP (#407), laid in group order by `selectNight`. Empty → honest
+    // empty state. Drawn UNDER the hypnogram on the same timeline. Mirrors iOS SleepView.Night.motionEpochs.
+    motionEpochs: List<Double> = emptyList(),
 ) {
     Column(verticalArrangement = Arrangement.spacedBy(Metrics.gap)) {
         NightNavHeader(nightOffset, lastIndex, clock, onNavigate, session, onUpdateTimes, onDeleteSession, onAddNap, onPickNightDate)
@@ -599,6 +616,10 @@ private fun Hero(
                             onsetTs = session?.effectiveStartTs,
                             wakeTs = session?.endTs,
                         )
+                        // #407 — subordinate movement/restlessness trace UNDER the hypnogram, on the SAME
+                        // timeline, for the SAME main-night GROUP blocks the hero resolved (selectNight's
+                        // group). Honest empty state when no fragment has persisted motion (older rows).
+                        MotionStrip(motionEpochs)
                         Row(horizontalArrangement = Arrangement.spacedBy(Metrics.space16)) {
                             StageLegend("Deep", Palette.sleepDeep)
                             StageLegend("Light", Palette.sleepLight)
@@ -1003,6 +1024,65 @@ private fun HypnogramWithAxis(
                 )
             }
         }
+    }
+}
+
+/**
+ * #407 — the subordinate per-epoch MOVEMENT / restlessness strip drawn UNDER the hypnogram, on the SAME
+ * timeline. [epochs] is the main-night GROUP's per-epoch motion magnitudes (laid fragment-by-fragment in
+ * `selectNight`, oldest→newest), self-normalised to the night's own peak so a quiet and a restless night
+ * both fill the strip — it shows the SHAPE of movement, not an absolute scale the strap doesn't calibrate.
+ * HONESTY: an empty series (no persisted motionJSON on any group fragment — older rows) renders an honest
+ * "no movement detail" note instead of a fabricated flat zero trace. Mirrors the Swift MotionTrace + the
+ * SleepView motionStrip. Presentation-only.
+ */
+@Composable
+private fun MotionStrip(epochs: List<Double>) {
+    if (epochs.size < 2) {
+        Text(
+            "No movement detail for this night.",
+            style = NoopType.footnote,
+            color = Palette.textTertiary,
+        )
+        return
+    }
+    val tint = Palette.restColor
+    Canvas(modifier = Modifier.fillMaxWidth().height(Metrics.motionStripHeight)) {
+        val w = size.width
+        val h = size.height
+        if (w <= 0f || h <= 0f) return@Canvas
+        // Faint baseline so the strip reads as a grounded trace even on a calm night.
+        drawLine(
+            color = Palette.hairline,
+            start = Offset(0f, h - 1f),
+            end = Offset(w, h - 1f),
+            strokeWidth = 1f,
+        )
+        val peak = epochs.maxOrNull()?.takeIf { it > 0.0 } ?: return@Canvas
+        val n = epochs.size
+        val usable = h - 2f
+        // One screen point per epoch: x spread evenly across the width (matching the hypnogram's left→right
+        // time mapping), y the magnitude normalised to the night's own peak (baseline at the bottom).
+        fun pointAt(i: Int): Offset {
+            val x = i.toFloat() / (n - 1).toFloat() * w
+            val frac = (epochs[i] / peak).coerceIn(0.0, 1.0).toFloat()
+            return Offset(x, h - frac * usable)
+        }
+        // Filled area under the per-epoch magnitude.
+        val area = Path().apply {
+            moveTo(0f, h)
+            for (i in 0 until n) { val p = pointAt(i); lineTo(p.x, p.y) }
+            lineTo(w, h)
+            close()
+        }
+        drawPath(area, color = tint.copy(alpha = 0.22f))
+        // The crest line on top of the fill for definition.
+        val crest = Path().apply {
+            val first = pointAt(0)
+            moveTo(first.x, first.y)
+            for (i in 1 until n) { val p = pointAt(i); lineTo(p.x, p.y) }
+        }
+        drawPath(crest, color = tint.copy(alpha = 0.8f), style = Stroke(width = 1.5f))
     }
 }
 
@@ -2036,6 +2116,11 @@ internal data class HeroNight(
     // let buildSleepModel render the WHOLE night instead of one fragment (#555). Null for a single-block day.
     val groupStages: StageMins? = null,
     val groupSegments: List<PersistedSegment>? = null,
+    // Per-epoch MOTION for the main-night GROUP (#407), laid fragment-by-fragment in the SAME order the
+    // group's stage segments are laid. Empty when no group fragment has a persisted motionJSON (older rows)
+    // → the hero shows an honest empty state instead of a fabricated zero trace. Read off the already-
+    // resolved group, NOT a re-resolution of the night.
+    val groupMotion: List<Double> = emptyList(),
 )
 
 /** What the hero card draws for the selected night — null means no usable stage data
@@ -2070,6 +2155,10 @@ internal fun selectNight(
     // and the edit target pick the SAME block the analytics rollup did — for a shift/late sleeper too. null
     // = cold-start band. (#547)
     habitualMidsleepSec: Long? = null,
+    // Per-epoch MOTION keyed by detected startTs (#407). The group's fragments' series are concatenated in
+    // group order onto HeroNight.groupMotion. Empty/absent → honest empty state. Default empty so existing
+    // callers/tests compile unchanged.
+    motionByStart: Map<Long, List<Double>> = emptyMap(),
 ): HeroNight? {
     if (navDays.isEmpty()) return null
     val dayIdx = offset.coerceIn(0, navDays.size - 1)
@@ -2100,7 +2189,13 @@ internal fun selectNight(
     val groupStages = if (group.size > 1) sumGroupStages(group) else null
     val segments = (groupSegments ?: parsePersistedSegments(session.stagesJSON))
         ?.map { seg -> seg.stage to ((seg.end - seg.start) / 60f) }
-    return HeroNight(session, dayKey, segments, sessionClockLabel(session), napBlocks, groupStages, groupSegments)
+    // #407: lay the GROUP's per-epoch motion fragment-by-fragment in `group` order (the same order
+    // `groupSegments` lays the stage timeline), reading the already-chosen group's stored series. The
+    // detected key (`startTs`) is the motion store's key. A fragment with no series contributes nothing; if
+    // NO fragment has one, `groupMotion` is empty → honest empty state.
+    val groupMotion = group.flatMap { motionByStart[it.startTs].orEmpty() }
+    return HeroNight(session, dayKey, segments, sessionClockLabel(session), napBlocks, groupStages,
+        groupSegments, groupMotion)
 }
 
 /**

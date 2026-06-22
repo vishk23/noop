@@ -55,6 +55,17 @@ const val MIN_PLAUSIBLE_UNIX: Long = 1_700_000_000L
  */
 const val FUTURE_MARGIN: Long = 86_400L
 
+/**
+ * SESSION-RELATIVE slack (#547): how far OUTSIDE the strap's own GET_DATA_RANGE oldest/newest markers a
+ * record may still be stamped before it's treated as wandering-clock pollution. The strap reports its
+ * banked history span [oldest, newest] for THIS sync; a real record cannot predate the oldest banked marker
+ * nor post-date the newest by more than benign skew, so a record dated MONTHS off the strap's OWN window is
+ * a bad-clock artefact even when it clears the absolute 2023-11 floor (e.g. a 2024-12-25 record against a
+ * 2026 strap window). 7 days absorbs marker jitter / a still-banking newest edge / DST while still catching
+ * the months-off garbage. Kept in lockstep with Swift `HistoricalStreams.swift` SESSION_RANGE_MARGIN.
+ */
+const val SESSION_RANGE_MARGIN: Long = 7L * 86_400L
+
 // MARK: - little-endian readers (null when out of range; mirror PostHooks.swift u8/u16/u32/f32)
 
 private fun ByteArray.histU8(off: Int): Int? = if (off + 1 <= size) this[off].toInt() and 0xFF else null
@@ -470,13 +481,30 @@ fun extractHistoricalStreams(
     // the real clock so a test that passes a recent wallClockRef still has a sane upper bound, and the
     // replay path's wallClockRef=0 falls back to the real clock. Mirrors the Swift wallNow seam.
     wallNow: Long = maxOf(wallClockRef.toLong(), System.currentTimeMillis() / 1000L),
+    // SESSION-RELATIVE bounds (#547): the strap's own GET_DATA_RANGE oldest/newest markers for THIS sync.
+    // null on the replay/import/no-range paths — the gate then falls back to the absolute-only floor
+    // (unchanged). Kept in lockstep with the Swift extractHistoricalStreams session args.
+    sessionOldestUnix: Long? = null,
+    sessionNewestUnix: Long? = null,
 ): StreamBatch {
     // Count of records dropped by the #547 plausibility gate this batch, surfaced on the returned
     // StreamBatch so the Backfiller can log "bad strap clock" once per session via its existing seam.
     var droppedImplausible = 0
 
-    // The plausible-timestamp window for this batch (#547): [MIN_PLAUSIBLE_UNIX, wallNow + FUTURE_MARGIN].
-    fun plausible(ts: Long): Boolean = ts >= MIN_PLAUSIBLE_UNIX && ts <= wallNow + FUTURE_MARGIN
+    // The plausible-timestamp window for this batch (#547): the absolute floor [MIN_PLAUSIBLE_UNIX,
+    // wallNow + FUTURE_MARGIN] PLUS, when the strap's GET_DATA_RANGE markers are known AND well-formed
+    // (both above the floor, oldest <= newest), the strap's OWN banked window padded by SESSION_RANGE_MARGIN.
+    // A record dated months outside the strap's own window is wandering-clock pollution even if it clears the
+    // absolute floor (e.g. 2024-12-25 against a 2026 strap). A legitimately-OLD record WITHIN [oldest, newest]
+    // (real banked history) is always kept. Malformed/half markers fall back to absolute-only — never reject
+    // real data on a wrong-epoch marker. Mirrors Swift `isPlausibleHistoricalUnix(_:wallNow:sessionOldest:sessionNewest:)`.
+    fun plausible(ts: Long): Boolean {
+        if (ts < MIN_PLAUSIBLE_UNIX || ts > wallNow + FUTURE_MARGIN) return false
+        val oldest = sessionOldestUnix
+        val newest = sessionNewestUnix
+        if (oldest == null || newest == null || oldest < MIN_PLAUSIBLE_UNIX || newest < oldest) return true
+        return ts >= oldest - SESSION_RANGE_MARGIN && ts <= newest + SESSION_RANGE_MARGIN
+    }
 
     fun wall(deviceTs: Int?): Int? = if (deviceTs == null) null else wallClockRef + (deviceTs - deviceClockRef)
 

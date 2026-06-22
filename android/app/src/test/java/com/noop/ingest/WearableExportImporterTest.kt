@@ -155,6 +155,37 @@ class WearableExportImporterTest {
         assertEquals(31, d.avgStress)
     }
 
+    // ---------------- Date formatter caching (PR #583) ----------------
+    //
+    // The Fitbit/dayKey formatters were hoisted to cached fields; these pin that the parse behaviour —
+    // and crucially the isDateOnly LocalDate-vs-LocalDateTime split in dayKey — is unchanged.
+
+    @Test
+    fun fitbitTimeParsesAllCachedDateTimePatterns() {
+        // ISO-with-offset goes through WhoopTime; the three offsetless local patterns go through the
+        // cached FITBIT_DT_FMTS list (millis / seconds / minute precision), interpreted at UTC.
+        val withMillis = WearableExportImporter.fitbitTime("2026-06-01T23:00:00.000")
+        val withSeconds = WearableExportImporter.fitbitTime("2026-06-01 23:00:00")
+        val withMinutes = WearableExportImporter.fitbitTime("2026-06-01 23:00")
+        assertEquals(withMillis, withSeconds)            // .000 and :00 are the same instant
+        assertEquals(withSeconds, withMinutes)           // minute precision lands on the same :00
+        assertNull(WearableExportImporter.fitbitTime("not a date"))
+        assertNull(WearableExportImporter.fitbitTime(null))
+    }
+
+    @Test
+    fun dayKeySplitHoldsAcrossMonthDayYearAndIsoDate() {
+        // dateTime is the MM/dd/yy HH:mm:ss form (a DAYKEY_DATETIME_FMTS LocalDateTime parse): the RHR
+        // row must still fold onto the 2026-06-01 day. A bare yyyy-MM-dd would take the LocalDate branch.
+        val rhr = """
+            [ { "dateTime": "06/01/26 08:30:00", "value": 53 } ]
+        """
+        val files = mapOf("resting_heart_rate-2026.json" to bytes(rhr))
+        val p = WearableExportImporter.parseFitbit(files)
+        val d = p.days.firstOrNull { it.day == "2026-06-01" }
+        assertEquals(53, d?.restingHr)                   // MM/dd/yy datetime → correct day, RHR set
+    }
+
     // ---------------- Safety / honesty ----------------
 
     @Test

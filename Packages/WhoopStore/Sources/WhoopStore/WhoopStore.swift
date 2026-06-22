@@ -121,6 +121,25 @@ public actor WhoopStore {
         }
     }
 
+    /// Total on-disk size of the database — the main file plus its `-wal`/`-shm` siblings — in bytes.
+    /// Drives the iOS Storage diagnostics screen (#590). `nil` for an in-memory store (no path). Runs
+    /// on the actor's executor, off the main thread.
+    public func databaseFileSizeBytes() async -> Int64? {
+        let base = dbQueue.path
+        guard base != ":memory:", !base.isEmpty else { return nil }
+        let fm = FileManager.default
+        var total: Int64 = 0
+        var found = false
+        for suffix in ["", "-wal", "-shm"] {
+            let path = base + suffix
+            if let size = (try? fm.attributesOfItem(atPath: path))?[.size] as? NSNumber {
+                total += size.int64Value
+                found = true
+            }
+        }
+        return found ? total : nil
+    }
+
     // MARK: - Introspection (used by tests)
 
     public func tableNames() async throws -> Set<String> {

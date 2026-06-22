@@ -57,6 +57,22 @@ object WearableExportImporter {
 
     private val DAY_FMT: DateTimeFormatter = DateTimeFormatter.ofPattern("yyyy-MM-dd")
 
+    // Cached date/time formatters — DateTimeFormatter is immutable + thread-safe, so hoisting them out
+    // of the per-row parse loops (fitbitTime / dayKey) avoids re-compiling the same pattern on every
+    // row of a multi-thousand-entry export. Behaviour-preserving; the order matches the old inline lists.
+    private val FITBIT_DT_FMTS: List<DateTimeFormatter> = listOf(
+        DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss.SSS"),
+        DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss"),
+        DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm"),
+    )
+    // dayKey patterns — the isDateOnly split is preserved exactly: "yyyy-MM-dd" parses as a bare
+    // LocalDate, the date-time patterns parse as LocalDateTime then take .toLocalDate().
+    private val DAYKEY_DATETIME_FMTS: List<DateTimeFormatter> = listOf(
+        DateTimeFormatter.ofPattern("MM/dd/yy HH:mm:ss"),
+        DateTimeFormatter.ofPattern("MM/dd/yy"),
+    )
+    private val DAYKEY_DATE_FMT: DateTimeFormatter = DateTimeFormatter.ofPattern("yyyy-MM-dd")
+
     // ------------------------------------------------------------------------
     // Public entry point (UI calls this)
     // ------------------------------------------------------------------------
@@ -575,9 +591,9 @@ object WearableExportImporter {
         if (t.isEmpty()) return null
         WhoopTime.parseEpochSeconds(t, 0)?.let { return it }
         val normalized = t.replace("T", " ")
-        for (pattern in listOf("yyyy-MM-dd HH:mm:ss.SSS", "yyyy-MM-dd HH:mm:ss", "yyyy-MM-dd HH:mm")) {
+        for (fmt in FITBIT_DT_FMTS) {
             runCatching {
-                return LocalDateTime.parse(normalized, DateTimeFormatter.ofPattern(pattern)).toEpochSecond(ZoneOffset.UTC)
+                return LocalDateTime.parse(normalized, fmt).toEpochSecond(ZoneOffset.UTC)
             }
         }
         return null
@@ -587,12 +603,15 @@ object WearableExportImporter {
         val t = raw?.trim() ?: return null
         if (t.isEmpty()) return null
         fitbitTime(t)?.let { return dayString(it) }
-        for (pattern in listOf("MM/dd/yy HH:mm:ss", "MM/dd/yy", "yyyy-MM-dd")) {
+        // Same order + isDateOnly split as before: the two MM/dd/yy* patterns parse as LocalDateTime,
+        // then the bare yyyy-MM-dd pattern parses as a LocalDate. Formatters are cached above.
+        for (fmt in DAYKEY_DATETIME_FMTS) {
             runCatching {
-                val ld = if (pattern == "yyyy-MM-dd") java.time.LocalDate.parse(t, DateTimeFormatter.ofPattern(pattern))
-                else LocalDateTime.parse(t, DateTimeFormatter.ofPattern(pattern)).toLocalDate()
-                return ld.format(DAY_FMT)
+                return LocalDateTime.parse(t, fmt).toLocalDate().format(DAY_FMT)
             }
+        }
+        runCatching {
+            return java.time.LocalDate.parse(t, DAYKEY_DATE_FMT).format(DAY_FMT)
         }
         if (t.length >= 10) return t.substring(0, 10)
         return null

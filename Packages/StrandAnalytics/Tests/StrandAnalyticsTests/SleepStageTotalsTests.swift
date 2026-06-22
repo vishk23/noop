@@ -192,6 +192,36 @@ final class SleepStageTotalsTests: XCTestCase {
         XCTAssertFalse(group?.contains(3) ?? true, "the afternoon nap is never in the main-night group")
     }
 
+    /// IRON-RULE REGRESSION GUARD (#547 / #407 lanes): the 6.1.1 bridged main-night SELECTION must NOT move
+    /// when the upstream ingest gate (#547) or the downstream motion trace (#407) change. This pins
+    /// `mainNightGroupIndices` for a biphasic main night to a BYTE-IDENTICAL expected output so any future
+    /// edit that perturbs `mainNightGroupIndices` / `mainNightIndex` / the bridge is caught immediately.
+    /// The values are hard-coded (not re-derived) so the test is a frozen golden, exactly the "before/after"
+    /// the lane brief requires.
+    func testMainNightGroupIndicesByteIdenticalForBiphasicNight() {
+        // A biphasic main night: two fragments split by a 35-min wake gap (< gapBridgeMaxMin → they bridge),
+        // plus a far-away afternoon nap that must stay OUT of the group. Same shape as the bridge fixture.
+        let a   = ts525("2026-06-14T23:10")              // 23:10–01:30
+        let b   = ts525("2026-06-15T02:05")              // 02:05–06:40  (35 min gap → bridges)
+        let nap = ts525("2026-06-15T15:00")              // 15:00–16:20  (far → does NOT bridge)
+        let blocks = [
+            SleepStageTotals.NightBlock(start: a,   end: a   + 140 * 60),   // idx 0
+            SleepStageTotals.NightBlock(start: b,   end: b   + 275 * 60),   // idx 1
+            SleepStageTotals.NightBlock(start: nap, end: nap +  80 * 60),   // idx 2
+        ]
+        // FROZEN GOLDEN: the two bridged night fragments are the group; the nap is excluded. If this value
+        // changes, the 6.1.1 main-night selection moved — STOP and investigate (the iron rule).
+        XCTAssertEqual(SleepStageTotals.mainNightGroupIndices(blocks, offsetSec: 0), [0, 1])
+        // Cold-start AND learned-habitual must both land identically (the selection is timing-independent
+        // here because the night dominates by duration), proving neither path perturbs the bridge.
+        let habitualMid = SleepStageTotals.localSecOfDay(a + 140 * 60 / 2, offsetSec: 0)
+        XCTAssertEqual(
+            SleepStageTotals.mainNightGroupIndices(blocks, offsetSec: 0, habitualMidsleepSec: habitualMid),
+            [0, 1])
+        // And the bare single-block winner stays inside the group (never the nap).
+        XCTAssertTrue([0, 1].contains(SleepStageTotals.mainNightIndex(blocks, offsetSec: 0) ?? -1))
+    }
+
     /// THE #525 invariant: a day with an overnight + a nap reports CONSISTENT totals — the day's
     /// canonical figure equals the MAIN NIGHT's sleep, NOT the night+nap sum. The honoring-edits seam
     /// (with onsets supplied) and the standalone main-night aggregate agree to the minute.

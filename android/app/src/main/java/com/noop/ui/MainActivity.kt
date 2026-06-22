@@ -555,6 +555,19 @@ object NoopPrefs {
         of(context).edit().putBoolean(KEY_TS_HEAL_DONE, true).apply()
     }
 
+    /** #547 RE-POLLUTION re-arm: set true by the BLE layer when a sync's ingest gate dropped implausible
+     *  (bad-clock) records, so the next analyze tick re-runs the purge even after [KEY_TS_HEAL_DONE] is set —
+     *  a wandering-clock strap re-sends bad-dated records across syncs, and may have banked similar garbage
+     *  on an OLDER build whose gate was weaker. Cleared once the re-heal runs. */
+    const val KEY_TS_HEAL_PENDING = "noop.tsHeal.v547.pending"
+
+    fun tsHealPending(context: Context): Boolean =
+        of(context).getBoolean(KEY_TS_HEAL_PENDING, false)
+
+    fun setTsHealPending(context: Context, pending: Boolean) {
+        of(context).edit().putBoolean(KEY_TS_HEAL_PENDING, pending).apply()
+    }
+
     /** The last strap we bonded to (address + model), persisted so NOOP can reconnect to it directly on
      *  the next launch — e.g. after an APK update restarts the process (#67). On-device only; never sent. */
     const val KEY_LAST_DEVICE_ADDR = "noop.lastDeviceAddress"

@@ -3,6 +3,7 @@ import Combine
 import WhoopStore
 import WhoopProtocol
 import StrandAnalytics
+import StrandDesign   // TrendPoint — the shared chart point type the Deep Timeline series uses
 
 /// Per-day sleep figures the WHOOP export carried verbatim (metricSeries rows written by
 /// WhoopImporter under the imported deviceId). SleepView prefers these over its on-device
@@ -127,6 +128,12 @@ final class Repository: ObservableObject {
     @Published private(set) var refreshSeq = 0
 
     init(deviceId: String) { self.deviceId = deviceId }
+
+    #if DEBUG
+    /// Inject a pre-opened store so unit tests can exercise the read facades (e.g. `timelineSeries`)
+    /// against an in-memory `WhoopStore` without touching the on-disk path. DEBUG-only test seam.
+    func setStoreForTesting(_ s: WhoopStore) { self.store = s }
+    #endif
 
     /// Today's row, by the device's LOGICAL local day — NOT just the newest stored row, which after a
     /// historical import was months-old data shown as today's hero (issue #23). The logical day rolls at
@@ -428,6 +435,24 @@ final class Repository: ObservableObject {
         return (imported + computedKept).sorted { $0.effectiveStartTs < $1.effectiveStartTs }
     }
 
+    /// The persisted per-epoch MOTION series for each of `starts` (detected session start keys), keyed by
+    /// start (#407). Motion is written ONLY under the computed ("-noop") source by the engine, so we read
+    /// there — and an imported-only night (no computed twin) simply has no motion (absent stays absent, an
+    /// honest empty state, never a fabricated zero array). This does NOT resolve the night: the caller has
+    /// already chosen the main-night GROUP (the 6.1.1 bridged group) and passes those blocks' starts; we
+    /// only fetch each one's stored series so the Sleep tab can lay them along the hypnogram's timeline.
+    /// A start with no stored series is omitted from the result (its key is absent).
+    func sessionMotions(starts: [Int]) async -> [Int: [Double]] {
+        guard !starts.isEmpty, let store = await ensureStore() else { return [:] }
+        var out: [Int: [Double]] = [:]
+        for start in starts {
+            if let m = try? await store.sessionMotion(deviceId: computedDeviceId, sessionStart: start), !m.isEmpty {
+                out[start] = m
+            }
+        }
+        return out
+    }
+
     /// The user's learned habitual midsleep (local time-of-day seconds), or nil under
     /// `SleepStageTotals.habitualMinDays` of history (cold-start). Computed EXACTLY as
     /// `IntelligenceEngine.computeHabitualMidsleep` does — the SAME raw imported + computed ("-noop")
@@ -649,6 +674,150 @@ final class Repository: ObservableObject {
         let to = Self.dayString(now.addingTimeInterval(86_400))
         let pts = (try? await store.metricSeries(deviceId: source, key: key, from: from, to: to)) ?? []
         return pts.map { ($0.day, $0.value) }
+    }
+
+    // MARK: - Deep Timeline (full-day full-resolution viewer — #575/#574/#582)
+    //
+    // The Deep Timeline draws a single metric across a zoomable time window at the resolution the zoom
+    // demands: a whole day reads COARSE SQL buckets (a worn 24h is ~86k 1 Hz HR rows — drawing all of
+    // them is the #1 risk, so we never load raw at day scale), while a zoomed-in window reads the RAW
+    // per-second rows so the user can inspect real beats. The adaptive choice lives here in the read
+    // layer (NOT the view) so the chart only ever receives ~targetPoints points regardless of zoom.
+
+    /// A metric the Deep Timeline can plot. HR is the always-present hero (adaptively downsampled);
+    /// the rest are lower-frequency raw-sample streams shown where the strap offloaded them.
+    enum TimelineMetric: String, CaseIterable, Identifiable, Sendable {
+        case hr, hrv, spo2, skinTemp, respiration, motion
+        var id: String { rawValue }
+
+        /// User-facing pill label.
+        var title: String {
+            switch self {
+            case .hr: return "Heart Rate"
+            case .hrv: return "HRV"
+            case .spo2: return "SpO₂"
+            case .skinTemp: return "Skin Temp"
+            case .respiration: return "Respiration"
+            case .motion: return "Motion"
+            }
+        }
+    }
+
+    /// One Deep-Timeline read: the plotted points plus whether they came from raw seconds or coarse
+    /// buckets (the view shows the resolution honestly) and the bucket width used.
+    struct TimelineSeries: Sendable {
+        var points: [TrendPoint]
+        var isRaw: Bool
+        var bucketSeconds: Int
+        static let empty = TimelineSeries(points: [], isRaw: false, bucketSeconds: 0)
+    }
+
+    /// Pure adaptive-resolution decision: the bucket width (seconds) to read for a `[from, to]` window
+    /// that should yield ABOUT `targetPoints` points. A bucket of 1 means "read raw per-second rows".
+    ///
+    /// span/targetPoints is the natural bucket width; we floor it at 1 s (raw) and round to a friendly
+    /// step so adjacent zoom levels share bucket edges (no shimmer while panning). The whole point: a
+    /// day-scale window (≈86 400 s) at ~600 target points picks a coarse ~150 s bucket (never raw), while
+    /// a few-minute zoom drops to bucket 1 and reads the real seconds. Static + pure so it's unit-testable
+    /// without a store or a clock.
+    nonisolated static func timelineBucketSeconds(spanSeconds: Int, targetPoints: Int) -> Int {
+        let span = max(1, spanSeconds)
+        let target = max(1, targetPoints)
+        let ideal = span / target
+        guard ideal > 1 else { return 1 }      // zoomed in enough that raw seconds already fit the budget
+        // Snap up to a friendly step so neighbouring zoom levels reuse bucket boundaries.
+        let steps = [2, 5, 10, 15, 30, 60, 120, 300, 600, 1800, 3600]
+        for s in steps where s >= ideal { return s }
+        return steps.last!
+    }
+
+    /// Deep-Timeline read facade. Returns ~`targetPoints` points for `metric` over `[from, to]` from
+    /// `source` (defaults to the user's own strap), choosing raw seconds vs coarse buckets adaptively so
+    /// the chart never draws ~86k points (the #575 day-scale risk). HR rides the existing COALESCE reads
+    /// (`hrBuckets`/`hrSamples`) so a PPG-only WHOOP 5 day still renders its ppgHrSample series (#156/#172)
+    /// — at day scale `hrBuckets` averages PPG into its buckets, and zoomed-in `hrSamples` returns the raw
+    /// PPG-derived seconds; neither is empty for a PPG-only night. Other metrics read their raw sample
+    /// tables (low frequency, no 86k risk) and bin to the same bucket grid when zoomed out.
+    func timelineSeries(metric: TimelineMetric, from: Int, to: Int,
+                        targetPoints: Int = 600, source: String? = nil) async -> TimelineSeries {
+        guard to > from, let store = await ensureStore() else { return .empty }
+        let src = source ?? deviceId
+        let bucket = Self.timelineBucketSeconds(spanSeconds: to - from, targetPoints: targetPoints)
+        let isRaw = bucket <= 1
+
+        if metric == .hr {
+            // Both HR paths COALESCE measured + ppgHrSample (#156) — preserved by delegating to the
+            // store reads rather than re-querying. Day scale → SQL-aggregated buckets; zoomed-in → raw.
+            if isRaw {
+                let s = (try? await store.hrSamples(deviceId: src, from: from, to: to, limit: 200_000)) ?? []
+                return TimelineSeries(points: s.map {
+                    TrendPoint(date: Date(timeIntervalSince1970: TimeInterval($0.ts)), value: Double($0.bpm))
+                }, isRaw: true, bucketSeconds: 1)
+            }
+            let b = (try? await store.hrBuckets(deviceId: src, from: from, to: to, bucketSeconds: bucket)) ?? []
+            return TimelineSeries(points: b.map {
+                TrendPoint(date: Date(timeIntervalSince1970: TimeInterval($0.ts)), value: $0.bpm)
+            }, isRaw: false, bucketSeconds: bucket)
+        }
+
+        // Non-HR streams: read raw rows (these tables are far sparser than 1 Hz HR, so a day's worth is
+        // safe to load) and, when zoomed out, downsample to the bucket grid in-process for a clean line.
+        let raw = await timelineRawMetric(metric: metric, store: store, source: src, from: from, to: to)
+        guard !raw.isEmpty else { return TimelineSeries(points: [], isRaw: isRaw, bucketSeconds: bucket) }
+        if isRaw { return TimelineSeries(points: raw, isRaw: true, bucketSeconds: 1) }
+        return TimelineSeries(points: Self.downsampleToBuckets(raw, bucketSeconds: bucket),
+                              isRaw: false, bucketSeconds: bucket)
+    }
+
+    /// Raw points for a non-HR timeline metric, mapped to display units (skin temp → °C via raw/100,
+    /// matching #156 centidegrees; HRV → per-RR instantaneous from RR ms; respiration/SpO₂/motion as the
+    /// stored signal). Empty when the strap offloaded nothing for the window.
+    private func timelineRawMetric(metric: TimelineMetric, store: WhoopStore, source: String,
+                                   from: Int, to: Int) async -> [TrendPoint] {
+        func pt(_ ts: Int, _ v: Double) -> TrendPoint {
+            TrendPoint(date: Date(timeIntervalSince1970: TimeInterval(ts)), value: v)
+        }
+        switch metric {
+        case .hr:
+            return []   // handled by the caller's HR path
+        case .hrv:
+            // Instantaneous HRV proxy: each RR interval in ms (a beat-to-beat view; daily rMSSD lives in
+            // Explore). Low frequency, so the raw rows are safe to load for a window.
+            let rr = (try? await store.rrIntervals(deviceId: source, from: from, to: to, limit: 200_000)) ?? []
+            return rr.map { pt($0.ts, Double($0.rrMs)) }
+        case .spo2:
+            // The honest raw red/IR ratio proxy (#166: no calibrated %), shown as a unitless trend.
+            let s = (try? await store.spo2Samples(deviceId: source, from: from, to: to, limit: 200_000)) ?? []
+            return s.compactMap { $0.ir > 0 ? pt($0.ts, Double($0.red) / Double($0.ir)) : nil }
+        case .skinTemp:
+            let s = (try? await store.skinTempSamples(deviceId: source, from: from, to: to, limit: 200_000)) ?? []
+            return s.map { pt($0.ts, Double($0.raw) / 100.0) }   // centidegrees → °C (#156)
+        case .respiration:
+            let s = (try? await store.respSamples(deviceId: source, from: from, to: to, limit: 200_000)) ?? []
+            return s.map { pt($0.ts, Double($0.raw)) }
+        case .motion:
+            // Gravity vector magnitude as a coarse movement signal (1 g at rest).
+            let s = (try? await store.gravitySamples(deviceId: source, from: from, to: to, limit: 200_000)) ?? []
+            return s.map { pt($0.ts, ($0.x * $0.x + $0.y * $0.y + $0.z * $0.z).squareRoot()) }
+        }
+    }
+
+    /// Mean-bin an already-loaded raw point series onto a `bucketSeconds` grid (floor(ts/bucket)*bucket),
+    /// ascending. The in-process twin of `hrBuckets` for the non-HR streams. Pure + static so it's testable.
+    nonisolated static func downsampleToBuckets(_ points: [TrendPoint], bucketSeconds: Int) -> [TrendPoint] {
+        let bucket = max(1, bucketSeconds)
+        guard !points.isEmpty else { return [] }
+        var sums: [Int: (sum: Double, n: Int)] = [:]
+        for p in points {
+            let key = (Int(p.date.timeIntervalSince1970) / bucket) * bucket
+            let acc = sums[key] ?? (0, 0)
+            sums[key] = (acc.sum + p.value, acc.n + 1)
+        }
+        return sums.keys.sorted().map { key in
+            let acc = sums[key]!
+            return TrendPoint(date: Date(timeIntervalSince1970: TimeInterval(key)),
+                              value: acc.sum / Double(acc.n))
+        }
     }
 
     // MARK: - Cross-source resolver (PR#196)

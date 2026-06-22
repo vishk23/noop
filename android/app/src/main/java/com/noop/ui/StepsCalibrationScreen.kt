@@ -163,7 +163,11 @@ fun StepsCalibrationScreen(
             ) {
                 ExplainerCard()
                 if (loaded && sampleMotion == null) NoMotionNote()
-                CurrentFitCard(profile)
+                // #589: the matched-day count (phone-counted days we could pair with strap motion — the
+                // engine's "usable overlapping days") drives the "Need N more days…" countdown. In the
+                // not-calibrated state the comparison build early-returns on coeff <= 0, so this is 0 and
+                // the headline reads the full MIN_CALIBRATION_DAYS — exactly the Swift behaviour.
+                CurrentFitCard(profile, matchedDays = comparison.size)
                 ComparisonCard(comparison)
                 ManualAdjustCard(
                     profile = profile,
@@ -289,7 +293,7 @@ private fun NoMotionNote() {
 /** The current calibration read-out: coefficient, sample days, and a Low/Medium/High confidence — or
  *  an honest "what we still need" prompt when nothing's fit and no manual value is set. */
 @Composable
-private fun CurrentFitCard(profile: ProfileStore) {
+private fun CurrentFitCard(profile: ProfileStore, matchedDays: Int) {
     NoopCard(padding = 20.dp, tint = Palette.accent) {
         Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
             Overline("Current calibration")
@@ -316,9 +320,18 @@ private fun CurrentFitCard(profile: ProfileStore) {
                 }
             } else {
                 Text("Not calibrated yet", style = NoopType.bodyNumber, color = Palette.textPrimary)
+                // #589: a concrete countdown instead of a vague "a few days". Headline comes straight from
+                // the engine's NeedsMoreDays state so the wording matches the Today steps tile + the Swift card.
                 Text(
-                    "We need a few days where your phone also counted steps (at least " +
-                        "${StepsEstimateEngine.MIN_CALIBRATION_DAYS}), or set it manually below.",
+                    StepsEstimateEngine.CalibrationStatus
+                        .NeedsMoreDays(have = matchedDays, need = StepsEstimateEngine.MIN_CALIBRATION_DAYS)
+                        .headline,
+                    style = NoopType.bodyNumber,
+                    color = Palette.accent,
+                )
+                Text(
+                    "These are the days where your phone also counted steps, so NOOP can learn how your " +
+                        "motion maps to steps. Or set the coefficient manually below.",
                     style = NoopType.footnote,
                     color = Palette.textTertiary,
                 )

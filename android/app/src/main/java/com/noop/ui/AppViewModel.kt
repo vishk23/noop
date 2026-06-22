@@ -405,6 +405,9 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         // Resolve the active band's name for the Live screen header (MW-6). Falls back to "WHOOP" in the
         // UI until this first read lands.
         refreshActiveDeviceName()
+        // #577 — surface the strap's smart-alarm wake as a local notification too (iOS AppModel.postSmartAlarm
+        // twin), so a pocketed phone doesn't miss the wrist buzz. Self-gates on the wrist-alerts master.
+        ble.onSmartAlarmFired = { com.noop.notif.SmartAlarmNotifier.onFired(appContext) }
         // Smooth HR from each LiveState emission, and re-arm the strap's firmware alarm whenever it
         // (re)bonds. A smart-alarm time changed while the strap was away never reached it — the send
         // is gated on bond — so the strap kept the OLD time and fired at it (#59). Gated on enabled so
@@ -550,7 +553,10 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
             // rows ONCE so the analyzeRecent pass below recomputes the real days cleanly. Guarded by a
             // persisted flag (re-running is harmless — the deletes are idempotent). Runs BEFORE the rescore.
             runCatching {
-                if (!NoopPrefs.tsHealDone(appContext)) {
+                // Run when the one-shot heal hasn't run yet OR a sync just flagged a re-heal (#547
+                // re-pollution): a wandering-clock strap re-sends bad-dated records across syncs, so a single
+                // on-upgrade pass can't be the only defence. The pending flag is cleared once the re-heal runs.
+                if (!NoopPrefs.tsHealDone(appContext) || NoopPrefs.tsHealPending(appContext)) {
                     val purged = repository.healImplausibleTimestamps()
                     if (purged > 0) {
                         ble.externalLog(
@@ -559,6 +565,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                         )
                     }
                     NoopPrefs.setTsHealDone(appContext)
+                    NoopPrefs.setTsHealPending(appContext, false)
                 }
             }.onFailure { if (it is kotlin.coroutines.cancellation.CancellationException) throw it }
             // One-shot on-upgrade Effort rescore (#313): recompute strain from source across the FULL
@@ -575,6 +582,21 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                 )
             }.onFailure { if (it is kotlin.coroutines.cancellation.CancellationException) throw it }
             while (isActive) {
+                // #547 RE-POLLUTION: a sync since the last tick may have flagged a re-heal (its ingest gate
+                // dropped bad-clock records). Re-run the purge BEFORE this tick's rescore so the affected days
+                // recompute clean — not gated behind the one-shot done flag. Idempotent on a clean DB.
+                runCatching {
+                    if (NoopPrefs.tsHealPending(appContext)) {
+                        val purged = repository.healImplausibleTimestamps()
+                        if (purged > 0) {
+                            ble.externalLog(
+                                "Heal #547: purged $purged row(s) with an implausible timestamp " +
+                                    "(bad strap clock detected this sync); rescoring clean days.",
+                            )
+                        }
+                        NoopPrefs.setTsHealPending(appContext, false)
+                    }
+                }.onFailure { if (it is kotlin.coroutines.cancellation.CancellationException) throw it }
                 runCatching {
                     IntelligenceEngine.analyzeRecent(
                         repo = repository,

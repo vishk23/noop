@@ -523,12 +523,20 @@ fun TodayScreen(
         // else "Not recording" (tap to connect). Today only — a past day isn't "recording". The minute
         // count reads from the BLE lastSyncAt; recomputed against the wall clock each emission.
         if (selectedDayOffset == 0) {
-            val recordingState = recordingStateFor(
-                connected = live.connected,
-                liveHeartRate = live.heartRate,
-                lastSyncAtSec = live.lastSyncAt,
-                nowSec = System.currentTimeMillis() / 1000,
-            )
+            // #580 — a connected WHOOP 5/MG streaming live HR but offloading no history reads
+            // "Connected — history sync is experimental on 5.0" rather than a WHOOP-4-style
+            // "not recording"/sync-error. The client only sets this true while connected + streaming,
+            // so it overrides the honest resolver. Mirrors the Swift `recordingState` property.
+            val recordingState = if (live.connected && live.historySyncExperimental) {
+                RecordingState.HistoryExperimental
+            } else {
+                recordingStateFor(
+                    connected = live.connected,
+                    liveHeartRate = live.heartRate,
+                    lastSyncAtSec = live.lastSyncAt,
+                    nowSec = System.currentTimeMillis() / 1000,
+                )
+            }
             RecordingStatusChip(state = recordingState, onConnect = onOpenSettings)
         }
 
@@ -1798,12 +1806,18 @@ sealed class RecordingState {
     /** No connection and nothing recent to fall back on. */
     object NotRecording : RecordingState()
 
+    /** #580 — a connected WHOOP 5/MG streaming live HR fine, but its firmware hands over no history
+     *  offload yet. NOT the WHOOP-4 "not recording" failure: the link is live, history sync is just
+     *  experimental on 5.0. Surfaced from `LiveState.historySyncExperimental`, overriding the resolver. */
+    object HistoryExperimental : RecordingState()
+
     /** The chip's status word. VERBATIM — mirror Swift exactly. */
     val title: String
         get() = when (this) {
             Recording -> "Recording"
             is LastSynced -> "Last synced ${minutesAgo}m ago"
             NotRecording -> "Not recording"
+            HistoryExperimental -> "Connected"
         }
 
     /** The chip's one-line detail. VERBATIM — mirror Swift exactly. */
@@ -1812,15 +1826,18 @@ sealed class RecordingState {
             Recording -> "Your strap is connected and saving data."
             is LastSynced -> "Reconnect to pull the latest."
             NotRecording -> "Strap not connected. Tap to connect."
+            HistoryExperimental -> "History sync is experimental on 5.0."
         }
 
     /** Chip hue: live recording reads positive (gold/green dot), a stale-but-recent sync reads neutral,
-     *  not-recording reads critical so a dropped link is obvious. */
+     *  not-recording reads critical so a dropped link is obvious; the 5.0 experimental-history state is
+     *  connected so it reads accent, not critical. */
     val tone: StrandTone
         get() = when (this) {
             Recording -> StrandTone.Positive
             is LastSynced -> StrandTone.Neutral
             NotRecording -> StrandTone.Critical
+            HistoryExperimental -> StrandTone.Accent
         }
 }
 

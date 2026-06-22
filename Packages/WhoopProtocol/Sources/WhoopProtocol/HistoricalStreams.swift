@@ -13,11 +13,39 @@ import Foundation
 public let MIN_PLAUSIBLE_UNIX = 1_700_000_000   // 2023-11
 public let FUTURE_MARGIN = 86_400               // 1 day
 
+/// SESSION-RELATIVE slack (#547): how far OUTSIDE the strap's own GET_DATA_RANGE oldest/newest markers a
+/// record may still be stamped before it's treated as bad-clock pollution. The strap reports its banked
+/// history span [oldest, newest] for THIS sync; a real record cannot predate the oldest banked marker nor
+/// post-date the newest by more than benign skew, so a record dated MONTHS off the strap's OWN window is a
+/// wandering-clock artefact even when it clears the absolute 2023-11 floor (e.g. a 2024-12-25 record against
+/// a 2026 strap window). 7 days absorbs marker jitter / a still-banking newest edge / DST while still
+/// catching the months-off garbage. Kept in lockstep with Android `HistoricalStreams.kt` SESSION_RANGE_MARGIN.
+public let SESSION_RANGE_MARGIN = 7 * 86_400    // 7 days
+
 /// True when `ts` is a plausible capture time for a historical record given `wallNow` (#547): on or
 /// after the 2023-11 floor and no more than a day ahead of now. The single predicate the ingest gate
 /// and the one-time DB heal both use, so both platforms reject the exact same set.
 public func isPlausibleHistoricalUnix(_ ts: Int, wallNow: Int) -> Bool {
     ts >= MIN_PLAUSIBLE_UNIX && ts <= wallNow + FUTURE_MARGIN
+}
+
+/// SESSION-RELATIVE plausibility (#547): the absolute gate (`isPlausibleHistoricalUnix`) PLUS a check
+/// that `ts` sits within the strap's OWN GET_DATA_RANGE markers for THIS sync, padded by
+/// `SESSION_RANGE_MARGIN`. `sessionOldestUnix`/`sessionNewestUnix` are the markers the BLE client scanned
+/// from the strap's range reply (nil when unknown — the replay/import/no-range paths). When BOTH markers
+/// are present AND well-formed (both clear the absolute floor and oldest <= newest), a record dated far
+/// before the oldest banked marker or far after the newest is rejected as wandering-clock pollution even
+/// though it cleared the absolute floor. When the markers are absent or malformed this is byte-identical
+/// to the absolute-only gate, so every legacy / range-less caller is unchanged. A legitimately-OLD record
+/// that falls WITHIN [oldest, newest] (real history the strap actually banked) is always kept.
+public func isPlausibleHistoricalUnix(_ ts: Int, wallNow: Int,
+                                      sessionOldestUnix: Int?, sessionNewestUnix: Int?) -> Bool {
+    guard isPlausibleHistoricalUnix(ts, wallNow: wallNow) else { return false }
+    // Only apply the session-relative window when both markers are trustworthy: present, themselves above
+    // the absolute floor, and correctly ordered. A wrong-epoch / partial marker must never reject real data.
+    guard let oldest = sessionOldestUnix, let newest = sessionNewestUnix,
+          oldest >= MIN_PLAUSIBLE_UNIX, newest >= oldest else { return true }
+    return ts >= oldest - SESSION_RANGE_MARGIN && ts <= newest + SESSION_RANGE_MARGIN
 }
 
 /// The HISTORICAL_DATA record frames in `rawFrames` that FAIL decode — a genuine CRC failure, or an
@@ -63,7 +91,12 @@ public func rejectedHistoricalRecords(_ rawFrames: [[UInt8]], family: DeviceFami
 /// EVENT and COMMAND_RESPONSE handling is identical to extractStreams.
 /// CRC-failed and non-ok frames are skipped.
 public func extractHistoricalStreams(_ parsed: [ParsedFrame],
-                                     deviceClockRef: Int, wallClockRef: Int) -> Streams {
+                                     deviceClockRef: Int, wallClockRef: Int,
+                                     // SESSION-RELATIVE bounds (#547): the strap's own GET_DATA_RANGE
+                                     // oldest/newest markers for THIS sync. nil on the replay/import/no-range
+                                     // paths — the gate then falls back to the absolute-only floor (unchanged).
+                                     sessionOldestUnix: Int? = nil,
+                                     sessionNewestUnix: Int? = nil) -> Streams {
     func wall(_ deviceTs: Int?) -> Int? {
         guard let d = deviceTs else { return nil }
         return wallClockRef + (d - deviceClockRef)
@@ -111,9 +144,13 @@ public func extractHistoricalStreams(_ parsed: [ParsedFrame],
             // guard is a no-op there. (PR #471, @cataboysbusiness-debug)
             candidate = corrected <= wallClockRef + snapGranularity ? corrected : rawTs
         }
-        // Final ingest gate (#547): drop the record if the resolved ts is implausible. Counted once per
-        // session via `droppedImplausible` so a bad-clock strap is visible in the diag/strap-log seam.
-        guard isPlausibleHistoricalUnix(candidate, wallNow: wallNow) else {
+        // Final ingest gate (#547): drop the record if the resolved ts is implausible — either by the
+        // absolute floor OR, when the strap's GET_DATA_RANGE markers are known, by sitting months outside
+        // the strap's OWN banked window (wandering-clock pollution that clears the absolute floor). Counted
+        // once per session via `droppedImplausible` so a bad-clock strap is visible in the diag/strap-log seam.
+        guard isPlausibleHistoricalUnix(candidate, wallNow: wallNow,
+                                        sessionOldestUnix: sessionOldestUnix,
+                                        sessionNewestUnix: sessionNewestUnix) else {
             droppedImplausible += 1
             return nil
         }
@@ -172,7 +209,9 @@ public func extractHistoricalStreams(_ parsed: [ParsedFrame],
             // drop the row unless the resulting wall ts is plausible (mirrors the type-47/EVENT gate).
             var rtTs: Int?
             if let w = wall(p["timestamp"]?.intValue) {
-                if isPlausibleHistoricalUnix(w, wallNow: wallNow) { rtTs = w }
+                if isPlausibleHistoricalUnix(w, wallNow: wallNow,
+                                             sessionOldestUnix: sessionOldestUnix,
+                                             sessionNewestUnix: sessionNewestUnix) { rtTs = w }
                 else { droppedImplausible += 1 }
             }
             if let ts = rtTs, let bpm = p["heart_rate"]?.intValue {

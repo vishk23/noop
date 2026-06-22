@@ -39,6 +39,12 @@ public enum HRVAnalyzer {
     /// Malik moving-window implementations.
     public static let ectopicWindowRadius: Int = 2
 
+    /// Default ceiling on the fraction of input beats the cleaning pipeline may reject before a SPOT
+    /// reading is refused as too noisy (#585). Spot-only: passed by the on-demand callers, never by the
+    /// nightly windowed path. 0.35 == refuse once more than 35% of beats were dropped as out-of-range or
+    /// ectopic, even if `minBeats` clean intervals survive — a quiet honesty gate on a short, live capture.
+    public static let defaultSpotMaxRejectedFraction: Double = 0.35
+
     /// Result of an HRV computation over a window.
     public struct HRVResult: Equatable, Sendable {
         /// RMSSD in milliseconds, or nil when too few valid beats.
@@ -156,11 +162,25 @@ public enum HRVAnalyzer {
 
     /// Compute HRV from raw RR-interval values (ms), applying the full cleaning
     /// pipeline. Returns an empty result when fewer than `minBeats` survive.
-    public static func analyze(rawRR: [Double]) -> HRVResult {
+    ///
+    /// - Parameter maxRejectedFraction: SPOT-ONLY honesty gate (#585). When non-nil, the reading is ALSO
+    ///   refused (empty result) if the fraction of input beats dropped by cleaning exceeds this value —
+    ///   even when `minBeats` clean intervals survive — because a short live capture that threw away most
+    ///   of its beats is too noisy to trust. nil (the default, and what the NIGHTLY windowed path passes)
+    ///   skips the gate entirely, so the nightly RMSSD is byte-identical to before this parameter existed.
+    public static func analyze(rawRR: [Double], maxRejectedFraction: Double? = nil) -> HRVResult {
         let nInput = rawRR.count
         let clean = cleanRR(rawRR)
         guard clean.count >= minBeats else {
             return .empty(nInput: nInput)
+        }
+        // Spot-only: refuse when too large a fraction of beats was noise (out-of-range or ectopic). Only
+        // applied when a ceiling is supplied; a guard against nInput == 0 is implicit (clean ≥ minBeats > 0).
+        if let maxRejectedFraction, nInput > 0 {
+            let rejectedFraction = 1.0 - Double(clean.count) / Double(nInput)
+            if rejectedFraction > maxRejectedFraction {
+                return .empty(nInput: nInput)
+            }
         }
         let rmssd = rmssdRaw(clean)
         let sdnn = sdnnRaw(clean)

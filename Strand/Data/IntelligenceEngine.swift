@@ -139,6 +139,21 @@ final class IntelligenceEngine: ObservableObject {
     /// heal completes so it never re-runs.
     static let timestampHealFlagKey = "intelligence.timestampHeal.v547.done"
 
+    /// #547 RE-POLLUTION re-arm: a one-shot heal isn't enough when a strap with a WANDERING clock keeps
+    /// re-sending bad-dated records across syncs. Whenever a sync's ingest gate drops implausible records
+    /// (the strap demonstrably has a bad clock THIS session), `BLEManager` sets this pending flag so the
+    /// next analyze tick re-runs the purge — clearing any pollution that slipped in on an OLDER build whose
+    /// gate was weaker, rather than permanently gating behind the one-shot `done` flag. Cleared once the
+    /// re-heal runs. Pure UserDefaults so the BLE layer can set it without an engine reference.
+    static let timestampHealPendingKey = "intelligence.timestampHeal.v547.pending"
+
+    /// Mark the #547 heal as needing a re-run because a sync just dropped implausible (bad-clock) records.
+    /// Called from `BLEManager.exitBackfilling` (no engine handle there); the next `runTimestampHealIfNeeded`
+    /// honours it even after the one-shot `done` flag is set.
+    static func requestTimestampReheal() {
+        UserDefaults.standard.set(true, forKey: timestampHealPendingKey)
+    }
+
     /// One-shot, on-upgrade heal of a database polluted by a bad-clock strap (#547, pikapik). The ingest
     /// gate now keeps garbage-timestamped records out, but a user who synced on an older build already has
     /// rows dated to scattered garbage (far-past, a bogus 2027, FUTURE dates) — which made one ~12h block
@@ -148,7 +163,11 @@ final class IntelligenceEngine: ObservableObject {
     /// re-running is harmless, but a persisted flag skips it on every later launch. Runs BEFORE the normal
     /// `analyzeRecent` loop so the rescore it triggers operates on an already-cleaned DB.
     func runTimestampHealIfNeeded(historyDays: Int = 4000) async {
-        guard !UserDefaults.standard.bool(forKey: Self.timestampHealFlagKey) else { return }
+        // Run when the one-shot heal hasn't run yet OR a sync just flagged a re-heal (#547 re-pollution): a
+        // wandering-clock strap re-sends bad-dated records across syncs, so a single on-upgrade pass can't
+        // be the only line of defence. The pending flag is cleared below once the re-heal completes.
+        let pending = UserDefaults.standard.bool(forKey: Self.timestampHealPendingKey)
+        guard pending || !UserDefaults.standard.bool(forKey: Self.timestampHealFlagKey) else { return }
         guard let store = await repo.storeHandle() else { return }   // no store yet → retry next launch
         let result: WhoopStore.TimestampHealResult
         do {
@@ -167,6 +186,8 @@ final class IntelligenceEngine: ObservableObject {
             guard !computing else { return }
         }
         UserDefaults.standard.set(true, forKey: Self.timestampHealFlagKey)
+        // Clear the re-pollution request now that this re-heal has run — a future bad-clock sync re-arms it.
+        UserDefaults.standard.set(false, forKey: Self.timestampHealPendingKey)
     }
 
     /// Compute on-device scores for each of the last `maxDays` that actually has raw HR data.
@@ -617,6 +638,9 @@ final class IntelligenceEngine: ObservableObject {
         }
         if let cal = StepsEstimateEngine.calibrate(calPoints, manualOverride: profile.stepsManualOverride) {
             // Estimate + upsert for each recent scored day that has motion but NO real phone step count.
+            // (Days the phone DID count keep their real value — surfaced directly by the Today tile, not
+            // overwritten by an estimate.) This runs AFTER any timestamp-heal upstream, so the motion it
+            // reads is the healed-day motion, never pre-heal.
             var estPts: [MetricPoint] = []
             for dm in dailies where refStepsByDay[dm.day] == nil {
                 guard let motion = motionByDay[dm.day],
@@ -629,6 +653,19 @@ final class IntelligenceEngine: ObservableObject {
             profile.stepsCalibrationSampleDays = cal.sampleDays
             profile.stepsCalibrationConfidence = cal.confidence
             profile.stepsCalibrationManual = cal.manual
+        } else {
+            // Not yet calibrated (too few overlapping phone-counted days, no manual override). Classify the
+            // STATE (#589) and persist the PROGRESS so the Today tile/Settings can say how many more days are
+            // needed rather than going silently blank. `status` uses the SAME usable-day filter the fit does.
+            // Coefficient stays 0 (the "not calibrated" gate the UI already keys off); sampleDays carries the
+            // usable-day count so the message can compute "need N more".
+            let stepsStatus = StepsEstimateEngine.status(calPoints, manualOverride: profile.stepsManualOverride)
+            if case let .needsMoreDays(have, _) = stepsStatus {
+                profile.stepsCalibrationCoefficient = 0
+                profile.stepsCalibrationSampleDays = have
+                profile.stepsCalibrationConfidence = 0
+                profile.stepsCalibrationManual = false
+            }
         }
 
         // Drop any freshly-detected session that overlaps a night the user has already hand-corrected.

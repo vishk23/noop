@@ -393,6 +393,7 @@ object Metrics {
     val sparkWidth = 58.dp
     val sparkHeight = 22.dp
     val stageStripHeight = 34.dp
+    val motionStripHeight = 40.dp   // #407 — the subordinate movement/restlessness trace under the hypnogram
     val trendStripHeight = 120.dp
     val sparklineHeight = 28.dp
     val segmentBarHeight = 18.dp

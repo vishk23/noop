@@ -264,6 +264,10 @@ struct TodayView: View {
     /// strap that isn't yet streaming HR reads as a last-sync / not-recording state, not a false "Recording".
     private var recordingState: RecordingState? {
         guard selectedDayOffset == 0 else { return nil }
+        // #580 — a connected WHOOP 5/MG streaming live HR but offloading no history reads "Connected —
+        // history sync is experimental on 5.0" rather than a WHOOP-4-style "not recording"/sync-error.
+        // BLEManager only flips this true while connected + streaming, so it overrides the honest mapper.
+        if live.connected && live.historySyncExperimental { return .historyExperimental }
         return RecordingState.resolve(connected: live.connected,
                                       heartRate: live.heartRate,
                                       lastSyncedAt: live.lastSyncedAt)
@@ -1063,9 +1067,10 @@ struct TodayView: View {
             let isLive = state == .recording
             let hue: Color = {
                 switch state {
-                case .recording:    return StrandPalette.statusPositive
-                case .lastSynced:   return StrandPalette.statusWarning
-                case .notRecording: return StrandPalette.textTertiary
+                case .recording:           return StrandPalette.statusPositive
+                case .lastSynced:          return StrandPalette.statusWarning
+                case .notRecording:        return StrandPalette.textTertiary
+                case .historyExperimental: return StrandPalette.accent
                 }
             }()
             // "Not recording" is the only actionable state (tap to connect) — wrap it in a Button; the
@@ -1811,28 +1816,39 @@ struct TodayView: View {
             )
         case .steps:
             // Prefer a REAL step count: the strap's own @57 counter (DailyMetric.steps, WHOOP 5/MG),
-            // then Apple Health for the day, then the loaded Apple-Health steps sparkline tail. Only when
-            // a day has NONE of those real sources do we fall back to the on-device ESTIMATE (steps_est)
-            // a WHOOP 4.0 user gets — flagged "est." so it's never mistaken for a measured count. A day
-            // with neither real nor estimated steps shows "—". Mirrors Android (#276/#150).
+            // then Apple Health FOR THE SELECTED DAY (#589 — when the user imported phone steps for this
+            // day, show THAT number directly, not the strap estimate), then the loaded Apple-Health steps
+            // sparkline tail as a last-resort recent value. Only when a day has NONE of those real sources
+            // do we fall back to the on-device ESTIMATE (steps_est) a WHOOP 4.0 user gets — flagged "est."
+            // so it's never mistaken for a measured count. Mirrors Android (#276/#150).
+            let appleStepsForDay = appleDays.last(where: { $0.day == selectedDayKey })?.steps
+                ?? (selectedDayOffset == 0 ? aLatest?.steps : nil)
             let realSteps: String? = (d?.steps).map { intString(Double($0)) }
-                ?? aLatest?.steps.map { intString(Double($0)) }
+                ?? appleStepsForDay.map { intString(Double($0)) }
                 ?? (sparks["steps"]?.last).map { intString($0) }
             let estSteps = stepsEstByDay[selectedDayKey]
             // H6 — only an ESTIMATED day (no real strap/phone count, so the on-device estimate filled in)
             // gets the calibration entry; a real measured count needs no calibration.
             let isEstimated = realSteps == nil && estSteps != nil
+            // #589 — when the tile would be BLANK on a strap that estimates steps (WHOOP 4.0: the steps
+            // pipeline has run, so there's calibration state recorded) explain WHY rather than a bare "—",
+            // and still expose the ⚙︎ so the user can reach the sheet to set a manual coefficient.
+            let needsCalibration = realSteps == nil && estSteps == nil && stepsPipelineActive
             StatTile(
                 label: "Steps",
                 value: realSteps ?? estSteps.map { intString(Double($0)) } ?? "—",
-                // An estimated day reads "est." so the number is never taken as a measured count.
-                caption: realSteps != nil ? "today" : (estSteps != nil ? "est." : "today"),
+                // An estimated day reads "est."; a not-yet-calibrated day says how many more phone-counted
+                // days are needed (so a blank tile is never silently unexplained).
+                caption: realSteps != nil ? "today"
+                    : (estSteps != nil ? "est."
+                       : (needsCalibration ? stepsCalibrationCaption : "today")),
                 accent: (realSteps != nil || estSteps != nil) ? StrandPalette.metricCyan : StrandPalette.textPrimary,
                 sparkline: sparks["steps"],
                 sparkColor: StrandPalette.metricCyan,
-                // H6 — an estimated-steps tile carries a small ⚙︎ that opens the steps-calibration sheet
-                // (the SAME one Settings hosts), so a WHOOP 4.0 user can tune the estimate from here.
-                accessory: { if isEstimated { stepsCalibrationButton } }
+                // H6 — an estimated (or awaiting-calibration) steps tile carries a small ⚙︎ that opens the
+                // steps-calibration sheet (the SAME one Settings hosts), so a WHOOP 4.0 user can tune or
+                // hand-set the estimate from here even before enough auto-fit days exist (#589).
+                accessory: { if isEstimated || needsCalibration { stepsCalibrationButton } }
             )
         case .weight:
             StatTile(
@@ -2043,6 +2059,27 @@ struct TodayView: View {
         .buttonStyle(.plain)
         .accessibilityLabel("Calibrate steps estimate")
         .help("Calibrate the steps estimate")
+    }
+
+    /// #589 — true once the WHOOP-4.0 steps-ESTIMATE pipeline has run for this user, i.e. the
+    /// IntelligenceEngine has mirrored some calibration state into the profile (a fitted/manual
+    /// coefficient, OR a recorded count of overlapping phone-counted days while still gathering).
+    /// Gates the "needs calibration" affordance so a user whose strap reports real steps (5/MG) or who
+    /// has no strap at all never sees a steps-calibration prompt on a blank tile.
+    private var stepsPipelineActive: Bool {
+        profile.stepsCalibrationCoefficient > 0
+            || profile.stepsManualCoefficient > 0
+            || profile.stepsCalibrationSampleDays > 0
+    }
+
+    /// #589 — the honest one-liner for a blank, not-yet-calibrated Steps tile: how many more days the
+    /// phone also has to count steps before an estimate appears. Built from the SAME engine descriptor
+    /// Settings uses (`StepsEstimateEngine.CalibrationStatus`) so the wording matches across surfaces.
+    private var stepsCalibrationCaption: String {
+        let status = StepsEstimateEngine.CalibrationStatus.needsMoreDays(
+            have: profile.stepsCalibrationSampleDays,
+            need: StepsEstimateEngine.minCalibrationDays)
+        return status.headline
     }
 
     // MARK: - Loading
@@ -2553,6 +2590,10 @@ enum RecordingState: Equatable {
     case lastSynced(minutesAgo: Int)
     /// Strap not connected and nothing fresh to fall back on.
     case notRecording
+    /// #580 — a connected WHOOP 5/MG streaming live HR fine, but its firmware hands over no history
+    /// offload yet. NOT the WHOOP-4 "not recording" failure: the link is live, history sync is just
+    /// experimental on 5.0. Surfaced from `LiveState.historySyncExperimental`, overriding the mapper.
+    case historyExperimental
 
     /// The chip's short label. Verbatim spec copy; the dynamic "Xm" goes into the LocalizedStringKey slot.
     var label: LocalizedStringKey {
@@ -2560,15 +2601,17 @@ enum RecordingState: Equatable {
         case .recording:                 return "Recording"
         case .lastSynced(let mins):      return "Last synced \(mins)m ago"
         case .notRecording:              return "Not recording"
+        case .historyExperimental:       return "Connected"
         }
     }
 
     /// The supporting detail line. Verbatim spec copy.
     var detail: LocalizedStringKey {
         switch self {
-        case .recording:    return "Your strap is connected and saving data."
-        case .lastSynced:   return "Reconnect to pull the latest."
-        case .notRecording: return "Strap not connected. Tap to connect."
+        case .recording:           return "Your strap is connected and saving data."
+        case .lastSynced:          return "Reconnect to pull the latest."
+        case .notRecording:        return "Strap not connected. Tap to connect."
+        case .historyExperimental: return "History sync is experimental on 5.0."
         }
     }
 
@@ -2581,6 +2624,8 @@ enum RecordingState: Equatable {
             return "Last synced \(mins) minutes ago. Reconnect to pull the latest."
         case .notRecording:
             return "Not recording. Strap not connected. Tap to connect."
+        case .historyExperimental:
+            return "Connected. History sync is experimental on 5.0."
         }
     }
 

@@ -76,4 +76,41 @@ class StepsEstimateEngineTest {
         val cal = StepsEstimateEngine.Calibration(1_000_000.0, 5, 0.1, false)
         assertEquals(StepsEstimateEngine.MAX_DAILY_STEPS, StepsEstimateEngine.estimate(100.0, cal))
     }
+
+    // calibration status (#589 — explain a blank tile instead of going silent)
+
+    @Test fun statusNeedsMoreDaysCountsUsableDays() {
+        // Two usable overlapping days (< MIN_CALIBRATION_DAYS 3) → NeedsMoreDays(have=2). A near-still day
+        // and a zero-step day don't count toward `have`.
+        val pts = listOf(p(0.2, 5000.0), p(10.0, 0.0), p(10.0, 1000.0), p(20.0, 2000.0))
+        val status = StepsEstimateEngine.status(pts)
+        assertTrue(status is StepsEstimateEngine.CalibrationStatus.NeedsMoreDays)
+        status as StepsEstimateEngine.CalibrationStatus.NeedsMoreDays
+        assertEquals(2, status.have)
+        assertEquals(3, status.need)
+        assertTrue(!status.canEstimate)
+        assertEquals("Need 1 more day where your phone also counted steps", status.headline)
+    }
+
+    @Test fun statusCalibratedOnceEnoughDays() {
+        val pts = (0 until 3).map { p(10.0, 1000.0) }
+        val status = StepsEstimateEngine.status(pts)
+        assertTrue(status is StepsEstimateEngine.CalibrationStatus.Calibrated)
+        status as StepsEstimateEngine.CalibrationStatus.Calibrated
+        assertEquals(100.0, status.coefficient, 1e-9)
+        assertEquals(3, status.sampleDays)
+        assertTrue(status.confidence > 0)
+        assertTrue(status.canEstimate)
+        assertEquals("Estimated from 3 days your phone also counted", status.headline)
+    }
+
+    @Test fun statusManualOverrideWinsEvenWithNoDays() {
+        val status = StepsEstimateEngine.status(emptyList(), manualOverride = 42.0)
+        assertTrue(status is StepsEstimateEngine.CalibrationStatus.Manual)
+        status as StepsEstimateEngine.CalibrationStatus.Manual
+        assertEquals(42.0, status.coefficient, 1e-9)
+        assertEquals(0, status.sampleDays)
+        assertTrue(status.canEstimate)
+        assertEquals("Calibrated by hand", status.headline)
+    }
 }

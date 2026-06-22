@@ -361,6 +361,23 @@ class WhoopRepository(private val dao: WhoopDao) {
     suspend fun sessionMotion(deviceId: String, sessionStart: Long): List<Double>? =
         dao.sessionMotionJson(deviceId, sessionStart)?.let { decodeDoubleArray(it) }
 
+    /** Per-epoch MOTION series for each of [starts] (detected session start keys), keyed by start (#407).
+     *  Motion is written ONLY under the computed ("-noop") source by the engine, so we read there; an
+     *  imported-only night (no computed twin) has no motion (absent stays absent — an honest empty state,
+     *  never a fabricated zero array). Does NOT resolve the night: the caller has already chosen the
+     *  main-night GROUP and passes those blocks' starts. A start with no stored series is omitted. Mirrors
+     *  iOS Repository.sessionMotions. */
+    suspend fun sessionMotions(strapDeviceId: String, starts: List<Long>): Map<Long, List<Double>> {
+        if (starts.isEmpty()) return emptyMap()
+        val computedId = computedDeviceId(strapDeviceId)
+        val out = HashMap<Long, List<Double>>()
+        for (start in starts) {
+            val m = dao.sessionMotionJson(computedId, start)?.let { decodeDoubleArray(it) }
+            if (!m.isNullOrEmpty()) out[start] = m
+        }
+        return out
+    }
+
     /** Persist the decoded v18 band sleep_state per epoch for one session (H2), keyed by [sessionStart].
      *  Empty clears to NULL. Returns rows changed. */
     suspend fun persistSessionSleepState(deviceId: String, sessionStart: Long, states: List<Int>): Int =

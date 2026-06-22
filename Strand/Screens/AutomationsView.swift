@@ -18,10 +18,20 @@ struct AutomationsView: View {
     /// from the BLE offload path (BLEManager.maybeBuzzInactivity → the shipped SedentaryDetector); this
     /// screen only edits the prefs the engine reads.
     @StateObject private var inactivity = InactivityPrefs()
+    #if os(iOS)
+    /// Wrist-alerts master gate (PR #572). On iOS the NotificationSettingsView (and its store) are
+    /// excluded by project.yml, so `notif.masterEnabled` — the key SedentaryDetector + the wrist-buzz
+    /// posting read — has no UI to flip and is stuck at its default OFF. Bind the SAME raw key here so
+    /// iPhone users can actually turn wrist alerts on. Default OFF, matching the store's default.
+    @AppStorage("notif.masterEnabled") private var wristAlertsMaster = false
+    #endif
 
     var body: some View {
         ScreenScaffold(title: "Automations",
                        subtitle: "Make the strap do things — tap to act, walk away to lock, train by feel.") {
+            #if os(iOS)
+            wristAlertsCard
+            #endif
             doubleTapCard
             wearCard
             coachingCard
@@ -32,6 +42,26 @@ struct AutomationsView: View {
             batteryCard
         }
     }
+
+    // MARK: - Wrist alerts master (iOS only — PR #572)
+
+    #if os(iOS)
+    /// The master switch for wrist-buzz notifications. On macOS this lives in its own Notifications
+    /// screen; that screen is excluded from the iOS target, so without this the gate is unreachable on
+    /// iPhone and every wrist alert (inactivity, app notifications) stays silently off. Binds the same
+    /// `notif.masterEnabled` key the SedentaryDetector and the notification posting read.
+    private var wristAlertsCard: some View {
+        Section2(icon: "bell.badge.fill", title: "Wrist alerts",
+                 blurb: "Let NOOP tap your wrist for the things you turn on below, so you can leave your phone and still feel what matters.",
+                 active: wristAlertsMaster) {
+            VStack(spacing: 0) {
+                ToggleRow(label: "Enable wrist alerts",
+                          help: "The master switch for every wrist buzz (inactivity, stress, alerts). Off keeps the strap quiet no matter what else is on.",
+                          isOn: $wristAlertsMaster)
+            }
+        }
+    }
+    #endif
 
     // MARK: - Double tap
 

@@ -43,6 +43,62 @@ object StepsEstimateEngine {
     )
 
     /**
+     * A readable read-out of the calibration state, for the Today steps tile and the Settings section.
+     * Pure data (no UI strings beyond a single short status line) so both surfaces stay in step.
+     * Mirror of Swift `CalibrationStatus`.
+     */
+    sealed interface CalibrationStatus {
+        /** True when an estimate can be produced right now (manual or a usable auto-fit). */
+        val canEstimate: Boolean
+
+        /** A short, honest one-liner for the tile/Settings. US-neutral, no em-dashes. */
+        val headline: String
+
+        /** A manual `k` is in force. [sampleDays] = auto-fit days that exist alongside it (informational). */
+        data class Manual(val coefficient: Double, val sampleDays: Int) : CalibrationStatus {
+            override val canEstimate: Boolean get() = true
+            override val headline: String get() = "Calibrated by hand"
+        }
+
+        /** Enough overlapping days fit an auto coefficient. Carries the fit and its 0–1 confidence. */
+        data class Calibrated(val coefficient: Double, val sampleDays: Int, val confidence: Double) : CalibrationStatus {
+            override val canEstimate: Boolean get() = true
+            override val headline: String
+                get() = "Estimated from $sampleDays day${if (sampleDays == 1) "" else "s"} your phone also counted"
+        }
+
+        /** Not yet calibrated: [have] overlapping phone-counted days out of [need]. */
+        data class NeedsMoreDays(val have: Int, val need: Int) : CalibrationStatus {
+            override val canEstimate: Boolean get() = false
+            override val headline: String
+                get() {
+                    val more = maxOf(0, need - have)
+                    return "Need $more more day${if (more == 1) "" else "s"} where your phone also counted steps"
+                }
+        }
+    }
+
+    /**
+     * Classify the current calibration state from the same inputs [calibrate] sees, so the UI can explain
+     * WHY the steps tile is (or isn't) showing an estimate without re-deriving the fit. A positive
+     * [manualOverride] always reports [CalibrationStatus.Manual]. Otherwise count the usable overlapping
+     * days (same filter the fit uses) and report [CalibrationStatus.Calibrated] once [MIN_CALIBRATION_DAYS]
+     * are met, else [CalibrationStatus.NeedsMoreDays]. Mirror of Swift `status(...)`.
+     */
+    fun status(points: List<CalibrationPoint>, manualOverride: Double? = null): CalibrationStatus {
+        val usableDays = points.count { it.motion >= MIN_MOTION_FOR_FIT && it.steps > 0 }
+        if (manualOverride != null && manualOverride > 0) {
+            return CalibrationStatus.Manual(manualOverride, usableDays)
+        }
+        val cal = calibrate(points)
+        return if (cal != null && usableDays >= MIN_CALIBRATION_DAYS) {
+            CalibrationStatus.Calibrated(cal.coefficient, cal.sampleDays, cal.confidence)
+        } else {
+            CalibrationStatus.NeedsMoreDays(have = usableDays, need = MIN_CALIBRATION_DAYS)
+        }
+    }
+
+    /**
      * Total daily MOTION INTENSITY = sum of per-record gravity-vector deltas (L2 magnitude of the change
      * between consecutive samples). Movement VOLUME over the day — the same proxy the sleep stager uses for
      * stillness, integrated. (Mirror of Swift dayMotionIntensity.)

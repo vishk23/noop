@@ -96,6 +96,65 @@ final class HistoricalTimestampGateTests: XCTestCase {
         XCTAssertEqual(st.droppedImplausible, 1)
     }
 
+    // MARK: - #547 SESSION-RELATIVE gate (re-pollution by a wandering clock)
+
+    func testSessionRelativeBoundsParity() {
+        XCTAssertEqual(SESSION_RANGE_MARGIN, 7 * 86_400)   // 7-day slack, == Android SESSION_RANGE_MARGIN
+    }
+
+    func testSessionRelativeDropsInWindowFloorClearingGarbage() {
+        // The #547 archetype: a 2024-12-25 record arrives in a sync whose strap GET_DATA_RANGE window is a
+        // 2026 fortnight. The record CLEARS the absolute 2023-11 floor, but it's months before the strap's
+        // OWN oldest banked marker → wandering-clock pollution. Session-relative gate must DROP it.
+        let newest = Int(Date().timeIntervalSince1970) - 86_400          // strap's newest banked: ~yesterday
+        let oldest = newest - 14 * 86_400                                // strap banked a 2-week window
+        let badYule = 1_735_084_800                                      // 2024-12-25 00:00 UTC (clears floor)
+        let st = extractHistoricalStreams(
+            [histFrame(unix: badYule)],
+            deviceClockRef: newest, wallClockRef: newest,
+            sessionOldestUnix: oldest, sessionNewestUnix: newest)
+        XCTAssertEqual(st.hr.count, 0, "a floor-clearing record months before the strap's own window is dropped")
+        XCTAssertEqual(st.droppedImplausible, 1)
+    }
+
+    func testSessionRelativeKeepsLegitimatelyOldInWindowBackfill() {
+        // A legitimately-OLD record that sits WITHIN the strap's banked [oldest, newest] window is real
+        // history (a deep oldest-first backfill) and must be KEPT — session-relative, not absolute.
+        let newest = Int(Date().timeIntervalSince1970) - 86_400
+        let oldest = newest - 30 * 86_400                                // a month of banked backlog
+        let realOld = oldest + 2 * 86_400                                // 2 days into the window — real history
+        let st = extractHistoricalStreams(
+            [histFrame(unix: realOld, bpm: 64)],
+            deviceClockRef: newest, wallClockRef: newest,
+            sessionOldestUnix: oldest, sessionNewestUnix: newest)
+        XCTAssertEqual(st.hr.count, 1, "an in-window legitimately-old record is real backfill — keep it")
+        XCTAssertEqual(st.hr.first?.bpm, 64)
+        XCTAssertEqual(st.droppedImplausible, 0)
+    }
+
+    func testSessionRelativeFallsBackToAbsoluteWithoutMarkers() {
+        // No range markers (replay / import / range-less) → absolute-only gate, unchanged. A 2024-12-25
+        // record then SURVIVES (it clears the absolute floor) exactly as before this change.
+        let badYule = 1_735_084_800
+        let st = extractHistoricalStreams([histFrame(unix: badYule, bpm: 70)],
+                                          deviceClockRef: badYule, wallClockRef: badYule)
+        XCTAssertEqual(st.hr.count, 1, "with no session markers the absolute-only gate keeps a floor-clearing ts")
+        XCTAssertEqual(st.droppedImplausible, 0)
+    }
+
+    func testSessionRelativeIgnoresMalformedMarkers() {
+        // A wrong-epoch / below-floor oldest marker must NEVER reject real data — the gate falls back to
+        // absolute-only when the markers aren't trustworthy (oldest below the floor here).
+        let newest = Int(Date().timeIntervalSince1970) - 86_400
+        let realRecent = newest - 3600
+        let st = extractHistoricalStreams(
+            [histFrame(unix: realRecent, bpm: 58)],
+            deviceClockRef: newest, wallClockRef: newest,
+            sessionOldestUnix: 12_345, sessionNewestUnix: newest)   // oldest < MIN_PLAUSIBLE_UNIX → malformed
+        XCTAssertEqual(st.hr.count, 1, "a malformed (below-floor) oldest marker must not reject real data")
+        XCTAssertEqual(st.droppedImplausible, 0)
+    }
+
     func testIdentityRefTrustsRealRawTimestamp() {
         // The RawHistoryArchive.replay / no-correlation path passes wallClockRef == 0 (identity sentinel):
         // the future bound must fall back to the LIVE wall clock, NOT 0, or every real record is rejected.

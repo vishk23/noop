@@ -56,6 +56,11 @@ public final class LiveState: ObservableObject {
     /// before the first event arrives; flipped by FrameRouter on a real event.
     @Published public var worn: Bool = true
 
+    /// #580 — true when a connected WHOOP 5/MG streams live HR fine but its firmware hands over no history
+    /// offload (consecutive empty backfills). Lets the home state read "connected, history sync is
+    /// experimental on 5.0" instead of a WHOOP-4-style "not recording"/sync-error. Reset on connect/disconnect.
+    @Published public var historySyncExperimental: Bool = false
+
     // MARK: - Standard fitness-sensor live metrics (RSC / CSC / CPS — additive, never HR)
     //
     // Live instantaneous speed / cadence / power from a connected standard fitness sensor (a footpod, a

@@ -107,6 +107,32 @@ class SpotHrvReadingTest {
     }
 
     @Test
+    fun spotGateRefusesNoisyCaptureByDefault() {
+        // #585: a capture where too many beats were noise must be refused even though >= MIN_BEATS clean
+        // beats survive. 24 valid 850 ms + 16 out-of-range (10 ms) -> 16/40 = 0.40 rejected > the default
+        // 0.35 ceiling -> Insufficient (an honest "sit still and try again"), never a fabricated number.
+        val rr = knownCleanSeries() + List(16) { 10 }   // 24 clean + 16 out-of-range
+        val outcome = SpotHrvReading.compute(rr)
+        assertTrue("0.40 rejected must be refused by the default spot gate",
+            outcome is SpotHrvReading.Outcome.Insufficient)
+        val insuff = outcome as SpotHrvReading.Outcome.Insufficient
+        assertEquals(HrvAnalyzer.MIN_BEATS, insuff.needed)
+        assertEquals(40, insuff.input)
+        assertEquals(0, insuff.clean)   // refusal reports the empty result's nClean
+    }
+
+    @Test
+    fun spotGateRelaxedAllowsTheSameNoisyCapture() {
+        // Passing a permissive ceiling (> 0.40) lets the same 24-clean capture through — proving the gate,
+        // not the clean-beat count, is what refused it above.
+        val rr = knownCleanSeries() + List(16) { 10 }
+        val outcome = SpotHrvReading.compute(rr, maxRejectedFraction = 0.5)
+        assertTrue("a 0.5 ceiling must allow the 0.40-rejected capture",
+            outcome is SpotHrvReading.Outcome.Reading)
+        assertEquals(24, (outcome as SpotHrvReading.Outcome.Reading).beats)
+    }
+
+    @Test
     fun meanHrFromNnMatchesDefinition() {
         assertEquals(60.0, SpotHrvReading.meanHrFromNN(1000.0)!!, 1e-9)
         assertEquals(75.0, SpotHrvReading.meanHrFromNN(800.0)!!, 1e-9)

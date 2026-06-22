@@ -411,7 +411,8 @@ struct HRVSnapshotView: View {
     /// End the capture and run the full cleaning analysis over everything collected.
     private func finish() {
         ScreenIdle.keepAwake(false)
-        result = HRVAnalyzer.analyze(rawRR: captureBuffer.map(Double.init))
+        result = HRVAnalyzer.analyze(rawRR: captureBuffer.map(Double.init),
+                                     maxRejectedFraction: HRVAnalyzer.defaultSpotMaxRejectedFraction)
         phase = .done
     }
 

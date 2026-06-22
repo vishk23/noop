@@ -25,7 +25,7 @@ object AppChangelog {
      * Bump this when you add a release below. The "What's New" sheet shows automatically when the
      * stored last-seen version is behind this. (Decoupled from the bundle version on purpose.)
      */
-    const val CURRENT_VERSION = "6.1.1"
+    const val CURRENT_VERSION = "6.2.0"
 
     data class Release(
         val version: String,
@@ -36,6 +36,20 @@ object AppChangelog {
 
     /** Newest first. */
     val releases: List<Release> = listOf(
+        Release(
+            version = "6.2.0",
+            title = "See Everything: the Deep Timeline, a sleep movement graph, and a big board-clear",
+            date = "June 2026",
+            items = listOf(
+                "**See everything, second by second: the new Deep Timeline.** Open a metric and pinch to zoom from a whole day right down to per-second detail. Your strap records far more than the old 5-minute averages let you see, and now you can: heart rate, HRV, SpO2, skin temperature, respiration and movement, all at full resolution, all on your device. Find it on the Explore tab. Thanks to everyone who asked for this (#575, #574, #582).",
+                "**A movement graph for your sleep.** The Sleep screen now draws a restlessness trace under your hypnogram, so you can see how much you stirred through the night. Thanks @mad201802 (#407).",
+                "**WHOOP 5.0 is honest about sync now.** A connected 5.0 that's streaming live heart rate but hasn't offloaded history no longer says \"not connected\" — it says history sync is still experimental on the 5.0, and it stops the battery-draining reconnect loop while it waits (#580).",
+                "**Storage, cleaned up.** Added a Storage screen so you can see what's using space and clear it safely (the matching iPhone import bloat is fixed too). Thanks @exzanimo (#590).",
+                "**Clearer steps, alarms and Mac.** Steps now tells you exactly how many more days it needs to calibrate (and shows your imported phone steps directly), the Mac explains that R22 deep data needs an iPhone or Android, and inactivity nudges and your smart alarm can now also reach you as a phone notification. Thanks @bringiton321, @hkuehl, @artur01-code (#589, #587, #577).",
+                "**Tighter sleep dates.** A WHOOP with a wandering clock could re-send records stamped with wrong dates and scramble which night was which. NOOP now checks each record against the strap's own data range and drops the impossible ones (#547).",
+                "**Polish + a share card.** No more black band under the camera notch (thanks @cooki371, @Divad27), profile photos import the right way up, Fitbit imports are faster, and the strap scan backs off to save battery during reconnects (thanks @ryanbr). Plus a new share card overlaying your Charge, Effort and Rest on a photo (#559).",
+                "**Spot HRV won't fake it.** An on-demand HRV reading now refuses to give a number when too much of the capture was noise, instead of showing you a shaky one. Thanks @ryanbr (#585).",
+            )),
         Release(
             version = "6.1.1",
             title = "Fix: a night with a brief wake-up showed as separate naps",

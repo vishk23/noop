@@ -17,6 +17,34 @@ approximate; downloads are on the [Releases](https://github.com/NoopApp/noop/rel
 
 ---
 
+## 6.2.0 — See Everything: the Deep Timeline, a sleep movement graph, and a big board-clear (all platforms)
+
+A large update built straight from the open board: one big new feature plus a wave of fixes and community PRs, cross-referenced so related reports were solved together.
+
+**See Everything: the Deep Timeline.** Open a metric and pinch or scroll to zoom from a whole day right down to per-second detail. Your strap records far more than the old 5-minute chart buckets ever showed, and now you can actually see it: heart rate, HRV, SpO2, skin temperature, respiration and movement, every reading at full resolution, all on your device. It reads the raw samples adaptively (coarse at day scale, raw seconds when you zoom in) so it stays smooth. Reachable from the Explore tab. Closes #575, serves #574 and #582.
+
+**Sleep**
+- A **movement / restlessness graph** now draws under your hypnogram so you can see how much you stirred (#407, thanks @mad201802).
+- **Tighter sleep dates (#547):** a WHOOP with a wandering internal clock could re-send records stamped with wrong dates and scramble which night was which. NOOP now checks every record against the strap's own data range and drops the impossible ones, while keeping legitimately old history.
+
+**WHOOP 5.0 & sync**
+- A connected 5.0 streaming live HR but offloading no history now honestly says **history sync is experimental on the 5.0** instead of "not connected", and **stops the battery-draining reconnect loop** while it waits (#580).
+- The Mac now explains that **R22 deep data needs an iPhone or Android** — a Mac structurally can't form the encrypted bond a 5/MG needs (#587).
+
+**Storage, steps, notifications**
+- Fixed an iPhone bug where importing an Apple Health export could **balloon the app's storage** by leaving a duplicate copy behind, and added a **Storage** diagnostics + cleanup screen (#590, thanks @exzanimo).
+- **Steps** now tells you exactly how many more overlapping days it needs to calibrate, and shows your imported phone steps directly (#589, thanks @bringiton321).
+- **Inactivity nudges and your smart alarm** can now also reach you as a phone notification (#577, thanks @hkuehl), and the iOS wrist-alerts master toggle is exposed (#572, thanks @artur01-code).
+- **Spot HRV** refuses to give a number when too much of the capture was noise (#585, thanks @ryanbr).
+- A new **share card** overlays your Charge, Effort and Rest on a photo (#559).
+
+**Android polish**
+- No more **black band under the camera notch** (#578, thanks @cooki371 and @Divad27), **profile photos** import the right way up (thanks @ryanbr), **Fitbit imports** are faster (thanks @ryanbr), and the strap scan **backs off to save battery** during reconnects (thanks @ryanbr).
+
+Reimplemented community PRs are credited above. With thanks to everyone who filed an issue, a log, or a PR.
+
+---
+
 ## 6.1.1 — Fix: a night with a brief wake-up showed as separate naps (all platforms)
 
 A focused follow-up to the 6.1.0 sleep rebuild. If you stirred briefly overnight, the **Sleep tab** could split that one continuous night into a "main" sleep plus one or two phantom naps, even though your recovery and your Today total were already correct (only the tab disagreed). The Sleep tab now resolves your main night the same way the rest of the app does: it stitches a briefly-interrupted or biphasic night's fragments back into one continuous sleep, and only genuinely separate blocks (like an afternoon nap) are shown as naps. The hero now reflects the whole night, so every screen agrees.

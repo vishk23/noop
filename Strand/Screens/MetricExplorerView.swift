@@ -178,6 +178,20 @@ struct MetricExplorerView: View {
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
             }
+            // The headline tap-through (#575): a full-day, full-resolution, zoomable timeline. Sits above
+            // the per-metric catalog because it's a different kind of view — every second of one day rather
+            // than one number per day. Closure-based NavigationLink, matching the metric rows below (#38/#199).
+            NavigationLink {
+                FullDayChartView()
+            } label: {
+                deepTimelineRow
+            }
+            .buttonStyle(StrandPressableButtonStyle(cornerRadius: NoopMetrics.cardRadius))
+            #if os(iOS)
+            .simultaneousGesture(TapGesture().onEnded { StrandHaptic.selection.play() })
+            #endif
+            .padding(.bottom, NoopMetrics.sectionGap - 20)
+
             ForEach(MetricCatalog.categories, id: \.self) { category in
                 let metrics = MetricCatalog.inCategory(category)
                 if !metrics.isEmpty {
@@ -221,6 +235,41 @@ struct MetricExplorerView: View {
         }
         // Rows push MetricDetailView directly (closure-based NavigationLink above) — no value/destination
         // pairing, which is what double-pushed (#38). Nothing else registers a MetricDescriptor destination.
+    }
+
+    /// The hero entry that opens the Deep Timeline (#575). A full-bleed card, not a list row, so it reads
+    /// as the headline above the per-metric catalog.
+    private var deepTimelineRow: some View {
+        NoopCard {
+            HStack(spacing: 14) {
+                ZStack {
+                    RoundedRectangle(cornerRadius: 11, style: .continuous)
+                        .fill(StrandPalette.metricRose.opacity(0.16))
+                    Image(systemName: "waveform.path.ecg")
+                        .font(.system(size: 18, weight: .semibold))
+                        .foregroundStyle(StrandPalette.metricRose)
+                }
+                .frame(width: 42, height: 42)
+
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Deep Timeline")
+                        .font(StrandFont.body)
+                        .fontWeight(.semibold)
+                        .foregroundStyle(StrandPalette.textPrimary)
+                    Text("Every second of your day, zoomable.")
+                        .font(StrandFont.footnote)
+                        .foregroundStyle(StrandPalette.textTertiary)
+                }
+                Spacer(minLength: 8)
+                Image(systemName: "chevron.right")
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundStyle(StrandPalette.textTertiary)
+            }
+        }
+        .contentShape(Rectangle())
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("Deep Timeline, every second of your day, zoomable")
+        .accessibilityAddTraits(.isButton)
     }
 
     /// One lightweight pass to learn which metrics have no series, so rows can flag them with the
