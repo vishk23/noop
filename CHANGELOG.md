@@ -17,6 +17,16 @@ approximate; downloads are on the [Releases](https://github.com/NoopApp/noop/rel
 
 ---
 
+## 6.2.2 — Deep Timeline day navigation, faster manual workouts, storage clean-up (all platforms)
+
+- **Deep Timeline can reach your other days.** It was today-only; now it steps back through previous days and opens on your most recent day with data instead of a blank today. Thanks @ruedigermunz (#597).
+- **Manual workouts fill in immediately + absolute start time.** Average/peak HR, strain and calories now appear straight away from the strap's HR for the window (not on the next background pass), and Android gains the exact start date/time picker the iPhone/Mac already had. Thanks @virajshoor, @pilleuspulcher-blip (#598).
+- **Storage clean-up (iPhone).** A failed/retried Apple Health import could strand a multi-GB unzipped copy the Storage screen never scanned; NOOP now reclaims those leftovers automatically on launch and via Clean up now. Thanks @exzanimo (#590).
+- **Russian localization** across the Apple app. Thanks @Te1man (#594).
+- **Coach tables on Android** render as a real grid instead of raw `| ... |` text. Thanks @Divad27 (#593).
+
+---
+
 ## 6.2.1 — Fix: imported phone steps were being double-counted (all platforms)
 
 - **Your imported steps add up properly now.** If you wear an Apple Watch as well as carrying your iPhone, Apple Health stores both their step counts for the same walk. NOOP was adding them together, so a busy day could read close to double the real number, which also threw off the steps calibration. It now does what the Health app does: it counts each source on its own and keeps the higher one, so a 7,000-step day reads 7,000, not 14,000. Re-import your Apple Health export after updating to clean up past days. Thanks @bringiton321 (#589).

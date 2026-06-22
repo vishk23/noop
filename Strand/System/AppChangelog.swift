@@ -7,7 +7,7 @@ enum AppChangelog {
 
     /// Bump this when you add a release below. The "What's New" sheet shows automatically when the
     /// stored last-seen version is behind this. (Decoupled from the bundle version on purpose.)
-    static let currentVersion = "6.2.1"
+    static let currentVersion = "6.2.2"
 
     struct Release: Identifiable {
         let version: String
@@ -19,6 +19,17 @@ enum AppChangelog {
 
     /// Newest first.
     static let releases: [Release] = [
+        Release(
+            version: "6.2.2",
+            title: "Deep Timeline you can scroll through days, faster manual workouts, and a storage clean-up",
+            date: "June 2026",
+            items: [
+                "**The Deep Timeline can reach your other days now.** It used to only ever show today, so if today was still syncing it looked empty even though your history was right there. It now lets you step back through previous days, and it opens on your most recent day with data instead of a blank today. Thanks @ruedigermunz (#597).",
+                "**Manual workouts fill in their numbers straight away.** When you add a workout over a window your strap was recording, its average and peak heart rate, strain and calories now appear immediately from your strap data instead of after the next background pass. On Android you can also set the exact start date and time now, matching the iPhone and Mac. Thanks @virajshoor, @pilleuspulcher-blip (#598).",
+                "**Storage clean-up that actually reclaims it.** A failed or retried Apple Health import could strand a multi-gigabyte unzipped copy that the Storage screen never saw, so it kept showing a huge footprint. NOOP now recognises and sweeps those leftovers automatically on launch, and the Clean up button reclaims them too. Thanks @exzanimo (#590).",
+                "**Russian is here.** Full Russian translation across the app. Thanks @Te1man (#594).",
+                "**Coach tables on Android.** When the AI Coach answers with a small comparison table, Android now renders it as a proper grid like the Mac and iPhone do, instead of raw text. Thanks @Divad27 (#593).",
+            ]),
         Release(
             version: "6.2.1",
             title: "Fix: imported phone steps were being double-counted",

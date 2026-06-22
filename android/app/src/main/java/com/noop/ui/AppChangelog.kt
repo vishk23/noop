@@ -25,7 +25,7 @@ object AppChangelog {
      * Bump this when you add a release below. The "What's New" sheet shows automatically when the
      * stored last-seen version is behind this. (Decoupled from the bundle version on purpose.)
      */
-    const val CURRENT_VERSION = "6.2.1"
+    const val CURRENT_VERSION = "6.2.2"
 
     data class Release(
         val version: String,
@@ -36,6 +36,18 @@ object AppChangelog {
 
     /** Newest first. */
     val releases: List<Release> = listOf(
+        Release(
+            version = "6.2.2",
+            title = "Deep Timeline you can scroll through days, faster manual workouts, and a storage clean-up",
+            date = "June 2026",
+            items = listOf(
+                "**The Deep Timeline can reach your other days now.** It used to only ever show today, so if today was still syncing it looked empty even though your history was right there. It now lets you step back through previous days, and it opens on your most recent day with data instead of a blank today. Thanks @ruedigermunz (#597).",
+                "**Manual workouts fill in their numbers straight away, and you can set the exact start time.** When you add a workout over a window your strap was recording, its average and peak heart rate, strain and calories now appear immediately from your strap data. And the Add Workout sheet now has a proper start date and time picker instead of \"minutes ago\", matching the iPhone and Mac. Thanks @virajshoor, @pilleuspulcher-blip (#598).",
+                "**Coach tables render properly.** When the AI Coach answers with a small comparison table, it now shows as a real grid instead of raw `| ... |` text, matching the Mac and iPhone. Thanks @Divad27 (#593).",
+                "**Russian is here.** Full Russian translation on the Apple side; Android language support is still on the way. Thanks @Te1man (#594).",
+                "**Storage clean-up (iPhone).** A failed or retried Apple Health import could strand a multi-gigabyte copy the Storage screen never saw; NOOP now reclaims those leftovers automatically. (No Android-facing change — this was an iPhone import path.) Thanks @exzanimo (#590).",
+            ),
+        ),
         Release(
             version = "6.2.1",
             title = "Fix: imported phone steps were being double-counted",
