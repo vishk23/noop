@@ -7,7 +7,7 @@ enum AppChangelog {
 
     /// Bump this when you add a release below. The "What's New" sheet shows automatically when the
     /// stored last-seen version is behind this. (Decoupled from the bundle version on purpose.)
-    static let currentVersion = "7.0.1"
+    static let currentVersion = "7.2.2"
 
     struct Release: Identifiable {
         let version: String
@@ -19,6 +19,60 @@ enum AppChangelog {
 
     /// Newest first.
     static let releases: [Release] = [
+        Release(
+            version: "7.2.2",
+            title: "Two quick fixes: the Blue Titanium icon, and Mac \"Your Cards\"",
+            date: "June 2026",
+            items: [
+                "**iPhone: the Blue Titanium app icon is clean again.** Picking the alternate \"Blue Titanium\" icon could leave you with a glitched or black tile, because its artwork had a see-through layer and iOS needs app icons fully solid. Fixed, so it lands as the proper icon now. (#708)",
+                "**Mac: \"Your Cards\" pages get a Back button and stop hanging.** The Stress, Health and Hydration detail pages had no way back, and flicking between sidebar items could freeze the window. They now sit in their own navigation stack, so Back works and switching around stays smooth. (#753)",
+                "iPhone and Mac fixes; nothing changed on Android this time (it just shares the version number).",
+            ]),
+        Release(
+            version: "7.2.1",
+            title: "iPhone hotfix: sideloading works again",
+            date: "June 2026",
+            items: [
+                "**If you couldn't install 7.2.0 on iPhone, this fixes it.** 7.2.0 tucked the new Apple Watch app inside the iPhone app, and that broke sideloading: re-signing a nested watch app under a free Apple ID is something Apple doesn't allow, so AltStore and SideStore crashed partway through the install. Sorry to everyone who hit it.",
+                "**The fix:** the sideload download no longer carries the embedded watch app, so it installs cleanly again. Nothing else changed. To get the watch app for now, build from source in Xcode (that signs it properly against your own Apple ID). Thanks mp3geek (#751).",
+                "iPhone only; Mac and Android are unchanged, just bumped to keep every version in step.",
+            ]),
+        Release(
+            version: "7.2.0",
+            title: "New: use an Apple Watch with NOOP",
+            date: "June 2026",
+            items: [
+                "**NOOP now works with your Apple Watch, no WHOOP needed.** Strap on the watch you already own and NOOP turns it into a recovery-and-strain tracker. Your Charge, Effort and Rest rings and live heart rate show right on your wrist, with a watch-face complication so your Charge is one glance away. Your phone stays the brain: it reads the watch's own health data and works out recovery from it, all offline, and a score it hasn't earned yet shows a dash rather than a fake number.",
+                "**It's iPhone only and brand new.** There's no Mac or Android twin, and it's early, so expect some rough edges and tell us what you find. For now the watch app installs by building from source in Xcode, so it's signed properly onto your own watch.",
+            ]),
+        Release(
+            version: "7.1.0",
+            title: "Board Sweep: battery days-left, browse past weeks, breathing cues, and a pile of fixes",
+            date: "June 2026",
+            items: [
+                "**New: \"~X days left\" on your strap battery.** NOOP watches how fast the band is discharging and tells you roughly how many days are left, right on the Today battery badge. All on-device, nothing logged.",
+                "**New: browse previous weeks in Trends.** Flick back through your Weekly Trends history week by week, instead of only seeing the current one.",
+                "**New: breathing cues.** An optional audio pacer for the breathing exercise, with a ring that breathes along with you. It stays quiet when your phone is on silent.",
+                "**A stack of connection and sleep fixes.** Straps that said \"connected\" but sent no data now connect properly, sleep on the WHOOP 5 and MG no longer over-counts time awake, the Sleep tab shows the right bedtime (and editing it actually moves it), and Trends \"Rest\" matches the number on Today.",
+                "**Plus the everyday polish.** Android home-screen cards open their detail when tapped, Today stops jumping back to the strap's start date, workouts gain Treadmill walk and Bodybuilding presets and an optional keep-screen-on, and the German, Spanish, Russian and Brazilian Portuguese translations all show up properly now. Thanks ryanbr, sunny-noop, Te1man, Divad27, artur01, oregontrailbison and everyone who reported these.",
+            ]),
+        Release(
+            version: "7.0.3",
+            title: "iPhone: smoother scrolling",
+            date: "June 2026",
+            items: [
+                "**Fixed the iPhone lag.** If the app felt sluggish on iPhone, especially right after an Apple Health import or on a busy Today screen, this sorts it. We traced it to two things from the v7 redesign: a few chart layers were doing extra offscreen drawing work every frame, and the deep-history re-analysis was running on the main thread where it blocked scrolling. Both fixed, Today's data now loads in parallel, and the live pulse dot is lighter. iPhone and Mac only; Android already did this the right way, so it's just version-matched.",
+            ]),
+        Release(
+            version: "7.0.2",
+            title: "The smoothness release: faster everywhere, plus a sleep memory fix",
+            date: "June 2026",
+            items: [
+                "**Scrolling is much smoother on every screen.** We went screen by screen: charts and rings now cache their drawing instead of redrawing every frame, long screens only build what's actually on screen, and the home screen no longer redraws itself on every heartbeat. iPhone, iPad, Mac and Android all get it.",
+                "**The analytics stopped thrashing your phone's memory.** The sleep and scoring engines were re-crunching the same nights over and over. Now each night is worked out once and reused, so the app stays quieter and faster while it scores.",
+                "**Fixed: a Sleep V2 crash.** With the experimental sleep staging turned on, the app could get choppy and then crash on Android while scrolling back through nights, because it never trimmed each night's data down and redid the same heavy maths a million times over. Now each night is trimmed first and the maths runs in a single pass, so it stays put. Your sleep numbers come out exactly the same. Thanks to the two of you who sent the logs that pinned it (#707).",
+                "**Also fixed:** the day no longer jumps when you come back to the app, the Rest graph matches the Rest score, and there's a new toggle in Settings to turn the moving day-cycle sky off if you prefer it plain. (#614, #698)",
+            ]),
         Release(
             version: "7.0.1",
             title: "Fixes: the experimental sleep toggle now works, steps calibration, manual workouts on WHOOP 5/MG, and a sane HRV reading",
