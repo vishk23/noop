@@ -30,6 +30,16 @@ final class PuffinFrameRecorder {
     private var sinceFlush = 0
     private var fileURL: URL?
 
+    /// Compact (single-line) encoder for the append-only NDJSON live file (#tetherpull). Distinct from
+    /// `PuffinCapture.encodedJSON()`'s pretty-printed whole-array output: NDJSON needs each record on ONE
+    /// line. `sortedKeys` keeps each line's key order stable; no `.prettyPrinted` so there are no embedded
+    /// newlines to break the one-record-per-line contract.
+    private static let ndjsonEncoder: JSONEncoder = {
+        let enc = JSONEncoder()
+        enc.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
+        return enc
+    }()
+
     init(state: LiveState) {
         self.state = state
     }
@@ -51,8 +61,17 @@ final class PuffinFrameRecorder {
     func capture(frame: [UInt8], char: CBUUID) {
         guard isEnabled else { return }
         let tsMs = Int(Date().timeIntervalSince1970 * 1000)
-        buffer.record(frame: frame, char: char.uuidString.lowercased(),
-                      tsMs: tsMs, hr: state?.heartRate)
+        let record = buffer.record(frame: frame, char: char.uuidString.lowercased(),
+                                   tsMs: tsMs, hr: state?.heartRate)
+        // Continuous live mirror (#tetherpull): ALSO append this frame as one NDJSON line to
+        // `Documents/noop-live-puffin.ndjson`, so the FULL raw stream — including any overnight type-47
+        // historical records — lands on disk as it arrives and survives the in-memory `PuffinCapture` cap,
+        // pullable by `devicectl copy from` at any time with no manual export. Additive: the buffered
+        // capture + the periodic `flush()` to the Application Support file are untouched.
+        if let line = try? Self.ndjsonEncoder.encode(record),
+           let text = String(data: line, encoding: .utf8) {
+            LiveDebugFiles.appendPuffinLine(text)
+        }
         sinceFlush += 1
         state?.puffinCaptureCount = buffer.count
         if sinceFlush >= Self.flushEvery { flush() }

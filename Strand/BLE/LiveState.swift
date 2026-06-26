@@ -1,7 +1,17 @@
 import Foundation
 import Combine
+import os
 import StrandAnalytics
 import WhoopProtocol
+
+/// Shared unified-logging handle for the BLE/connection log (the "logging tether", #logtether). A
+/// developer on a tethered Mac watches the live strap connection from Console.app / `log` by filtering
+/// this subsystem (the app bundle id) + category ("BLE"). Defined once here so the subsystem/category
+/// aren't duplicated; the only emit site is `LiveState.append(log:)`, the single funnel every BLE log
+/// line already passes through. The in-app buffer is unaffected — this is a pure additional sink.
+enum NoopLog {
+    static let ble = Logger(subsystem: Bundle.main.bundleIdentifier ?? "noop", category: "BLE")
+}
 
 /// Observable snapshot of the live connection + biometric state, driven by FrameRouter
 /// (from decoded frames) and BLEManager (from CoreBluetooth callbacks).
@@ -380,9 +390,55 @@ public final class LiveState: ObservableObject {
         // parseable marker the export filters on. Redaction is STILL the only scrub point
         // (redactPii below); tagging happens BEFORE redaction so the scrub covers the whole line.
         let tagged = domain.map { "[\($0.id)] " + line } ?? line
-        log.append(Self.redactPii(tagged))
+        let redacted = Self.redactPii(tagged)
+        log.append(redacted)
         if log.count > Self.maxLogLines { log.removeFirst(log.count - Self.maxLogLines) }
         Self.persistTail(log)
+        scheduleLiveLogFileWrite()
+        // Logging tether (#logtether): mirror the SAME PII-scrubbed line to Apple's unified logging so a
+        // developer on a tethered Mac can watch the live strap connection (Console.app / `log`). `.public`
+        // because os.Logger redacts interpolated strings as `<private>` by default and this is a developer
+        // diagnostic of the user's OWN device — without it the tether is useless. Additive: the in-app
+        // buffer above is untouched, so the "Strap log" export and Live screen read exactly as before.
+        // `.default` (not `.debug`): debug-level os_log isn't persisted, so `log collect` / `log show`
+        // snapshots pulled to the Mac would miss it. `.default` — the "notice"/standard level — is written
+        // to the on-disk store, so a snapshot pull captures it. (OSLogType has no `.notice`; "notice" = `.default`.)
+        NoopLog.ble.log(level: .default, "\(redacted, privacy: .public)")
+    }
+
+    // MARK: - Live strap-log file (#tetherpull — continuous Documents auto-persist)
+
+    /// Debounce window before the in-memory `log` tail is rewritten to `Documents/noop-live-strap-log.txt`
+    /// (see [LiveDebugFiles]). The realtime BLE stream emits many lines a second during an offload, so a
+    /// per-line file write would thrash the disk; coalescing to one write per window keeps the pulled file
+    /// near-current (a developer's `devicectl copy from` sees at most ~3 s of lag) while staying cheap.
+    private static let liveLogFileDebounce: TimeInterval = 3
+    /// One-shot debounce timer for the live-log file write, re-armed on each new batch of lines. Holding
+    /// the source (not just scheduling work) lets a rapid burst collapse into a single trailing write.
+    private var liveLogFileTimer: DispatchSourceTimer?
+
+    /// (Re)arm the debounced rewrite of the live strap-log file. Each call pushes the write out by
+    /// `liveLogFileDebounce`, so a burst of lines produces ONE write once the stream quiets for a window.
+    /// Additive: the in-app buffer, `persistTail`, and the OSLog tether above are untouched whether or not
+    /// the file can be written.
+    private func scheduleLiveLogFileWrite() {
+        liveLogFileTimer?.cancel()
+        let timer = DispatchSource.makeTimerSource(queue: .main)
+        timer.schedule(deadline: .now() + Self.liveLogFileDebounce)
+        timer.setEventHandler { [weak self] in
+            self?.writeLiveLogFile()
+        }
+        timer.resume()
+        liveLogFileTimer = timer
+    }
+
+    /// Rewrite the current strap-log tail to `Documents/noop-live-strap-log.txt`, atomically and
+    /// best-effort. Uses the SAME `exportableLogText()` body the manual share + Live card render, so the
+    /// continuously-pulled file reads identically to a hand-saved one. A write failure is swallowed — the
+    /// next batch re-arms the timer and rewrites the whole file.
+    private func writeLiveLogFile() {
+        guard let url = LiveDebugFiles.strapLogURL() else { return }
+        try? exportableLogText().write(to: url, atomically: true, encoding: .utf8)
     }
 
     /// The in-app log lines tagged for one test domain (for the Test Centre live readout). Read-only,
