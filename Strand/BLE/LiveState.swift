@@ -1,6 +1,7 @@
 import Foundation
 import Combine
 import StrandAnalytics
+import WhoopProtocol
 
 /// Observable snapshot of the live connection + biometric state, driven by FrameRouter
 /// (from decoded frames) and BLEManager (from CoreBluetooth callbacks).
