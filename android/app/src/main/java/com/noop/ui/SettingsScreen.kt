@@ -33,6 +33,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.KeyboardArrowRight
 import androidx.compose.material.icons.filled.Autorenew
 import androidx.compose.material.icons.filled.Bolt
+import androidx.compose.material.icons.filled.BugReport
 import androidx.compose.material.icons.filled.Brightness6
 import androidx.compose.material.icons.filled.Campaign
 import androidx.compose.material.icons.filled.Cancel
@@ -273,7 +274,7 @@ class ProfileStore(private val prefs: SharedPreferences) {
 // MARK: - Screen
 
 @Composable
-fun SettingsScreen(vm: AppViewModel) {
+fun SettingsScreen(vm: AppViewModel, onOpenTestCentre: () -> Unit = {}) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
     val live by vm.live.collectAsStateWithLifecycle()
@@ -1658,6 +1659,24 @@ fun SettingsScreen(vm: AppViewModel) {
                     },
                 )
             }
+        }
+
+        // --- Test Centre (the diagnostic home, #507/#509) ---
+        // A nav row into the Test Centre: the single home for the diagnostic, log and test controls (spec
+        // section 7). The strap log, recalibrate, scheduled export and experimental toggles also live there
+        // on the same bindings, so this is a faster door to the full set without growing this screen.
+        SettingsSection(
+            icon = Icons.Filled.BugReport,
+            title = "Test Centre",
+            blurb = "Turn on a test for the thing that's wrong, wear the strap, then tap Report. Your strap log, recalibrate, scheduled export and experimental probes all live here too.",
+        ) {
+            NoopButton(
+                text = "Open Test Centre",
+                leadingIcon = Icons.Filled.BugReport,
+                kind = NoopButtonKind.Secondary,
+                fullWidth = true,
+                onClick = onOpenTestCentre,
+            )
         }
 
         // --- Charge (Recovery) advanced ---

@@ -30,6 +30,7 @@ import androidx.compose.material.icons.filled.Alarm
 import androidx.compose.material.icons.filled.AutoAwesome
 import androidx.compose.material.icons.filled.Bedtime
 import androidx.compose.material.icons.filled.Bolt
+import androidx.compose.material.icons.filled.BugReport
 import androidx.compose.material.icons.filled.ChevronRight
 import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material.icons.filled.Explore
@@ -151,6 +152,7 @@ private enum class Destination(
     Notifications("notifications", "Notifications", Icons.Filled.Notifications),
     Support("support", "Support", Icons.Filled.Tune),
     Settings("settings", "Settings", Icons.Filled.Settings),
+    TestCentre("test_centre", "Test Centre", Icons.Filled.BugReport),
 
     // The "More" tab: its own navigated page (mirroring the iOS More tab) that hosts the full
     // grouped destination list. It is NOT itself in any [DrawerGroup] — it's the door to them.
@@ -337,7 +339,10 @@ fun AppRoot(viewModel: AppViewModel = viewModel()) {
                 composable(Destination.Devices.route) { DevicesScreen(viewModel) }
                 composable(Destination.DataSources.route) { DataSourcesScreen(viewModel) }
                 composable(Destination.Notifications.route) { NotificationsSettingsScreen(viewModel) }
-                composable(Destination.Settings.route) { SettingsScreen(viewModel) }
+                composable(Destination.Settings.route) {
+                    SettingsScreen(viewModel, onOpenTestCentre = { nav.navigate(Destination.TestCentre.route) })
+                }
+                composable(Destination.TestCentre.route) { TestCentreScreen(viewModel) }
                 // The "More" page — the iOS More tab's twin: a navigated ScreenScaffold page hosting the
                 // full grouped destination list (was a pull-up sheet). A row navigates top-level.
                 composable(Destination.More.route) {
