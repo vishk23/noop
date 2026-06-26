@@ -359,6 +359,9 @@ private struct TestModeRow: View {
             if on, mode.domain == .sleep {
                 SleepReadoutPanel(live: live)
             }
+            if on, mode.domain == .battery {
+                BatteryReadoutPanel(live: live)
+            }
             HStack {
                 Spacer()
                 Button("Report") { report.start(mode: mode, live: live) }
@@ -386,6 +389,24 @@ private struct SleepReadoutPanel: View {
             ReadoutRow(label: "Gravity coverage",
                        value: live.recentGravitySamples.isEmpty ? "no live gravity yet" : String(format: "%.0f%%", gravCoverage * 100))
             ReadoutRow(label: "Last gate fired", value: lastGate ?? "no night yet")
+        }
+        .padding(.top, 2)
+    }
+}
+
+/// The Battery & Charging live-readout panel (Group F): current SoC, the "~X days left" estimate, and
+/// whether the discharge slope is the user's own measured rate or the rated fallback. Bound from
+/// LiveState.batteryReadout over the SAME banked SoC series the Today badge reads, so the panel never
+/// diverges from the headline number. No hardcoded colours; uses the same ReadoutRow tokens as the Sleep
+/// panel above. No em-dash in any string here.
+private struct BatteryReadoutPanel: View {
+    @ObservedObject var live: LiveState
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            ReadoutRow(label: "Current charge", value: live.batteryReadout("currentSoc"))
+            ReadoutRow(label: "Estimated runtime left", value: live.batteryReadout("estimateDaysLeft"))
+            ReadoutRow(label: "Slope source", value: live.batteryReadout("slopeSource"))
         }
         .padding(.top, 2)
     }

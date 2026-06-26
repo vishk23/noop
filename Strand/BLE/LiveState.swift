@@ -115,6 +115,20 @@ public final class LiveState: ObservableObject {
         for line in batteryEstimateTraceLines { append(log: line, domain: .battery) }
     }
 
+    /// Resolve one of the Battery mode's liveReadout ids ("currentSoc" / "estimateDaysLeft" /
+    /// "slopeSource") to a short display string the Test Centre Battery panel binds to. Returns "--" when
+    /// there is no estimate yet or the id is unknown. Reads the SAME values the Today badge shows, so the
+    /// readout never diverges from the headline number.
+    public func batteryReadout(_ id: String) -> String {
+        guard let e = batteryEstimate else { return "--" }
+        switch id {
+        case "currentSoc":       return "\(Int(e.currentSoc.rounded()))%"
+        case "estimateDaysLeft": return BatteryEstimator.label(hours: e.remainingHours)
+        case "slopeSource":      return e.source.rawValue
+        default:                 return "--"
+        }
+    }
+
     @Published public var lastFrameType: String? = nil
     @Published public var lastEvent: String? = nil
     /// The strap's BLE advertising name, read back from firmware via GET_ADVERTISING_NAME_HARVARD
