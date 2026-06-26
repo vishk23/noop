@@ -293,6 +293,12 @@ public final class LiveState: ObservableObject {
         if batterySamples.count > Self.maxBatterySamples {
             batterySamples.removeFirst(batterySamples.count - Self.maxBatterySamples)
         }
+        // Battery test mode: one tagged (t, soc) line per banked reading, gated zero-cost when off (the
+        // gate is one UserDefaults bool read, and the string below is only built when the mode is on).
+        // Rides the redacting sink; the banked SoC series is the readout + trace source (#713, Test Centre).
+        if TestCentre.active(.battery) {
+            append(log: "bank soc=\(String(format: "%.1f", pct)) t=\(now)s", domain: .battery)
+        }
     }
 
     /// Drop the banked SoC buffer (called on disconnect) so a stale runtime estimate can't outlive the
