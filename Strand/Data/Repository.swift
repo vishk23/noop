@@ -855,6 +855,19 @@ final class Repository: ObservableObject {
             }, isRaw: false, bucketSeconds: bucket)
         }
 
+        if metric == .hrv {
+            // Real intraday HRV: rMSSD per time window from the R-R intervals (#803), NOT the raw R-R
+            // tachogram. The window floors at 300 s (5 min) so it matches the nightly sessionAvgHRV
+            // bucket and clears HRVAnalyzer.minBeats, staying trustworthy when zoomed in; otherwise it
+            // tracks the chart's bucket.
+            let rr = (try? await store.rrIntervals(deviceId: src, from: from, to: to, limit: 200_000)) ?? []
+            let window = max(bucket, 300)
+            let pts = HRVAnalyzer.rmssdTimeline(rr, windowSeconds: window).map {
+                TrendPoint(date: Date(timeIntervalSince1970: TimeInterval($0.ts)), value: $0.rmssd)
+            }
+            return TimelineSeries(points: pts, isRaw: false, bucketSeconds: window)
+        }
+
         // Non-HR streams: read raw rows (these tables are far sparser than 1 Hz HR, so a day's worth is
         // safe to load) and, when zoomed out, downsample to the bucket grid in-process for a clean line.
         let raw = await timelineRawMetric(metric: metric, store: store, source: src, from: from, to: to)
@@ -876,10 +889,7 @@ final class Repository: ObservableObject {
         case .hr:
             return []   // handled by the caller's HR path
         case .hrv:
-            // Instantaneous HRV proxy: each RR interval in ms (a beat-to-beat view; daily rMSSD lives in
-            // Explore). Low frequency, so the raw rows are safe to load for a window.
-            let rr = (try? await store.rrIntervals(deviceId: source, from: from, to: to, limit: 200_000)) ?? []
-            return rr.map { pt($0.ts, Double($0.rrMs)) }
+            return []   // handled by the caller's HRV path (#803: windowed rMSSD, not raw R-R)
         case .spo2:
             // The honest raw red/IR ratio proxy (#166: no calibrated %), shown as a unitless trend.
             let s = (try? await store.spo2Samples(deviceId: source, from: from, to: to, limit: 200_000)) ?? []

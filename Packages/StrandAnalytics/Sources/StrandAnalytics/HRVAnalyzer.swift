@@ -195,6 +195,36 @@ public enum HRVAnalyzer {
                          nInput: nInput, nClean: clean.count)
     }
 
+    /// rMSSD computed per fixed-width time window across `rr`, so an intraday chart shows real HRV
+    /// variability (#803) instead of the raw R-R tachogram. Each window reuses the canonical cleaning
+    /// (range + Malik ectopic), Task-Force rMSSD, the `minBeats` floor, AND the spot-reading honesty
+    /// gate (more than `defaultSpotMaxRejectedFraction` of beats rejected ⇒ too noisy, dropped) so
+    /// daytime motion-artifact windows don't show as spikes. Windows without a trustworthy result are
+    /// omitted. Returns ascending `(windowStartTs, rmssd)` points.
+    public static func rmssdTimeline(_ rr: [RRInterval], windowSeconds: Int) -> [(ts: Int, rmssd: Double)] {
+        guard windowSeconds > 0, !rr.isEmpty else { return [] }
+        // Bucket beats by fixed-width window (floor(ts / windowSeconds) * windowSeconds), preserving
+        // the input ts order within each bucket so the successive-difference rMSSD is meaningful.
+        var windows: [Int: [RRInterval]] = [:]
+        for beat in rr {
+            let key = (beat.ts / windowSeconds) * windowSeconds
+            windows[key, default: []].append(beat)
+        }
+        var points: [(ts: Int, rmssd: Double)] = []
+        points.reserveCapacity(windows.count)
+        for key in windows.keys.sorted() {
+            // Reuse the full cleaning + Task-Force rMSSD + the spot-reading honesty gate (#585): a
+            // window below `minBeats` clean intervals, OR with more than `defaultSpotMaxRejectedFraction`
+            // of its beats rejected as noise, yields rmssd == nil and is dropped — an honest gap, not a
+            // fabricated spike. This keeps daytime motion artifacts out of the chart (#803).
+            let raw = windows[key]!.map { Double($0.rrMs) }
+            if let rmssd = analyze(rawRR: raw, maxRejectedFraction: defaultSpotMaxRejectedFraction).rmssd {
+                points.append((ts: key, rmssd: rmssd))
+            }
+        }
+        return points
+    }
+
     // MARK: - Helpers
 
     /// Median of a non-empty array. (Caller guarantees non-empty.)
