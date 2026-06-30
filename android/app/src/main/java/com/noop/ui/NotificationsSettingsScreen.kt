@@ -98,7 +98,7 @@ internal enum class NotifCategory(
 ) {
     Email("Email", Icons.Filled.Email, BuzzPattern.Double),
     Messaging("Messaging", Icons.Filled.Chat, BuzzPattern.Single),
-    Meetings("Meetings & Calls", Icons.Filled.Videocam, BuzzPattern.Triple),
+    Meetings("Meetings", Icons.Filled.Videocam, BuzzPattern.Triple),
     Calendar("Calendar & Reminders", Icons.Filled.CalendarMonth, BuzzPattern.Double),
 }
 
@@ -122,7 +122,10 @@ private val notifCatalog: List<NotifApp> = listOf(
     NotifApp("com.google.android.apps.messaging", "Messages", NotifCategory.Messaging, Icons.Filled.Chat),
     NotifApp("com.Slack", "Slack", NotifCategory.Messaging, Icons.Filled.Chat),
     NotifApp("org.telegram.messenger", "Telegram", NotifCategory.Messaging, Icons.Filled.Chat),
-    NotifApp("com.microsoft.teams", "Microsoft Teams", NotifCategory.Meetings, Icons.Filled.Videocam),
+    // Teams' ringing-call notifications are handled by the Calls card below (VoIP path). This
+    // per-app row covers everything else Teams sends to the shade (chats, @-mentions, channel
+    // posts), which read as messages, so it lives under Messaging with the chat glyph.
+    NotifApp("com.microsoft.teams", "Microsoft Teams", NotifCategory.Messaging, Icons.Filled.Chat),
     NotifApp("us.zoom.videomeetings", "Zoom", NotifCategory.Meetings, Icons.Filled.Videocam),
     NotifApp("com.google.android.calendar", "Calendar", NotifCategory.Calendar, Icons.Filled.CalendarMonth),
 )

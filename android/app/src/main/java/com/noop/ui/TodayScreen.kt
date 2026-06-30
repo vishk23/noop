@@ -143,6 +143,10 @@ import kotlin.math.roundToInt
  *  iOS card ids so an export/import round-trips. */
 private const val CARD_SCORES_BUILDING = "scoresBuilding"
 private const val CARD_NEW_HERE = "newHere"
+// #827: the "Building your baseline, N more nights" calibrating note is dismissible-into-the-inbox like
+// the other Today info-cards, so a returning user who has read it once isn't nagged with it every day
+// through the multi-night calibration window. Same id on both platforms so it round-trips an export/import.
+private const val CARD_CALIBRATING = "calibratingBaseline"
 
 /** Process-lifetime guard for the #605 dashboard auto-land. A top-level var = one value per LAUNCH, which
  *  survives BOTH a recomposition AND an Activity recreation / tab-away+restore. rememberSaveable only
@@ -223,7 +227,9 @@ fun TodayScreen(
             )
         }
     }
-    var footer by remember { mutableStateOf(TodayFooterState()) }
+    // #849: seed from the ViewModel cache so a re-mount (tab-return / post-import) restores the last footer
+    // immediately instead of flashing empty while the heavy reload is (now) skipped for unchanged data.
+    var footer by remember { mutableStateOf(viewModel.todayFooterCache ?: TodayFooterState()) }
     // rememberSaveable (not plain remember): the bottom-tab NavHost (AppRoot) navigates with
     // saveState/restoreState, which only restores rememberSaveable-backed state. With plain remember a
     // tab-away wiped the chosen day back to 0, so on return the dashboard "shifted" off the day the user was
@@ -319,10 +325,17 @@ fun TodayScreen(
     // screens use; null simply renders a dash on that card. Mirror the iOS Today lane's stressToday /
     // fitnessAgeToday / vitalityToday loads (last resolved value over all history). Loaded off the main
     // thread; re-read as the data grows.
-    var stressToday by remember { mutableStateOf<Double?>(null) }
-    var fitnessAgeToday by remember { mutableStateOf<Double?>(null) }
-    var vitalityToday by remember { mutableStateOf<Double?>(null) }
+    // #849: seed from the ViewModel cache so a re-mount restores the pinned-card numbers instead of flashing
+    // dashes while the heavy history-wide read is (now) skipped for unchanged data.
+    var stressToday by remember { mutableStateOf(viewModel.todayStressCache) }
+    var fitnessAgeToday by remember { mutableStateOf(viewModel.todayFitnessAgeCache) }
+    var vitalityToday by remember { mutableStateOf(viewModel.todayVitalityCache) }
     LaunchedEffect(days) {
+        // #849 re-mount guard: skip the whole-history scan when `days` is content-identical to the last load
+        // (data class hashCode is a stable structural signature). The marker + cached values live on the
+        // long-lived ViewModel, so a tab-return / post-import re-mount restores the numbers without re-reading.
+        val sig = days.hashCode()
+        if (viewModel.todayCardsLoadedSig == sig) return@LaunchedEffect
         // Read each pinned card from the SAME source its own detail screen reads — the proven path that
         // already shows real numbers there (and the resolution iOS's exploreSeries uses). Stress is derived
         // from the imported strap data (StressScreen reads "my-whoop"); Fitness age + Vitality are
@@ -349,6 +362,12 @@ fun TodayScreen(
         vitalityToday = runCatching {
             viewModel.repo.metricSeries("my-whoop-noop", "vitality", "0000-01-01", "9999-12-31").lastOrNull()?.value
         }.getOrNull()
+        // Cache the computed triple + signature so a later re-mount with unchanged data restores them and
+        // short-circuits the history-wide read above.
+        viewModel.todayStressCache = stressToday
+        viewModel.todayFitnessAgeCache = fitnessAgeToday
+        viewModel.todayVitalityCache = vitalityToday
+        viewModel.todayCardsLoadedSig = sig
     }
 
     // #713 — strap battery runtime estimate ("~X left") for the Data-sources battery row. The battery lane
@@ -469,6 +488,10 @@ fun TodayScreen(
     var newHereDismissed by remember {
         mutableStateOf(TodayCardDismissal.isDismissed(context, CARD_NEW_HERE))
     }
+    // #827: the calibrating note's own dismissed flag, read once from the same shared store.
+    var calibratingDismissed by remember {
+        mutableStateOf(TodayCardDismissal.isDismissed(context, CARD_CALIBRATING))
+    }
     // Dismiss a Today info-card INTO the inbox: persist its flag, hide it, and post a restorable
     // `.dismissedCard` update carrying the card id. Mirrors the iOS `dismissTodayCard`.
     val dismissTodayCard: (String, String, String) -> Unit = { id, title, message ->
@@ -476,6 +499,7 @@ fun TodayScreen(
         when (id) {
             CARD_SCORES_BUILDING -> scoresBuildingDismissed = true
             CARD_NEW_HERE -> newHereDismissed = true
+            CARD_CALIBRATING -> calibratingDismissed = true
         }
         updateStore?.post(
             UpdateItem(
@@ -495,6 +519,7 @@ fun TodayScreen(
             when (restoreSignal) {
                 CARD_SCORES_BUILDING -> scoresBuildingDismissed = false
                 CARD_NEW_HERE -> newHereDismissed = false
+                CARD_CALIBRATING -> calibratingDismissed = false
             }
             updateStore.restoreRequest = null
         }
@@ -737,6 +762,17 @@ fun TodayScreen(
     val window = remember14(days, selectedDay)
 
     LaunchedEffect(days) {
+        // #849: this footer pass is the heavy one. It derives HR per imported workout from raw strap samples
+        // (fillWorkoutHrFromStrap = potentially hundreds of raw-HR reads) and counts every workout / Apple /
+        // Health-Connect row across ALL history. A bare Today re-mount (tab-away + return, or an Apple-Health
+        // import that recreates the screen) re-fires this LaunchedEffect with the screen's `remember` state
+        // reset, so it re-ran the full pass for byte-identical data every time: the lag users see returning
+        // to Today after an import. `days` is a `data class` list, so its structural hashCode is a stable
+        // content signature; if we already loaded the footer for THIS signature, the data on screen is correct
+        // and we skip. The marker lives on the long-lived ViewModel, so it survives the re-mount that reset the
+        // screen state. A real data change bumps the signature and re-runs, so no real update is dropped.
+        val sig = days.hashCode()
+        if (viewModel.todayFooterLoadedSig == sig) return@LaunchedEffect
         val now = System.currentTimeMillis() / 1000
         val recentCutoff = LocalDate.now()
             .minusDays(13)
@@ -763,6 +799,10 @@ fun TodayScreen(
             hcDays = hcDaysCount,
             hcWorkouts = hcWorkouts.size,
         )
+        // Cache the result + record the signature so a later re-mount with unchanged data restores the footer
+        // and short-circuits the heavy reload above.
+        viewModel.todayFooterCache = footer
+        viewModel.todayFooterLoadedSig = sig
     }
 
     // #817 - horizontal swipe to change day, alongside the header chevrons. `detectHorizontalDragGestures`
@@ -859,12 +899,34 @@ fun TodayScreen(
             // or "Needs the strap" (no data overnight). The carried Charge now draws a dimmed filled ring on
             // the hero with NO in-ring caption, so its "Last night ..." note renders BELOW the rings here,
             // matching iOS explainedScoreNote. Today only; never a fabricated value.
+            //
+            // #827: CarriedLastNight + NeedsStrap ALWAYS show. They're either a today-blocking state or a
+            // one-off carry-over, not a recurring nag. The Calibrating note, by contrast, repeats for several
+            // consecutive nights, so it gets a × that tucks it into the Updates inbox (restorable from there),
+            // and is rendered separately just below so a returning user isn't shown it every single day.
             if (selectedDayOffset == 0 &&
-                (scoreState is ScoreState.Calibrating ||
-                    scoreState is ScoreState.CarriedLastNight ||
-                    scoreState is ScoreState.NeedsStrap)
+                (scoreState is ScoreState.CarriedLastNight || scoreState is ScoreState.NeedsStrap)
             ) {
                 ScoreStateNote(scoreState)
+            }
+            // #827: the dismissible calibrating note. Hidden once dismissed into the inbox; a "Restore to
+            // Today" tap there flips calibratingDismissed back via the shared restore path above.
+            if (selectedDayOffset == 0 && scoreState is ScoreState.Calibrating && !calibratingDismissed) {
+                Box(modifier = Modifier.fillMaxWidth()) {
+                    ScoreStateNote(scoreState)
+                    if (updateStore != null) {
+                        TodayCardDismissButton(
+                            modifier = Modifier.align(Alignment.TopEnd),
+                            onClick = {
+                                dismissTodayCard(
+                                    CARD_CALIBRATING,
+                                    "Building your baseline",
+                                    "Charge, Effort and Rest become personal after a few nights of wear.",
+                                )
+                            },
+                        )
+                    }
+                }
             }
             if (selectedDayOffset != 0 || !scoresBuildingDismissed) {
                 Box(modifier = Modifier.fillMaxWidth()) {
@@ -914,7 +976,7 @@ fun TodayScreen(
             modifier = Modifier
                 .fillMaxWidth()
                 // The dark hero CARD floats over the vivid day-scene so the rings + white numbers stay crisp —
-                // the card does the contrast work, not a muted scene (Aaron 2026-06-23). Mirrors iOS heroSection.
+                // the card does the contrast work, not a muted scene (2026-06-23). Mirrors iOS heroSection.
                 .background(
                     Palette.surfaceBase.copy(alpha = 0.72f),
                     RoundedCornerShape(Metrics.cardRadius),
@@ -4122,7 +4184,9 @@ private fun WorkoutGlyph(icon: ImageVector, modifier: Modifier = Modifier) {
 
 // MARK: - Today footer sections
 
-private data class TodayFooterState(
+// Internal (not private) so the #849 re-mount cache can live on the long-lived ViewModel and be restored
+// when the Today composable is recreated (tab-return / post-import re-mount) instead of recomputing.
+data class TodayFooterState(
     val recentWorkouts: List<WorkoutRow> = emptyList(),
     val whoopDays: Int? = null,
     val whoopWorkouts: Int? = null,

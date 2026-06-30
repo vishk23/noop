@@ -106,6 +106,11 @@ data class LiveState(
      *  [withRRIntervals]; emptied by [clearedBiometrics]. Twin of macOS LiveState.rrRecent (PR#191). */
     val rrRecent: List<Int> = emptyList(),
     val batteryPct: Double? = null,
+    /** Strap firmware version captured during the connect handshake: WHOOP 4.0 reports `fw_harvard`
+     *  (a.b.c.d) via REPORT_VERSION_INFO, WHOOP 5/MG reports `fw_version` via GET_HELLO. Shown on the
+     *  Devices card. Null until the handshake response decodes. The Swift WhoopProtocol decodes the
+     *  same fields; this is the Android send → state → UI wiring. */
+    val strapFirmware: String? = null,
     /** Charging flag from BATTERY_LEVEL events — wire observation: u8 bit0 (4.0 @26 / 5.0 @30,
      *  ~every 8 min on captured links). Flag only; battery % keeps its family source (#77).
      *  Cleared on disconnect so a stale flag can't outlive the link. Twin of macOS
@@ -623,6 +628,8 @@ class WhoopBleClient(
             previous.clearedBiometrics().copy(
                 connected = false, bonded = false, encryptedBond = false,
                 backfilling = false, syncChunksThisSession = 0, charging = null,
+                // A stale firmware version must not outlive the dropped link.
+                strapFirmware = null,
                 // #580: the 5/MG "history experimental" note is per-link — a fresh connect re-derives it
                 // from the next offload, so it must not outlive the dropped link.
                 historySyncExperimental = false,
@@ -667,7 +674,8 @@ class WhoopBleClient(
         fun releasedLiveState(previous: LiveState): LiveState =
             previous.clearedBiometrics().copy(
                 connected = false, bonded = false, encryptedBond = false,
-                charging = null, pairingHint = null, scanning = false, statusNote = null,
+                charging = null, strapFirmware = null, pairingHint = null, scanning = false,
+                statusNote = null,
             )
 
         /**
@@ -3029,6 +3037,13 @@ class WhoopBleClient(
 
             "COMMAND_RESPONSE" -> {
                 doubleValue(parsed.parsed["battery_pct"])?.let { setBattery(it) }
+                // Firmware version from the handshake: 4.0 reports fw_harvard (REPORT_VERSION_INFO),
+                // 5/MG reports fw_version (GET_HELLO). Keyed on whichever field decoded rather than
+                // resp_cmd, so a single branch covers both families. Stable for the connection, so we
+                // only republish state when it actually changes.
+                (parsed.parsed["fw_version"] as? String ?: parsed.parsed["fw_harvard"] as? String)?.let { fw ->
+                    if (_state.value.strapFirmware != fw) _state.value = _state.value.copy(strapFirmware = fw)
+                }
                 val respCmd = parsed.parsed["resp_cmd"] as? String
                 val result = parsed.parsed["result"] as? String
                 // 5/MG range-query gate: a GET_DATA_RANGE SUCCESS releases the history request
@@ -3233,6 +3248,14 @@ class WhoopBleClient(
      */
     private fun runConnectHandshake() {
         send(CommandNumber.GET_HELLO_HARVARD)
+        // One-shot firmware-version read for the Devices card. These are documented READ commands, not
+        // firmware-load opcodes. Pick the family-appropriate one; a strap silently ignores the command
+        // meant for the other generation. The response decodes to fw_harvard (4.0) / fw_version (5/MG)
+        // in Framing.
+        when (connectedFamily) {
+            DeviceFamily.WHOOP4 -> send(CommandNumber.REPORT_VERSION_INFO)
+            DeviceFamily.WHOOP5 -> send(CommandNumber.GET_HELLO)
+        }
         sendSetClockBothForms()
         // GET_CLOCK's payload length is firmware-specific, exactly like SET_CLOCK's: newer firmware
         // answers the EMPTY form and ignores [0x00], while fw 41.17.x answers [0x00] and ignores the
@@ -4362,7 +4385,8 @@ class WhoopBleClient(
         _state.value = _state.value.clearedBiometrics().copy(
             connected = false, bonded = false, encryptedBond = false,
             backfilling = false, syncChunksThisSession = 0,
-            charging = null,   // a stale charging flag must not outlive the link
+            charging = null,        // a stale charging flag must not outlive the link
+            strapFirmware = null,   // nor a stale firmware version
         )
         // Multi-WHOOP: the link is down — clear the published connected address so SourceCoordinator's
         // adoption sink can't re-fire on a stale strap id (twin of macOS clearing connectedPeripheralUUID).

@@ -2437,6 +2437,7 @@ extension BLEManager: @preconcurrency CBCentralManagerDelegate {
         state.connected = false
         state.encryptedBond = false   // cleared with didBond; next session must re-prove the bond (#69)
         state.charging = nil          // a stale charging flag must not outlive the link
+        state.strapFirmware = nil     // a stale firmware version must not outlive the link
         state.clearBiometrics()       // and a stale HR / R-R must not outlive the link either
         state.liveFeedActive = false  // a drop while Live is open must not leave a stale "Stop live feed"
         didBond = false
@@ -2873,6 +2874,13 @@ extension BLEManager: @preconcurrency CBPeripheralDelegate {
         // (PHASE A = 50 records; PHASE B high-freq = 0). We still exchange hello to mirror WHOOP exactly.
         send(.getHelloHarvard)
         send(.getAdvertisingNameHarvard)
+        // One-shot firmware-version read for the Devices card. These are read-only commands (not
+        // firmware-load opcodes); send the one this family answers and let the other be ignored. The
+        // reply decodes to fw_harvard (4.0) / fw_version (5/MG) and FrameRouter posts it to LiveState.
+        switch selectedModel.deviceFamily {
+        case .whoop4: send(.reportVersionInfo)
+        case .whoop5: send(.getHello)
+        }
         sendSetClockBothForms()
         if clockRef == nil && !clockRequested {
             clockRequested = true

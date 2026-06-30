@@ -125,7 +125,7 @@ fun Modifier.frostedCardSurface(
             style = Stroke(width = 1.dp.toPx()),
         )
     } else {
-        // TINTED card (iOS parity, Aaron 2026-06-23 "synthesis has the old blue style"): a FLAT raised
+        // TINTED card (iOS parity, 2026-06-23 "synthesis has the old blue style"): a FLAT raised
         // surface — the SAME WHOOP grey as the neutral card, NO navy bevel gradient — carrying only a
         // whisper of the domain tint as a diagonal hue wash so it stays in the grey family.
         // 1) Flat raised fill — identical to the neutral card.

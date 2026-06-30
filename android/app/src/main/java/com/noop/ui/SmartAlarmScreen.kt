@@ -60,7 +60,12 @@ fun SmartAlarmScreen(vm: AppViewModel) {
     val windowMinutes by vm.phoneAlarmWindowMinutes.collectAsStateWithLifecycle()
     val buzzWhoop4 by vm.buzzWhoop4Enabled.collectAsStateWithLifecycle()
     // #536: the hint adapts to bond state — the strap can only be armed when a WHOOP 4.0 is connected.
-    val bonded = vm.live.collectAsStateWithLifecycle().value.bonded
+    val liveState = vm.live.collectAsStateWithLifecycle().value
+    val bonded = liveState.bonded
+    // #821: the strap-buzz row was hardcoded to "WHOOP 4", which reads wrong on a connected 5/MG (issue
+    // #730 follow-up). Name the actual strap generation instead: a detected 5/MG says "WHOOP 5/MG", anything
+    // else (a 4.0, or nothing connected yet) keeps "WHOOP 4.0", so the label never claims the wrong device.
+    val strapName = if (liveState.whoop5Detected) "WHOOP 5/MG" else "WHOOP 4.0"
 
     // True when exact alarms are permitted. Re-read on each (re)composition because the user can grant
     // it in Settings and come back — there's no result callback for this special-access permission.
@@ -146,23 +151,21 @@ fun SmartAlarmScreen(vm: AppViewModel) {
                 }
             }
 
-            // #536: companion strap-buzz, always visible so it's discoverable. Arms the WHOOP 4.0's own
-            // firmware alarm at the earliest wake time, so the strap buzzes first and the OS alarm backs it up.
+            // #536: companion strap-buzz, always visible so it's discoverable. Arms the strap's own firmware
+            // alarm at the earliest wake time, so the strap buzzes first and the OS alarm backs it up.
+            // #821: label + copy name the CONNECTED strap generation (strapName), not a hardcoded "WHOOP 4".
             RowDividerLocal()
             ToggleRowLocal(
-                label = "Buzz WHOOP 4",
+                label = "Buzz $strapName",
                 help = if (bonded)
-                    "Also arms your WHOOP 4.0 to buzz at your earliest wake time, so the strap wakes you first and the phone alarm is the guaranteed backup."
+                    "Also arms your $strapName to buzz at your earliest wake time, so the strap wakes you first and the phone alarm is the guaranteed backup."
                 else
-                    "Connect your WHOOP 4.0 to use this. It arms the strap to buzz at your earliest wake time as a gentler first wake-up.",
+                    "Connect your strap to use this. It arms the strap to buzz at your earliest wake time as a gentler first wake-up.",
                 checked = buzzWhoop4,
                 onChange = { vm.setBuzzWhoop4Enabled(it) },
             )
         }
         }
-
-        // The honest explanation of how detection works + its limits.
-        item { ExplanationCard() }
 
         // #766: the strap's own firmware wake-alarm (its own time + weekdays + per-day overrides). Moved
         // here from Automations so every wake/alarm control sits on the one Alarms screen instead of being
@@ -172,6 +175,11 @@ fun SmartAlarmScreen(vm: AppViewModel) {
 
         // The cross-platform wind-down nudge lives here too.
         item { WindDownCard(vm) }
+
+        // #821: the "how the smart wake works" explainer sat in the MIDDLE of the page (between the wake-alarm
+        // settings and the strap alarm), which read as an interruption. It's reference detail, not a control,
+        // so it belongs at the BOTTOM after every alarm/reminder control, moved here.
+        item { ExplanationCard() }
     }
 }
 

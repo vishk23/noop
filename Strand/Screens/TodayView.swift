@@ -204,6 +204,10 @@ struct TodayView: View {
     // (via the shared `TodayCardDismissal.flagKey`). @AppStorage matches the file's existing prefs style.
     @AppStorage(TodayCardDismissal.flagKey("scoresBuilding")) private var scoresBuildingDismissed = false
     @AppStorage(TodayCardDismissal.flagKey("newHere")) private var newHereDismissed = false
+    // #827: the Charge calibration countdown repeats for several consecutive nights, so it's dismissible
+    // into the inbox (restorable) like the cards above, rather than nagging a returning user every day. Same
+    // card id as Android ("calibratingBaseline") so a dismissed flag round-trips an export/import.
+    @AppStorage(TodayCardDismissal.flagKey("calibratingBaseline")) private var calibratingDismissed = false
 
     // Memoized repo-derived values that are expensive (a full-history sort + per-call
     // `repo.days.map`) yet INDEPENDENT of the ~1 Hz live-HR ticks that re-evaluate `body`
@@ -935,7 +939,7 @@ struct TodayView: View {
                             .foregroundStyle(StrandPalette.goldDeepText)
                             // Fixed 14pt square + Circle() = a true CIRCLE on both platforms, kept INSIDE
                             // the 34pt bell frame (offset -1,1) so the macOS toolbar (at the window's top
-                            // edge) no longer clips the badge's top (Aaron 2026-06-23).
+                            // edge) no longer clips the badge's top (2026-06-23).
                             .frame(width: 14, height: 14)
                             .background(Circle().fill(StrandPalette.statusCritical))
                             .offset(x: -1, y: 1)
@@ -1028,7 +1032,7 @@ struct TodayView: View {
                     .padding(.vertical, NoopMetrics.space4)
                     .frame(maxWidth: .infinity)
                     // The dark hero CARD floats over the vivid day-scene so the rings + white numbers stay
-                    // crisp — the card does the contrast work, not a muted scene (Aaron 2026-06-23).
+                    // crisp — the card does the contrast work, not a muted scene (2026-06-23).
                     .background(
                         RoundedRectangle(cornerRadius: NoopMetrics.cardRadius, style: .continuous)
                             .fill(StrandPalette.surfaceBase.opacity(0.72))
@@ -1177,9 +1181,10 @@ struct TodayView: View {
     /// "Restore to Today"). Keyed on the card id stored in the update's `restorePayload`.
     private func restoreTodayCard(_ cardID: String) {
         switch cardID {
-        case "scoresBuilding": scoresBuildingDismissed = false
-        case "newHere":        newHereDismissed = false
-        default:               break
+        case "scoresBuilding":      scoresBuildingDismissed = false
+        case "newHere":             newHereDismissed = false
+        case "calibratingBaseline": calibratingDismissed = false
+        default:                    break
         }
     }
 
@@ -1188,9 +1193,10 @@ struct TodayView: View {
     private func dismissTodayCard(id: String, title: String, message: String) {
         StrandHaptic.selection.play()
         switch id {
-        case "scoresBuilding": scoresBuildingDismissed = true
-        case "newHere":        newHereDismissed = true
-        default:               break
+        case "scoresBuilding":      scoresBuildingDismissed = true
+        case "newHere":             newHereDismissed = true
+        case "calibratingBaseline": calibratingDismissed = true
+        default:                    break
         }
         updateStore.post(UpdateItem(
             kind: .dismissedCard,
@@ -1467,8 +1473,21 @@ struct TodayView: View {
             // "more overnight wear to unlock your Charge baseline" sits under the rings, in place of an
             // empty/zero Charge. Uses the EXISTING calibrating-nights value (no recompute) and only on
             // TODAY (a past day with no Charge is missing data, not mid-calibration).
-            if selectedDayOffset == 0, let banked = recoveryCalibration {
+            // #827: this repeats nightly through the calibration window, so it's dismissible into the inbox
+            // (restorable) instead of nagging a returning user every day. Hidden once dismissed.
+            if selectedDayOffset == 0, !calibratingDismissed, let banked = recoveryCalibration {
                 chargeCalibrationCountdown(banked: banked)
+                    // A small × tucks the calibration note into the Updates inbox (restorable from there).
+                    .overlay(alignment: .topTrailing) {
+                        todayCardDismissButton {
+                            dismissTodayCard(
+                                id: "calibratingBaseline",
+                                title: "Building your baseline",
+                                message: "Charge, Effort and Rest become personal after a few nights of wear."
+                            )
+                        }
+                    }
+                    .transition(.opacity.combined(with: .scale(scale: 0.97)))
             }
         }
     }
@@ -3161,6 +3180,28 @@ struct TodayView: View {
         // the history-wide set + the new-day announce — the re-fired pass does both for the real day).
         let autoLanded = await loadDayScoped()
         guard !autoLanded else { return }
+        // #849: a bare Today RE-MOUNT (tab-away + return, or an Apple-Health import that recreates the view)
+        // re-fires this task with TodayView's `@State` reset, so the heavy history-wide pass re-ran in full
+        // every time even when NOTHING in the data had changed: hundreds of redundant reads (incl. the
+        // per-day raw-HR queries) that lag the screen on return. Guard on `refreshSeq`, which only advances
+        // when a refresh() actually published new data: if we already loaded the history-wide set for the
+        // CURRENT seq, the data on screen is correct and we skip the reload. The marker lives on the
+        // long-lived `repo` (not @State), so it survives the re-mount that resets `loadedHistoryWideOnce`.
+        // The day-scoped reads above ALWAYS run, so a day-switch / return still repaints instantly.
+        let currentSeq = repo.refreshSeq
+        // #849 no-op guard: have we ALREADY run the history-wide pass for this exact data state? If so the
+        // dashboard data is unchanged, so a bare re-mount must NOT re-run the ~40 reads + per-workout strap-HR
+        // pass. A TabView/module switch (and the post-import re-mount) tears down TodayView's `@State`, so we
+        // RESTORE the history-wide outputs from the cache on `repo` (a handful of in-memory assignments)
+        // rather than re-querying, otherwise the dashboard would flash empty. This wins over the
+        // first-load-this-mount path below, which would otherwise treat the re-mount as a cold launch and
+        // reload identical data. If the cache is somehow absent (defensive), fall through and reload.
+        if repo.todayHistoryWideLoadedSeq == currentSeq, let cached = repo.todayHistoryWideCache {
+            restoreHistoryWide(cached)
+            loadedHistoryWideOnce = true
+            announceNewDaysIfNeeded()
+            return
+        }
         // Defer the heavy history-wide reads ONLY on a re-load while a backfill is actively writing, so they
         // don't contend with the offload's bulk writes on the single-connection store. But ALWAYS run them on
         // the FIRST load (even mid-offload): otherwise a cold launch during a sync would show a blank
@@ -3170,6 +3211,8 @@ struct TodayView: View {
         if !backfillActivelyWriting || !loadedHistoryWideOnce {
             await loadHistoryWide()
             loadedHistoryWideOnce = true
+            // Record the seq we just loaded so a later re-mount with unchanged data short-circuits above.
+            repo.todayHistoryWideLoadedSeq = currentSeq
         }
         announceNewDaysIfNeeded()
     }
@@ -3276,6 +3319,47 @@ struct TodayView: View {
             let farFuture = Int(Date.distantFuture.timeIntervalSince1970)
             xiaomiSleeps = ((try? await store.sleepSessions(deviceId: "xiaomi-band", from: 0, to: farFuture, limit: 4000))?.count) ?? 0
         }
+        // #849: snapshot everything just computed onto the long-lived `repo`, keyed by the seq we loaded for,
+        // so a later re-mount with unchanged data restores it in-memory instead of re-running this pass.
+        // Note the Rest-tile spark (`sparks["sleep_performance"]`) is written by loadDayScoped, which always
+        // runs after a restore, so it is intentionally NOT part of this history-wide snapshot.
+        // Exclude the day-scoped Rest-tile spark from the snapshot: loadDayScoped owns it and rewrites it for
+        // the selected day on every pass, so caching it here (then merging it back on a same-seq day-switch)
+        // would clobber the new day's value with a stale one. Every other spark key is history-wide.
+        var historyWideSparks = sparks
+        historyWideSparks["sleep_performance"] = nil
+        repo.todayHistoryWideCache = TodayHistoryWideCache(
+            sparks: historyWideSparks,
+            stepsEstByDay: stepsEstByDay,
+            workouts: workouts,
+            appleDays: appleDays,
+            xiaomiDays: xiaomiDays,
+            xiaomiSleeps: xiaomiSleeps,
+            stressToday: stressToday,
+            fitnessAgeToday: fitnessAgeToday,
+            vitalityToday: vitalityToday,
+            hydrationTotalML: hydrationTotalML,
+            hydrationGoalML: hydrationGoalML
+        )
+    }
+
+    /// #849: restore the history-wide outputs from a same-seq cache on a re-mount, so the dashboard repaints
+    /// from memory without re-running the heavy reload (which is the lag returning to Today after an import).
+    /// `sparks` is MERGED, not replaced: loadDayScoped writes `sparks["sleep_performance"]` (the Rest-tile
+    /// spark) and runs before this in the same pass, so overwriting the whole dict would drop that day-scoped
+    /// entry. Every other history-wide spark key is restored.
+    private func restoreHistoryWide(_ c: TodayHistoryWideCache) {
+        sparks.merge(c.sparks) { _, cached in cached }
+        stepsEstByDay = c.stepsEstByDay
+        workouts = c.workouts
+        appleDays = c.appleDays
+        xiaomiDays = c.xiaomiDays
+        xiaomiSleeps = c.xiaomiSleeps
+        stressToday = c.stressToday
+        fitnessAgeToday = c.fitnessAgeToday
+        vitalityToday = c.vitalityToday
+        hydrationTotalML = c.hydrationTotalML
+        hydrationGoalML = c.hydrationGoalML
     }
 
     /// The reads that follow `selectedDayOffset`: the selected day's Rest score + provenance, its HR
@@ -3673,6 +3757,27 @@ struct TodayView: View {
 private struct TodayLoadKey: Equatable {
     let seq: Int
     let offset: Int
+}
+
+/// #849: an in-memory snapshot of everything `loadHistoryWide()` computes: the ~40 history-wide reads +
+/// the per-workout strap-HR derivation. Held on the long-lived `Repository` (NOT TodayView's `@State`),
+/// keyed by the `refreshSeq` it was built at, so a Today RE-MOUNT (TabView/module switch, or an
+/// Apple-Health import that recreates the view, both tear down `@State`) can RESTORE these values without
+/// re-running the heavy query pass. Restoring is a handful of in-memory assignments; the old code instead
+/// re-ran the full history-wide reload on every re-mount, which is the lag #849 reports returning to Today
+/// after an import. Built only after a real `loadHistoryWide()`; consumed when the seq still matches.
+struct TodayHistoryWideCache {
+    let sparks: [String: [Double]]
+    let stepsEstByDay: [String: Int]
+    let workouts: [WorkoutRow]
+    let appleDays: [AppleDaily]
+    let xiaomiDays: Int
+    let xiaomiSleeps: Int
+    let stressToday: Double?
+    let fitnessAgeToday: Double?
+    let vitalityToday: Double?
+    let hydrationTotalML: Double?
+    let hydrationGoalML: Int?
 }
 
 // MARK: - Live-observing leaf subviews (scroll-stutter isolation)

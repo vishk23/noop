@@ -134,6 +134,9 @@ fun DevicesScreen(
                 // strap, or an FTMS machine all funnel into live.batteryPct). null otherwise.
                 liveBatteryPct = if (device.status == DeviceStatus.active.name && live.connected)
                     live.batteryPct?.let { Math.round(it).toInt() } else null,
+                // Firmware version from the connect handshake: only for the active, connected strap.
+                liveFirmware = if (device.status == DeviceStatus.active.name && live.connected)
+                    live.strapFirmware else null,
                 onMakeActive = { switchTarget = device },
                 onRename = { renameTarget = device },
                 onRemove = { removeTarget = device },
@@ -268,6 +271,9 @@ private fun DeviceCard(
     /** The active+connected device's live battery percent (0–100) — surfaced the same way for WHOOP, a
      *  generic strap, or an FTMS machine. null when not active/connected or no battery was reported. */
     liveBatteryPct: Int? = null,
+    /** The active+connected strap's firmware version (from the connect handshake). null when not
+     *  active/connected, or for a source that reports no firmware (e.g. a non-WHOOP strap). */
+    liveFirmware: String? = null,
     onMakeActive: () -> Unit,
     onRename: () -> Unit,
     onRemove: (() -> Unit)?,
@@ -330,7 +336,8 @@ private fun DeviceCard(
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Text(
                     lastSeenLine(device, isLiveConnected) +
-                        (liveBatteryPct?.let { " · Battery $it%" } ?: ""),
+                        (liveBatteryPct?.let { " · Battery $it%" } ?: "") +
+                        (liveFirmware?.let { " · FW $it" } ?: ""),
                     style = NoopType.footnote,
                     color = Palette.textTertiary,
                     modifier = Modifier.weight(1f),

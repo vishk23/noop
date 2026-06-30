@@ -793,6 +793,39 @@ final class IntelligenceEngine: ObservableObject {
                                                   offsetSec: tzOffset)
         let newestDay = AnalyticsEngine.dayString(nowLocalMidnight, offsetSec: tzOffset)
 
+        // ── Source-only Charge/Rest fold for wearable imports (Oura / Fitbit / Garmin / Health Connect) ──
+        // Same honesty gap the watch fold above closes (#823), extended to the other import-only sources: a
+        // user who ONLY imports an Oura/Fitbit/Garmin export (or Health Connect) has DAILY aggregates (HRV +
+        // resting HR) but no raw HR stream, so the raw-HR loop never scored their days and the import left
+        // recovery nil , Today/Recovery show a blank Charge. Score it from the daily aggregate vs the person's
+        // own baseline with the SAME `watchRecoveries` engine the apple fold uses (which reuses
+        // RecoveryScorer.recovery verbatim), then write the score under the COMPUTED ("-noop") source so it
+        // merges onto Today exactly like a live day. The imported daily row keeps its raw values untouched;
+        // the computed row carries the NOOP-derived Charge + the Rest composite. HONEST DATA: the engine
+        // returns nil + calibrating until the HRV baseline is usable, so an import-only day stays calibrating
+        // rather than faking a number. The strap and a real WHOOP/Apple import keep winning , we skip any day
+        // already scored this pass (`dailies`) or owned by a WHOOP/Apple import. The window matches the
+        // computed reconcile below, so the fold's rows survive the stale-row eviction.
+        var importScoredDays = Set(dailies.map { $0.day }).union(importedWhoopDays).union(appleHealthDays)
+        for source in Repository.wearableImportSources {
+            let rows = ((try? await store.dailyMetrics(deviceId: source, from: oldestDay, to: newestDay)) ?? [])
+                .sorted { $0.day < $1.day }
+            guard !rows.isEmpty else { continue }
+            let byDay = Dictionary(rows.map { ($0.day, $0) }, uniquingKeysWith: { a, _ in a })
+            for w in Self.watchRecoveries(appleRows: rows, strapRecoveryDays: importScoredDays) {
+                guard let recovery = w.recovery, let row = byDay[w.day] else { continue }
+                let scored = row.with(recovery: recovery, skinTempDevC: row.skinTempDevC)
+                dailies.append(scored)
+                importScoredDays.insert(w.day)
+                if let rest = AnalyticsEngine.Rest.composite(daily: scored) {
+                    restPoints.append(MetricPoint(day: w.day, key: "sleep_performance", value: rest))
+                }
+                out.append(Computed(day: w.day, recovery: recovery, strain: scored.strain,
+                                    sleepMin: scored.totalSleepMin, hrv: scored.avgHrv, rhr: scored.restingHr,
+                                    source: .computed, confidence: w.confidence))
+            }
+        }
+
         // Persist the computed scores under a dedicated "-noop" source so the WHOLE dashboard
         // (Today / Recovery / Strain / Sleep / Trends), not just this screen, reads them. The
         // Repository merges these UNDER any imported "my-whoop" rows, so a real WHOOP import

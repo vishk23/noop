@@ -65,6 +65,11 @@ object IntelligenceEngine {
 
     private const val SECONDS_PER_DAY: Long = 86_400L
 
+    /** Imported wearable-export source ids whose DAILY aggregates can be scored for a NOOP Charge/Rest on
+     *  an import-only day (#823). Matches WearableExportImporter.Brand.deviceId. Mirrors the Swift
+     *  Repository.wearableImportSources. */
+    private val WEARABLE_IMPORT_SOURCES = listOf("oura-import", "fitbit-import", "garmin-import")
+
     /** CAPTURE-B: a day's resolved read owner + the HR-row count read for it, captured in pass 1 and
      *  consumed by pass 2's universal dayOwner emit. */
     private data class OwnerRead(val owner: String, val hrRows: Int)
@@ -726,6 +731,55 @@ object IntelligenceEngine {
             nowLocalMidnight - (maxDays - 1) * SECONDS_PER_DAY, tzOffsetSeconds,
         )
         val newestDay = AnalyticsEngine.dayString(nowLocalMidnight, tzOffsetSeconds)
+
+        // ── Source-only Charge/Rest fold for imported-only days (#823) ──────────────────────────────────
+        // A user who ONLY imports (Health Connect, or an Oura/Fitbit/Garmin export, or Apple Health) has
+        // DAILY aggregates (HRV + resting HR) but no raw HR stream, so the raw-HR scoring loop above never
+        // touched their days and the import left recovery null , Today/Recovery show a blank Charge. Score it
+        // from the daily aggregate vs the person's own baseline with the [watchRecoveries] engine (which
+        // reuses RecoveryScorer.recovery verbatim), then write the score under the COMPUTED ("-noop") source
+        // so it merges onto Today exactly like a live day. The imported daily row keeps its raw values
+        // untouched; the computed row carries the NOOP-derived Charge + the Rest composite. HONEST DATA: the
+        // engine returns null + calibrating until the HRV baseline is usable, so an import-only day stays
+        // calibrating rather than faking a number. Strap/WHOOP-import days keep winning , we skip any day
+        // already scored this pass. Health Connect writes its DailyMetric rows under the strap source
+        // ("my-whoop"), so importedDeviceId is included; a row already carrying its OWN recovery is left
+        // alone. Mirrors the Swift fold.
+        val importScoredDays = HashSet<String>().apply { addAll(dailies.map { it.day }) }
+        val importSourceIds = buildList {
+            add(importedDeviceId) // Health Connect imports its DailyMetric rows under the strap source.
+            add(WhoopRepository.APPLE_HEALTH_SOURCE)
+            add(WhoopRepository.HEALTH_CONNECT_SOURCE)
+            addAll(WEARABLE_IMPORT_SOURCES)
+        }.distinct()
+        for (source in importSourceIds) {
+            val rows = repo.dailyMetrics(source, oldestDay, newestDay)
+            // A real export that already carries its OWN recovery WINS , never overwrite a verbatim imported
+            // score; those days also pre-claim the slot so the fold doesn't re-score them.
+            val byDay = rows.associateBy { it.day }
+            for (r in rows) if (r.recovery != null) importScoredDays.add(r.day)
+            for (w in watchRecoveries(rows, importScoredDays)) {
+                val recovery = w.recovery ?: continue
+                val row = byDay[w.day] ?: continue
+                val scored = row.copy(deviceId = computedId, recovery = recovery)
+                dailies.add(scored)
+                importScoredDays.add(w.day)
+                RestScorer.restFromDaily(scored)?.let { rest ->
+                    restRows.add(MetricSeriesRow(deviceId = computedId, day = w.day, key = "sleep_performance", value = rest))
+                }
+                out.add(
+                    Computed(
+                        day = w.day,
+                        recovery = recovery,
+                        strain = scored.strain,
+                        sleepMin = scored.totalSleepMin,
+                        hrv = scored.avgHrv,
+                        rhr = scored.restingHr,
+                    ),
+                )
+            }
+        }
+
         repo.deleteComputedDailyInRange(computedId, oldestDay, newestDay)
 
         // Persist the computed scores under the dedicated "-noop" source so the WHOLE
@@ -961,6 +1015,40 @@ object IntelligenceEngine {
             sleepPerf = restQuality,
             skinTempDev = daily.skinTempDevC,
         )
+    }
+
+    /** One day's source-only (daily-aggregate) recovery output, keyed by day. Mirrors Swift WatchScoredDay. */
+    data class WatchScoredDay(val day: String, val recovery: Double?, val confidence: ScoreConfidence)
+
+    /**
+     * Score Charge for daily-aggregate (import-only) days that the raw-HR loop never touched (#823). For
+     * each row it folds the TRAILING HRV + RHR history (every earlier row's avgHrv / restingHr) into the
+     * cross-lane [WatchRecovery] engine, which mirrors our Charge shape but reads daily values. Stays null +
+     * CALIBRATING until there are enough usable nights, so we never fabricate a number. [strapRecoveryDays]
+     * are days a strap / WHOOP import already scored , those are SKIPPED so the strap keeps winning. Pure (no
+     * store) so it is unit-tested directly. [rows] need not be ordered (it sorts). Mirrors Swift
+     * `IntelligenceEngine.watchRecoveries`.
+     */
+    fun watchRecoveries(
+        rows: List<DailyMetric>,
+        strapRecoveryDays: Set<String> = emptySet(),
+    ): List<WatchScoredDay> {
+        val sorted = rows.sortedBy { it.day }
+        val out = ArrayList<WatchScoredDay>()
+        for ((i, row) in sorted.withIndex()) {
+            if (row.day in strapRecoveryDays) continue
+            val prior = sorted.subList(0, i)
+            val hrvHistory = prior.mapNotNull { it.avgHrv }
+            val rhrHistory = prior.mapNotNull { it.restingHr?.toDouble() }
+            val res = WatchRecovery.compute(
+                todayHrv = row.avgHrv,
+                todayRhr = row.restingHr,
+                hrvHistory = hrvHistory,
+                rhrHistory = rhrHistory,
+            )
+            out.add(WatchScoredDay(row.day, res.recovery, res.confidence))
+        }
+        return out
     }
 
     /**

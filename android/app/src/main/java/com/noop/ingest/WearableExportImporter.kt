@@ -55,6 +55,16 @@ object WearableExportImporter {
     private const val MAX_FILES = 200_000
     private const val MAX_ROWS = 5_000_000
 
+    // Oura CSV detection (#857). Header keys are already HeaderNorm-normalized.
+    private val OURA_CSV_DATE_KEYS = setOf("date", "day", "summary_date", "calendar_date")
+    private val OURA_CSV_SIGNAL_COLUMNS = setOf(
+        "total_sleep_duration", "rem_sleep_duration", "deep_sleep_duration", "light_sleep_duration",
+        "sleep_efficiency", "average_hrv", "average_resting_heart_rate", "lowest_resting_heart_rate",
+        "readiness_score", "sleep_score", "respiratory_rate", "temperature_deviation",
+    )
+    // Filename fragments that mark an Oura per-category CSV export (lowercased, substring match).
+    private val OURA_CSV_FILENAMES = listOf("heartrate", "heart_rate", "readiness", "sleep_periods")
+
     private val DAY_FMT: DateTimeFormatter = DateTimeFormatter.ofPattern("yyyy-MM-dd")
 
     // Cached date/time formatters — DateTimeFormatter is immutable + thread-safe, so hoisting them out
@@ -94,9 +104,27 @@ object WearableExportImporter {
             Brand.GARMIN -> parseGarmin(files)
         }
         if (parsed.days.isEmpty() && parsed.sleeps.isEmpty()) {
+            // A lone Oura `heartrate.csv` is a raw HR-sample file, not a daily summary, so it carries no
+            // recovery/sleep/HRV to map. Say so plainly and point at the right file (#857).
+            if (brand == Brand.OURA && onlyHeartRateCsv(files)) {
+                return ImportSummary.failure(
+                    brand.label,
+                    "That file is Oura's raw heart-rate log, which has no daily sleep or recovery values to " +
+                        "import. Export your Oura data as JSON (Account -> Export Data), or pick the daily/" +
+                        "readiness CSV, and import that instead.",
+                )
+            }
             return ImportSummary.failure(brand.label, "${brand.label} export held no sleep or daily wellness data.")
         }
         return persist(repo, brand, parsed)
+    }
+
+    /** True when every collected file is a raw heart-rate CSV (no daily-summary file): the #857 case. */
+    internal fun onlyHeartRateCsv(files: Map<String, ByteArray>): Boolean {
+        if (files.isEmpty()) return false
+        return files.keys.all { name ->
+            name.endsWith(".csv") && (name.contains("heartrate") || name.contains("heart_rate"))
+        }
     }
 
     // ------------------------------------------------------------------------
@@ -131,8 +159,15 @@ object WearableExportImporter {
         if (names.any { it.contains("sleepdata") || it.contains("di_connect") || it.contains("userbiometric") || it.contains("_summarizedactivities") }) return Brand.GARMIN
         if (names.any { last(it).startsWith("sleep-") || last(it).startsWith("resting_heart_rate-") || last(it).startsWith("steps-") || it.contains("fitbit") }) return Brand.FITBIT
         if (names.any { it.contains("oura") }) return Brand.OURA
+        // Oura CSV export (#857): the per-category files (`heartrate.csv` / `readiness.csv` / ...). Routing
+        // these to Oura (rather than failing detection) lets the importer give an HONEST per-file outcome:
+        // a daily-summary CSV imports, a lone raw heart-rate CSV reports "no daily wellness data".
+        if (names.any { name -> OURA_CSV_FILENAMES.any { name.contains(it) } }) return Brand.OURA
 
-        for (data in files.values.take(8)) brandFromJsonShape(data)?.let { return it }
+        for ((name, data) in files.entries.take(8)) {
+            brandFromJsonShape(data)?.let { return it }
+            if (name.endsWith(".csv") && looksLikeOuraCsv(CsvTable.fromData(data).normalizedHeaders)) return Brand.OURA
+        }
         return null
     }
 
@@ -225,7 +260,100 @@ object WearableExportImporter {
                 }
             }
         }
+
+        // Fold Oura CSV daily-summary rows in too. An export can be JSON, CSV, or a mix; JSON is richer so
+        // it WINS field-by-field, CSV only fills a day's gaps (#857). A lone raw `heartrate.csv` folds to
+        // nothing here, so the day stays honestly empty and the caller reports it plainly.
+        parseOuraCsv(files, byDay, sleeps)
+
         return Parsed(byDay.values.sortedBy { it.day }, sleeps.sortedBy { it.startTs })
+    }
+
+    /**
+     * Parse Oura's per-day SUMMARY CSV (the "Export Data" trends CSV) into the same day/sleep accumulators
+     * the JSON path fills. Columns are matched after HeaderNorm normalization (so "Average HRV" ->
+     * "average_hrv"); sleep durations are SECONDS (like Oura's JSON) -> minutes. Existing (JSON) values are
+     * never overwritten; CSV only fills nulls. (#857)
+     */
+    internal fun parseOuraCsv(
+        files: Map<String, ByteArray>,
+        byDay: LinkedHashMap<String, DayAcc>,
+        sleeps: ArrayList<SleepAcc>,
+    ) {
+        for ((name, data) in files) {
+            if (!name.endsWith(".csv")) continue
+            val table = CsvTable.fromData(data)
+            if (!looksLikeOuraCsv(table.normalizedHeaders)) continue
+            for (cells in table.rows) {
+                val rawDay = cells.cell("date", "day", "summary_date", "calendar_date") ?: continue
+                val key = normalizeDayKey(rawDay)
+                val d = byDay.getOrPut(key) { DayAcc(key) }
+
+                fun minutes(vararg keys: String): Double? {
+                    val v = cells.double(*keys) ?: return null
+                    return if (v > 0) v / 60.0 else null
+                }
+                val total = minutes("total_sleep_duration", "total_sleep")
+                val deep = minutes("deep_sleep_duration", "deep_sleep")
+                val light = minutes("light_sleep_duration", "light_sleep")
+                val rem = minutes("rem_sleep_duration", "rem_sleep")
+                val awake = minutes("awake_time", "awake_duration", "time_awake")
+
+                d.totalSleepMin = d.totalSleepMin ?: total
+                d.deepMin = d.deepMin ?: deep
+                d.lightMin = d.lightMin ?: light
+                d.remMin = d.remMin ?: rem
+                d.awakeMin = d.awakeMin ?: awake
+                d.efficiencyPct = d.efficiencyPct ?: cells.double("sleep_efficiency", "efficiency")?.takeIf { it > 0 }
+
+                val rhr = cells.double("average_resting_heart_rate", "resting_heart_rate")
+                    ?: cells.double("lowest_resting_heart_rate", "lowest_heart_rate")
+                if (rhr != null && rhr > 0 && d.restingHr == null) d.restingHr = rhr.toInt()
+                cells.double("average_hrv", "hrv")?.takeIf { it > 0 }?.let { d.avgHrvMs = d.avgHrvMs ?: it }
+                cells.double("temperature_deviation", "skin_temperature_deviation")?.let { d.skinTempDevC = d.skinTempDevC ?: it }
+                cells.double("spo2", "blood_oxygen", "average_spo2")?.takeIf { it > 0 }?.let { d.spo2Pct = d.spo2Pct ?: it }
+                cells.double("steps")?.takeIf { it >= 0 }?.let { d.steps = d.steps ?: it.toInt() }
+                cells.double("activity_burn", "active_calories", "active_burn")?.takeIf { it > 0 }?.let { d.activeKcal = d.activeKcal ?: it }
+                cells.double("total_burn", "total_calories")?.takeIf { it > 0 }?.let { d.totalKcal = d.totalKcal ?: it }
+                // Oura's OWN scores -> REFERENCE only.
+                cells.double("readiness_score", "readiness")?.takeIf { it > 0 }?.let { d.readinessScore = d.readinessScore ?: it.toInt() }
+                cells.double("sleep_score")?.takeIf { it > 0 }?.let { d.sleepScore = d.sleepScore ?: it.toInt() }
+
+                // A bedtime window (when the CSV carries one) lands the night on the Sleep tab too.
+                val start = WhoopTime.parseIsoWithOffsetEpochSeconds(cells.cell("bedtime_start", "sleep_start"))
+                val end = WhoopTime.parseIsoWithOffsetEpochSeconds(cells.cell("bedtime_end", "sleep_end"))
+                if (start != null && end != null && end > start && sleeps.size < MAX_ROWS) {
+                    sleeps.add(
+                        SleepAcc(
+                            startTs = start, endTs = end,
+                            deepMin = deep, lightMin = light, remMin = rem, awakeMin = awake,
+                            totalSleepMin = total, efficiencyPct = d.efficiencyPct,
+                            avgHr = null,
+                            lowestHr = rhr?.takeIf { it > 0 }?.toInt(),
+                            avgHrvMs = d.avgHrvMs,
+                            sleepScore = null, stagesJson = null,
+                        ),
+                    )
+                }
+            }
+        }
+    }
+
+    /** True if a CSV's normalized header set looks like an Oura per-day summary (date + a wellness col). */
+    internal fun looksLikeOuraCsv(normalizedHeaders: List<String>): Boolean {
+        val set = normalizedHeaders.toHashSet()
+        if (set.none { it in OURA_CSV_DATE_KEYS }) return false
+        return set.any { it in OURA_CSV_SIGNAL_COLUMNS }
+    }
+
+    /** Reduce an Oura CSV date/datetime cell to the `YYYY-MM-DD` day key (drops any time component). */
+    private fun normalizeDayKey(raw: String): String {
+        val trimmed = raw.trim()
+        if (trimmed.length >= 10) {
+            val head = trimmed.substring(0, 10)
+            if (head.length == 10 && head[4] == '-') return head
+        }
+        return trimmed
     }
 
     private fun ouraSleep(s: JSONObject): SleepAcc? {
@@ -548,7 +676,11 @@ object WearableExportImporter {
     /** True if the file is a wellness JSON/CSV we care about (filters out a brand's non-wellness bulk). */
     internal fun isWellnessFile(name: String, data: ByteArray): Boolean {
         if (name.endsWith(".csv")) {
-            return listOf("sleep", "heart", "step", "stress", "activit", "readiness", "wellness", "rhr").any { name.contains(it) }
+            // Includes Oura's generically-named daily-summary CSV (#857) so it reaches the parser.
+            return listOf(
+                "sleep", "heart", "step", "stress", "activit", "readiness", "wellness", "rhr",
+                "oura", "daily", "trend",
+            ).any { name.contains(it) }
         }
         if (!name.endsWith(".json")) return false
         val hints = listOf("sleep", "heart", "rate", "step", "stress", "activit", "readiness", "wellness",

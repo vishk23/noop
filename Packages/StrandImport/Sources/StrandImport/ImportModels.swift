@@ -700,7 +700,7 @@ public struct WhoopImportResult: Sendable, Equatable {
 
 // MARK: - Errors
 
-public enum ImportError: Error, Equatable, Sendable, CustomStringConvertible {
+public enum ImportError: Error, Equatable, Sendable, CustomStringConvertible, LocalizedError {
     case fileNotFound(String)
     case notAZipOrFolder(String)
     case missingEntry(String)
@@ -716,4 +716,10 @@ public enum ImportError: Error, Equatable, Sendable, CustomStringConvertible {
         case .emptyExport(let m):     return "Export contained no usable data: \(m)"
         }
     }
+
+    /// Honest, human-readable failure text surfaced in the import UI. Without this the enum bridges to
+    /// NSError positionally and the user sees an opaque "…ImportError erreur 4" with no clue what went
+    /// wrong (#857). `LocalizedError.errorDescription` is what `Error.localizedDescription` returns, so
+    /// the Data Sources screen now shows the same plain sentence `description` carries.
+    public var errorDescription: String? { description }
 }

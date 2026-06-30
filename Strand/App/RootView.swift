@@ -207,7 +207,7 @@ struct RootView: View {
                 SidebarStatus().padding(.horizontal, 14).padding(.vertical, 12)
             }
             // One continuous flat WHOOP-grey surface behind the brand header, the list rows, and the
-            // status pill — no black-vs-vibrancy seam (Design Reset, Aaron 2026-06-23).
+            // status pill — no black-vs-vibrancy seam (Design Reset, 2026-06-23).
             .background(StrandPalette.surfaceBase)
             .navigationSplitViewColumnWidth(min: 220, ideal: 240, max: 280)
         } detail: {

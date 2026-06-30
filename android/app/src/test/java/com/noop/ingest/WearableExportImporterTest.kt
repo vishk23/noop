@@ -73,6 +73,58 @@ class WearableExportImporterTest {
         assertEquals(360.0, p.sleeps[0].totalSleepMin!!, 1e-6)
     }
 
+    // ---------------- Oura CSV (#857) ----------------
+
+    @Test
+    fun ouraDailySummaryCsvFoldsDays() {
+        // Representative Oura daily-summary CSV: header + two days. Sleep durations are SECONDS (like the
+        // JSON); headers mix spaces/case so HeaderNorm has to normalize them.
+        val csv = """
+            date,Total Sleep Duration,Deep Sleep Duration,REM Sleep Duration,Light Sleep Duration,Awake Time,Sleep Efficiency,Average Resting Heart Rate,Average HRV,Temperature Deviation,Readiness Score,Sleep Score,Steps,Activity Burn
+            2026-06-01,25200,5400,6000,13800,900,92,49,65,-0.2,81,84,8421,520
+            2026-06-02,21600,4800,5400,11400,600,90,51,58,0.1,76,79,9300,610
+        """
+        val files = mapOf("oura_daily.csv" to bytes(csv))
+        assertEquals(WearableExportImporter.Brand.OURA, WearableExportImporter.detectBrand(files))
+
+        val p = WearableExportImporter.parseOura(files)
+        assertEquals(2, p.days.size)
+        val byDay = p.days.associateBy { it.day }
+
+        val d1 = byDay["2026-06-01"]!!
+        assertEquals(420.0, d1.totalSleepMin!!, 1e-6)   // 25200s → 420 min
+        assertEquals(90.0, d1.deepMin!!, 1e-6)
+        assertEquals(100.0, d1.remMin!!, 1e-6)
+        assertEquals(92.0, d1.efficiencyPct!!, 1e-6)
+        assertEquals(49, d1.restingHr)
+        assertEquals(65.0, d1.avgHrvMs!!, 1e-6)
+        assertEquals(-0.2, d1.skinTempDevC!!, 1e-6)
+        assertEquals(8421, d1.steps)
+        assertEquals(520.0, d1.activeKcal!!, 1e-6)
+        // Oura's OWN scores stay REFERENCE only.
+        assertEquals(81, d1.readinessScore)
+        assertEquals(84, d1.sleepScore)
+
+        assertEquals(360.0, byDay["2026-06-02"]!!.totalSleepMin!!, 1e-6)
+        assertEquals(51, byDay["2026-06-02"]!!.restingHr)
+    }
+
+    @Test
+    fun loneHeartRateCsvRoutesToOuraButImportsNothing() {
+        // The exact #857 input: a single raw heartrate.csv (timestamped samples, no daily summary).
+        val csv = """
+            timestamp,heart_rate
+            2026-06-01T09:00:00+00:00,62
+            2026-06-01T09:01:00+00:00,64
+        """
+        val files = mapOf("heartrate.csv" to bytes(csv))
+        assertEquals(WearableExportImporter.Brand.OURA, WearableExportImporter.detectBrand(files))
+        assertTrue(WearableExportImporter.onlyHeartRateCsv(files))
+        val p = WearableExportImporter.parseOura(files)
+        assertTrue(p.days.isEmpty())
+        assertTrue(p.sleeps.isEmpty())
+    }
+
     // ---------------- Fitbit ----------------
 
     @Test

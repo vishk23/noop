@@ -68,6 +68,9 @@ private struct DevicesContent: View {
                     // The live battery belongs to whichever device is ACTIVE + connected (the WHOOP, a
                     // generic strap, or an FTMS machine all funnel into live.batteryPct). nil otherwise.
                     liveBatteryPct: (device.status == .active && live.connected) ? live.batteryPct.map { Int($0.rounded()) } : nil,
+                    // Firmware version belongs to the active + connected strap only; nil otherwise (and
+                    // for a non-WHOOP source that never reports one).
+                    liveFirmware: (device.status == .active && live.connected) ? live.strapFirmware : nil,
                     onMakeActive: { switchTarget = device },
                     onRename: { renameDraft = device.nickname ?? device.displayName; renameTarget = device },
                     onRemove: { removeTarget = device })
@@ -228,6 +231,9 @@ private struct DeviceCard: View {
     /// for WHOOP, a generic strap, or an FTMS machine. nil when not the active/connected device or
     /// the source hasn't reported a battery (e.g. a strap/machine without the 0x180F service).
     var liveBatteryPct: Int? = nil
+    /// The active+connected strap's firmware version (from the connect handshake). nil when not the
+    /// active/connected device, or for a source that reports no firmware (e.g. a non-WHOOP strap).
+    var liveFirmware: String? = nil
     var dimmed: Bool = false
     var onMakeActive: () -> Void
     var onRename: () -> Void
@@ -297,6 +303,14 @@ private struct DeviceCard: View {
                             .foregroundStyle(StrandPalette.textSecondary)
                             .labelStyle(.titleAndIcon)
                             .accessibilityLabel("Battery \(pct) percent")
+                    }
+                    // Firmware version for the active+connected strap, read on connect.
+                    if let fw = liveFirmware {
+                        Text("·").font(StrandFont.footnote).foregroundStyle(StrandPalette.textTertiary)
+                        Text("FW \(fw)")
+                            .font(StrandFont.footnote)
+                            .foregroundStyle(StrandPalette.textSecondary)
+                            .accessibilityLabel("Firmware version \(fw)")
                     }
                     Spacer()
                     actionsMenu

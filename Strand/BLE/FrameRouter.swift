@@ -70,6 +70,14 @@ public final class FrameRouter {
             if let pct = parsed.parsed["battery_pct"]?.doubleValue {
                 state.setBattery(pct)
             }
+            // Firmware version from the connect handshake: WHOOP 4.0 decodes `fw_harvard`
+            // (REPORT_VERSION_INFO), WHOOP 5/MG decodes `fw_version` (GET_HELLO). Take whichever the
+            // decoder produced; one branch covers both families. It's stable for the connection, so
+            // only republish on a real change. Surfaced on the Devices card.
+            if let fw = parsed.parsed["fw_version"]?.stringValue ?? parsed.parsed["fw_harvard"]?.stringValue,
+               state.strapFirmware != fw {
+                state.strapFirmware = fw
+            }
             // Advertising-name replies (WHOOP 4.0 / Harvard). GET (cmd 76) carries the current name in
             // its payload; SET (cmd 77) carries only a result byte. The schema has no field decode for
             // either, so pull them straight from the frame bytes. The COMMAND_RESPONSE inner is

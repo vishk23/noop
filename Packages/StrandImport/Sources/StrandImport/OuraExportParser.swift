@@ -93,7 +93,161 @@ enum OuraExportParser {
             }
         }
 
+        // Fold any Oura CSV daily-summary rows in too. An export can be JSON, CSV, or a mix; JSON is
+        // richer so it WINS field-by-field, CSV only fills a day's gaps (#857). CSV-only sessions append.
+        let csv = parseCSV(files)
+        for d in csv.days {
+            var row = byDay[d.day] ?? WearableDailyRow(day: d.day)
+            row.totalSleepMin = row.totalSleepMin ?? d.totalSleepMin
+            row.deepMin = row.deepMin ?? d.deepMin
+            row.lightMin = row.lightMin ?? d.lightMin
+            row.remMin = row.remMin ?? d.remMin
+            row.awakeMin = row.awakeMin ?? d.awakeMin
+            row.efficiencyPct = row.efficiencyPct ?? d.efficiencyPct
+            row.restingHr = row.restingHr ?? d.restingHr
+            row.avgHrvMs = row.avgHrvMs ?? d.avgHrvMs
+            row.skinTempDevC = row.skinTempDevC ?? d.skinTempDevC
+            row.spo2Pct = row.spo2Pct ?? d.spo2Pct
+            row.steps = row.steps ?? d.steps
+            row.activeKcal = row.activeKcal ?? d.activeKcal
+            row.totalKcal = row.totalKcal ?? d.totalKcal
+            row.readinessScore = row.readinessScore ?? d.readinessScore
+            row.sleepScore = row.sleepScore ?? d.sleepScore
+            byDay[d.day] = row
+        }
+        sleeps.append(contentsOf: csv.sleeps)
+
         return (Array(byDay.values), sleeps)
+    }
+
+    // MARK: - CSV (Oura's "Export Data" trends / daily-summary CSV)
+    //
+    // Alongside the account-export JSON, Oura also lets a user export a per-day SUMMARY CSV (one row per
+    // calendar day, header + rows). The columns we read (diacritic/space-folded by HeaderNorm, so e.g.
+    // "Average HRV" to "average_hrv", "Total Sleep Duration" to "total_sleep_duration"):
+    //
+    //   date                         : the calendar day (YYYY-MM-DD or an ISO date/datetime).
+    //   total/deep/light/rem sleep   : SECONDS (Oura's CSV uses seconds, like the JSON) -> minutes.
+    //   awake time                   : SECONDS -> minutes.
+    //   sleep efficiency             : %.
+    //   average/lowest resting hr    : bpm (lowest is the night's sleeping floor).
+    //   average hrv                  : rMSSD ms.
+    //   respiratory rate             : breaths/min.
+    //   readiness/sleep score        : Oura's OWN scores, REFERENCE only (never NOOP Charge).
+    //   temperature deviation        : degrees C from baseline.
+    //   steps / activity (active) burn / total burn : daily activity.
+    //
+    // A lone `heartrate.csv` (timestamped HR samples, no daily summary) carries NO daily wellness/sleep
+    // row, so it folds to nothing here and the importer reports that honestly rather than failing opaquely
+    // (#857).
+
+    /// True if a CSV's normalized header set looks like an Oura per-day summary (a date column plus at
+    /// least one Oura wellness column). Used by brand detection so a CSV export routes to Oura.
+    static func looksLikeOuraCSV(_ normalizedHeaders: [String]) -> Bool {
+        let set = Set(normalizedHeaders)
+        guard set.contains(where: { dateKeys.contains($0) }) else { return false }
+        return set.contains(where: { ouraCSVSignalColumns.contains($0) })
+    }
+
+    /// Header keys (already HeaderNorm-normalized) that name the day column in an Oura CSV.
+    private static let dateKeys: Set<String> = ["date", "day", "summary_date", "calendar_date"]
+
+    /// Normalized columns that mark a CSV as an Oura DAILY summary (vs a raw `heartrate.csv` sample file).
+    private static let ouraCSVSignalColumns: Set<String> = [
+        "total_sleep_duration", "rem_sleep_duration", "deep_sleep_duration", "light_sleep_duration",
+        "sleep_efficiency", "average_hrv", "average_resting_heart_rate", "lowest_resting_heart_rate",
+        "readiness_score", "sleep_score", "respiratory_rate", "temperature_deviation",
+    ]
+
+    /// Parse Oura CSV files (daily summaries) into the same day/sleep model the JSON path produces. A CSV
+    /// that is only a raw HR-sample file (`heartrate.csv`) yields nothing, so the day stays honestly empty.
+    static func parseCSV(_ files: [String: Data]) -> (days: [WearableDailyRow], sleeps: [WearableSleepSession]) {
+        var byDay: [String: WearableDailyRow] = [:]
+        var sleeps: [WearableSleepSession] = []
+
+        for data in files.values {
+            let table = CSVTable(data: data)
+            guard looksLikeOuraCSV(table.normalizedHeaders) else { continue }
+            for cells in table.rows {
+                guard let key = cells.cell("date", "day", "summary_date", "calendar_date")
+                    .map(normalizeDayKey) else { continue }
+
+                var row = byDay[key] ?? WearableDailyRow(day: key)
+
+                // Sleep durations are SECONDS in Oura's CSV (as in the JSON) → minutes.
+                func minutes(_ keys: String...) -> Double? {
+                    for k in keys { if let v = cells.double(k), v > 0 { return v / 60.0 } }
+                    return nil
+                }
+                let total = minutes("total_sleep_duration", "total_sleep")
+                let deep = minutes("deep_sleep_duration", "deep_sleep")
+                let light = minutes("light_sleep_duration", "light_sleep")
+                let rem = minutes("rem_sleep_duration", "rem_sleep")
+                let awake = minutes("awake_time", "awake_duration", "time_awake")
+
+                row.totalSleepMin = row.totalSleepMin ?? total
+                row.deepMin = row.deepMin ?? deep
+                row.lightMin = row.lightMin ?? light
+                row.remMin = row.remMin ?? rem
+                row.awakeMin = row.awakeMin ?? awake
+                row.efficiencyPct = row.efficiencyPct
+                    ?? cells.double("sleep_efficiency", "efficiency").flatMap { $0 > 0 ? $0 : nil }
+
+                let restingHr = cells.double("average_resting_heart_rate", "resting_heart_rate")
+                    ?? cells.double("lowest_resting_heart_rate", "lowest_heart_rate")
+                if let rhr = restingHr, rhr > 0 { row.restingHr = row.restingHr ?? Int(rhr) }
+                if let hrv = cells.double("average_hrv", "hrv"), hrv > 0 { row.avgHrvMs = row.avgHrvMs ?? hrv }
+                if let temp = cells.double("temperature_deviation", "skin_temperature_deviation") {
+                    row.skinTempDevC = row.skinTempDevC ?? temp
+                }
+                if let spo2 = cells.double("spo2", "blood_oxygen", "average_spo2"), spo2 > 0 {
+                    row.spo2Pct = row.spo2Pct ?? spo2
+                }
+                if let steps = cells.double("steps"), steps >= 0 { row.steps = row.steps ?? Int(steps) }
+                if let kcal = cells.double("activity_burn", "active_calories", "active_burn"), kcal > 0 {
+                    row.activeKcal = row.activeKcal ?? kcal
+                }
+                if let total = cells.double("total_burn", "total_calories"), total > 0 {
+                    row.totalKcal = row.totalKcal ?? total
+                }
+                // Oura's OWN scores → REFERENCE only.
+                if let r = cells.double("readiness_score", "readiness"), r > 0 {
+                    row.readinessScore = row.readinessScore ?? Int(r)
+                }
+                if let s = cells.double("sleep_score"), s > 0 { row.sleepScore = row.sleepScore ?? Int(s) }
+
+                byDay[key] = row
+
+                // Build a sleep session when the CSV gave a bedtime window, so the night lands on the Sleep
+                // tab too (not just the daily rollup). Oura's CSV often carries `bedtime_start/_end`.
+                if let start = WhoopTime.parseISOWithOffset(cells.cell("bedtime_start", "sleep_start")),
+                   let end = WhoopTime.parseISOWithOffset(cells.cell("bedtime_end", "sleep_end")),
+                   end > start {
+                    sleeps.append(WearableSleepSession(
+                        start: start, end: end,
+                        deepMin: deep, lightMin: light, remMin: rem, awakeMin: awake,
+                        totalSleepMin: total, efficiencyPct: row.efficiencyPct,
+                        avgHr: nil,
+                        lowestHr: restingHr.flatMap { $0 > 0 ? Int($0) : nil },
+                        avgHrvMs: row.avgHrvMs,
+                        respRateBpm: cells.double("respiratory_rate", "average_breath").flatMap { $0 > 0 ? $0 : nil },
+                        sleepScore: nil, stages: []))
+                }
+            }
+        }
+
+        return (Array(byDay.values), sleeps)
+    }
+
+    /// Reduce an Oura CSV date/datetime cell to the `YYYY-MM-DD` day key (drops any time component).
+    private static func normalizeDayKey(_ raw: String) -> String {
+        let trimmed = raw.trimmingCharacters(in: .whitespaces)
+        // "2026-06-01", "2026-06-01T23:15:00+00:00", or "2026-06-01 23:15:00" → "2026-06-01".
+        if trimmed.count >= 10 {
+            let head = String(trimmed.prefix(10))
+            if head.count == 10, head[head.index(head.startIndex, offsetBy: 4)] == "-" { return head }
+        }
+        return trimmed
     }
 
     // MARK: - Helpers

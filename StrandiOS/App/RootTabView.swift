@@ -212,7 +212,7 @@ struct RootTabView: View {
         // Each primary tab gets its OWN NavigationStack so the in-content NavigationLinks (e.g. the Today
         // dashboard card rows) both navigate AND render opaque. An ORPHANED NavigationLink (no
         // NavigationStack ancestor) renders its whole label in a disabled/translucent state — that was
-        // washing the Today cards over the hero scene and dimming their text to grey (Aaron 2026-06-23).
+        // washing the Today cards over the hero scene and dimming their text to grey (2026-06-23).
         // The root view hides the system nav bar (each screen draws its own in-content header); pushed
         // detail screens get their own nav bar + back button.
         NavigationStack {

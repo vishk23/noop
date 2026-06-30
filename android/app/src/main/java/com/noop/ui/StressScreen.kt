@@ -222,7 +222,7 @@ private fun androidx.compose.foundation.lazy.LazyListScope.StressContent(
 
 // MARK: - 1 · Hero — the NOOP count-up PipBar (the needle/speedometer is gone)
 //
-// Aaron's call mirrored from iOS: "remove the needle, it's not needed" + "straight
+// Design call mirrored from iOS: "remove the needle, it's not needed" + "straight
 // horizontal bars that almost count up separated by pips". So the hero reads as one clean
 // WHOOP-style block — a big WHITE CountUpText value with "of 3" + the band word beside it,
 // over a PipBar on the 0…3 scale tinted by the live stress band (calm blue → steady green →

@@ -283,7 +283,7 @@ struct StressView: View {
 
     // MARK: 1 · Hero — the NOOP count-up PipBar (the needle/speedometer is gone).
     //
-    // Aaron's call: "remove the needle, it's not needed" + "straight horizontal bars that
+    // Design call: "remove the needle, it's not needed" + "straight horizontal bars that
     // almost count up separated by pips". So the hero reads as one clean WHOOP-style block —
     // a big white CountUpText value with "of 3" + the band word beside it, over a PipBar on the
     // 0…3 scale tinted by the live stress band (calm blue → steady green → tense amber). Flat,

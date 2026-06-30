@@ -177,6 +177,12 @@ public final class LiveState: ObservableObject {
     /// (cmd 76 — sent in the connect handshake, parsed by FrameRouter). nil until the first reply.
     /// WHOOP 4.0 only; the rename control in Settings shows this as the strap's current name.
     @Published public var advertisingName: String? = nil
+    /// The connected strap's firmware version, read during the connect handshake: WHOOP 4.0 via
+    /// REPORT_VERSION_INFO (`fw_harvard`), WHOOP 5/MG via GET_HELLO (`fw_version`). FrameRouter
+    /// publishes it; the Devices card shows it next to battery. nil until the reply lands, and
+    /// cleared on disconnect so a stale version can't outlive the link. Twin of the Android
+    /// LiveState.strapFirmware.
+    @Published public var strapFirmware: String? = nil
     /// Transient, human-readable result of the most recent strap-rename attempt — the
     /// SET_ADVERTISING_NAME_HARVARD ack, or a local validation message from BLEManager.renameStrap.
     /// Surfaced under the rename field; overwritten by the next attempt.

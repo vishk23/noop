@@ -17,6 +17,10 @@ public enum WhoopCommand: UInt8, CaseIterable {
     case getBatteryLevel       = 26
     case getDataRange          = 34
     case getHelloHarvard       = 35
+    /// WHOOP 5.0/MG hello (the puffin generation's GET_HELLO). The response carries the device name
+    /// and the firmware version (`fw_version` a.b.c.d), which we surface on the Devices card. A WHOOP
+    /// 4.0 answers "unsupported" and ignores it, so this is only sent to a 5/MG strap. Read-only.
+    case getHello              = 145
     case getAdvertisingNameHarvard = 76
     /// SET_ADVERTISING_NAME_HARVARD (77) — rename the strap's BLE advertising name on a WHOOP 4.0
     /// (Harvard). Payload = `advertisingNamePayload(_:)` (a 2-byte header + UTF-8 name + trailing NUL,
@@ -89,6 +93,7 @@ public enum WhoopCommand: UInt8, CaseIterable {
         case .getBatteryLevel:       return "Get Battery Level"
         case .getDataRange:          return "Get Data Range"
         case .getHelloHarvard:       return "Get Hello (Harvard)"
+        case .getHello:              return "Get Hello (5/MG)"
         case .getAdvertisingNameHarvard: return "Get Advertising Name (Harvard)"
         case .setAdvertisingNameHarvard: return "Set Advertising Name (Harvard)"
         case .startRawData:          return "Start Raw Data"

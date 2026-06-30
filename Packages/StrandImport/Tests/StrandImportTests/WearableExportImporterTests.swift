@@ -81,6 +81,84 @@ final class WearableExportImporterTests: XCTestCase {
         XCTAssertEqual(r.sleeps[0].totalSleepMin!, 360, accuracy: 1e-6)
     }
 
+    // MARK: - Oura CSV (the "Export Data" daily-summary CSV, and the raw heart-rate CSV) #857
+
+    func testOuraDailySummaryCSVFoldsDaysAndSleep() {
+        // A representative Oura daily-summary CSV: header + two days. Durations are SECONDS (Oura's CSV,
+        // like the JSON). Columns mix spaces / case so HeaderNorm has to normalize them.
+        let csv = """
+        date,Total Sleep Duration,Deep Sleep Duration,REM Sleep Duration,Light Sleep Duration,Awake Time,Sleep Efficiency,Average Resting Heart Rate,Average HRV,Respiratory Rate,Temperature Deviation,Readiness Score,Sleep Score,Steps,Activity Burn
+        2026-06-01,25200,5400,6000,13800,900,92,49,65,14.2,-0.2,81,84,8421,520
+        2026-06-02,21600,4800,5400,11400,600,90,51,58,14.6,0.1,76,79,9300,610
+        """
+        let files = ["oura_daily.csv": bytes(csv)]
+        XCTAssertEqual(WearableExportImporter.detectBrand(files), .oura)
+
+        let r = WearableExportImporter.parse(brand: .oura, files: files)
+        XCTAssertEqual(r.days.count, 2)
+        let byDay = Dictionary(uniqueKeysWithValues: r.days.map { ($0.day, $0) })
+
+        let d1 = byDay["2026-06-01"]!
+        XCTAssertEqual(d1.totalSleepMin!, 420, accuracy: 1e-6)   // 25200s → 420 min
+        XCTAssertEqual(d1.deepMin!, 90, accuracy: 1e-6)
+        XCTAssertEqual(d1.remMin!, 100, accuracy: 1e-6)
+        XCTAssertEqual(d1.efficiencyPct!, 92, accuracy: 1e-6)
+        XCTAssertEqual(d1.restingHr, 49)
+        XCTAssertEqual(d1.avgHrvMs!, 65, accuracy: 1e-6)
+        XCTAssertEqual(d1.skinTempDevC!, -0.2, accuracy: 1e-6)
+        XCTAssertEqual(d1.steps, 8421)
+        XCTAssertEqual(d1.activeKcal!, 520, accuracy: 1e-6)
+        // Oura's OWN scores stay REFERENCE only.
+        XCTAssertEqual(d1.readinessScore, 81)
+        XCTAssertEqual(d1.sleepScore, 84)
+
+        let d2 = byDay["2026-06-02"]!
+        XCTAssertEqual(d2.totalSleepMin!, 360, accuracy: 1e-6)   // 21600s → 360 min
+        XCTAssertEqual(d2.restingHr, 51)
+    }
+
+    func testOuraJSONStillWinsOverCSVForSameDay() {
+        // A mixed export (JSON + CSV) for the same day: the richer JSON value must win, CSV fills gaps.
+        let json = """
+        { "daily_readiness": [ { "day": "2026-06-01", "score": 81,
+            "contributors": { "resting_heart_rate": 49 } } ] }
+        """
+        let csv = """
+        date,Average Resting Heart Rate,Steps
+        2026-06-01,77,8421
+        """
+        let files: [String: Data] = ["oura.json": bytes(json), "oura_daily.csv": bytes(csv)]
+        let r = WearableExportImporter.parse(brand: .oura, files: files)
+        let d = r.days.first { $0.day == "2026-06-01" }!
+        XCTAssertEqual(d.restingHr, 49)   // JSON readiness RHR wins over the CSV's 77
+        XCTAssertEqual(d.steps, 8421)     // CSV fills the step gap JSON lacked
+    }
+
+    func testLoneHeartRateCSVRoutesToOuraButImportsNoDailyData() {
+        // The exact #857 input: a single raw `heartrate.csv` (timestamped samples, no daily summary). It
+        // must route to Oura (so we can speak to it) yet fold to NOTHING, no fabricated day.
+        let csv = """
+        timestamp,heart_rate
+        2026-06-01T09:00:00+00:00,62
+        2026-06-01T09:01:00+00:00,64
+        """
+        let files = ["heartrate.csv": bytes(csv)]
+        XCTAssertEqual(WearableExportImporter.detectBrand(files), .oura)
+        XCTAssertTrue(WearableExportImporter.onlyHeartRateCSV(files))
+        let r = WearableExportImporter.parse(brand: .oura, files: files)
+        XCTAssertTrue(r.days.isEmpty)
+        XCTAssertTrue(r.sleeps.isEmpty)
+    }
+
+    func testImportErrorIsHonestNotOpaqueErreur4() {
+        // The honest-message fix (#857): ImportError now conforms to LocalizedError, so the surfaced
+        // localizedDescription is a real sentence, not the positional NSError "…ImportError erreur 4".
+        let err = ImportError.emptyExport("That file is Oura's raw heart-rate log")
+        XCTAssertEqual(err.errorDescription, err.description)
+        XCTAssertTrue(err.localizedDescription.contains("heart-rate log"))
+        XCTAssertFalse(err.localizedDescription.lowercased().contains("erreur"))
+    }
+
     // MARK: - Fitbit
 
     func testFitbitSleepRestingHrSteps() {

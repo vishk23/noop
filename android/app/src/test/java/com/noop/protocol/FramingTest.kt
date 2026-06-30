@@ -232,6 +232,37 @@ class FramingTest {
         assertEquals(91.2, r.parsed["battery_pct"] as Double, 1e-9)
     }
 
+    /** Build a CRC-valid WHOOP4 COMMAND_RESPONSE (type 0x24) frame for a given resp_cmd + payload,
+     *  computing crc8(length) and crc32(inner) exactly as the strap would, so the decode vector
+     *  cross-checks the decoder instead of agreeing with a hand-typed checksum. */
+    private fun whoop4CommandResponse(cmd: Int, payload: ByteArray): ByteArray {
+        val inner = byteArrayOf(0x24, 0x00, cmd.toByte()) + payload   // type, seq, resp_cmd, payload
+        val length = 4 + inner.size                                    // crc32 sits at offset = length
+        val out = ByteArray(length + 4)
+        out[0] = 0xAA.toByte()
+        out[1] = (length and 0xFF).toByte()
+        out[2] = ((length ushr 8) and 0xFF).toByte()
+        out[3] = Crc.crc8(byteArrayOf(out[1], out[2])).toByte()
+        inner.copyInto(out, 4)
+        val crc32 = Crc.crc32(inner)
+        for (i in 0..3) out[length + i] = ((crc32 ushr (8 * i)) and 0xFFL).toByte()
+        return out
+    }
+
+    @Test
+    fun parse_commandResponse_reportVersionInfo_fwHarvard() {
+        // COMMAND_RESPONSE REPORT_VERSION_INFO(7): fw_harvard = four LE u32 at payload[3,7,11,15].
+        // payload[0..2] are status bytes (ignored); the four versions spell 41.16.6.0.
+        val payload = ByteArray(19)
+        fun le32(at: Int, v: Int) { for (i in 0..3) payload[at + i] = ((v ushr (8 * i)) and 0xFF).toByte() }
+        le32(3, 41); le32(7, 16); le32(11, 6); le32(15, 0)
+        val r = Framing.parseFrame(whoop4CommandResponse(CommandNumber.REPORT_VERSION_INFO.rawValue, payload))
+        assertTrue(r.ok)
+        assertEquals(true, r.crcOk)
+        assertEquals("COMMAND_RESPONSE", r.typeName)
+        assertEquals("41.16.6.0", r.parsed["fw_harvard"])
+    }
+
     @Test
     fun parse_corruptedCrc_reportsCrcFalse() {
         // Flip a payload byte so the CRC32 no longer matches; the frame is still well-formed (ok),
@@ -300,6 +331,21 @@ class FramingTest {
         val out = r.feed(garbage + good)
         assertEquals(1, out.size)
         assertArrayEquals(good, out[0])
+    }
+
+    @Test
+    fun reassembler_reassemblesWhenFedOneByteAtATime() {
+        // Two back-to-back frames, fed a single byte per fragment. This is the worst case for the old
+        // removeAt(0) drain (O(n^2)) and exercises the offset/compact window hard: head advances byte by
+        // byte, compact() slides the tail every feed(). Output must still be the two exact frames, in order.
+        val first = Framing.buildCommand(CommandNumber.GET_BATTERY_LEVEL, byteArrayOf(0), seq = 0)
+        val second = Framing.buildCommand(CommandNumber.GET_CLOCK, byteArrayOf(0), seq = 1)
+        val r = Reassembler()
+        val out = ArrayList<ByteArray>()
+        for (b in first + second) out += r.feed(byteArrayOf(b))
+        assertEquals(2, out.size)
+        assertArrayEquals(first, out[0])
+        assertArrayEquals(second, out[1])
     }
 
     @Test

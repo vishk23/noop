@@ -353,6 +353,13 @@ final class Repository: ObservableObject {
     static let appleHealthSource = "apple-health"
     static let healthConnectSource = "health-connect"
 
+    /// Imported wearable-export sources whose DAILY aggregates (HRV / resting HR / sleep) can be scored
+    /// for a NOOP Charge/Rest on an import-only day, exactly like a live day (#823). These carry no raw HR
+    /// stream, so the source-only fold in IntelligenceEngine scores them from the daily aggregate vs the
+    /// person's own baseline. Matches `WearableBrand.sourceId` plus Health Connect (Android imports HC's
+    /// daily metrics under the strap source, but a sideloaded/standalone HC source id is covered too).
+    static let wearableImportSources = ["oura-import", "fitbit-import", "garmin-import", healthConnectSource]
+
     /// `yyyy-MM-dd` in the device's local zone, matching how `DailyMetric.day` is stored.
     private static let dayKeyFormatter: DateFormatter = {
         let f = DateFormatter(); f.dateFormat = "yyyy-MM-dd"; f.locale = Locale(identifier: "en_US_POSIX"); return f
@@ -484,6 +491,18 @@ final class Repository: ObservableObject {
     /// newer one. Each call captures the token at entry and only publishes if it is still the latest. Not
     /// @Published (pure ordering, never drives the UI); race-free since Repository is @MainActor.
     private var refreshGen = 0
+
+    /// #849: the `refreshSeq` value at which Today last ran its heavy history-wide reload (the ~40 reads +
+    /// per-day raw-HR pass). Lives HERE, on the long-lived Repository, not in TodayView's `@State`, so it
+    /// SURVIVES a Today re-mount (tab-away + return / an Apple-Health import that recreates the view). A bare
+    /// re-mount resets TodayView's `@State` but `refreshSeq` is unchanged, so the screen re-ran the full
+    /// reload for byte-identical data every time. Today now compares this against the live `refreshSeq` and
+    /// skips the reload when nothing has changed since it last loaded. `-1` = never loaded this launch, so the
+    /// first load (seq 0) always runs. Not @Published (pure load-bookkeeping, never drives the UI).
+    var todayHistoryWideLoadedSeq = -1
+    /// #849: the last history-wide snapshot Today built, so a re-mount can RESTORE it (in-memory, no queries)
+    /// instead of re-running the heavy reload. Paired with `todayHistoryWideLoadedSeq`. Not @Published.
+    var todayHistoryWideCache: TodayHistoryWideCache?
 
     func refresh(days nDays: Int = 4000) async {
         guard let store = await ensureStore() else { return }
