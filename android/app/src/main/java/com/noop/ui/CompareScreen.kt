@@ -44,6 +44,8 @@ import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.StrokeJoin
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.semantics.clearAndSetSemantics
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
@@ -324,6 +326,11 @@ private object CorrelationEngine {
 fun CompareScreen(vm: AppViewModel) {
     val days by vm.recentDays.collectAsStateWithLifecycle()
 
+    // Liquid finish (pilot pattern): the time-of-day sky settles behind the top of the screen, gated on the
+    // same day-cycle-background preference the liquid Today honours. Off = the flat dark canvas path.
+    val context = LocalContext.current
+    val showDayCycleBackground = remember { NoopPrefs.showDayCycleBackground(context) }
+
     val maxSelection = 4
     val minSelection = 2
 
@@ -401,7 +408,13 @@ fun CompareScreen(vm: AppViewModel) {
         if (anyWidened) "$base · sparse widened" else base
     }
 
-    LazyScreenScaffold(title = "Compare", subtitle = "Overlay signals, draw conclusions.") {
+    LazyScreenScaffold(
+        title = "Compare",
+        subtitle = "Overlay signals, draw conclusions.",
+        // Liquid sky backdrop (LiquidScreenSky.kt) in the scaffold's topBackground slot, gated on the
+        // day-cycle preference — the same pilot plumbing the liquid Today uses.
+        topBackground = if (showDayCycleBackground) { { LiquidScreenSky() } } else null,
+    ) {
 
         // ── Metric picker section (chips + range control)
         item {
@@ -646,9 +659,14 @@ private fun MetricChip(
     modifier: Modifier = Modifier,
 ) {
     val shape = RoundedCornerShape(50)
+    // liquidPress on the whole pick chip, driven by the SAME interactionSource that drives its only tap
+    // target (the remove ✕) — so pressing to remove settles the chip inward, the pilot's tappable-card feel.
+    // The remove gesture is unchanged (still the ✕ tap → onRemove).
+    val interaction = remember { MutableInteractionSource() }
     Row(
         modifier = modifier
             .clip(shape)
+            .liquidPress(interaction)
             .background(Palette.surfaceOverlay)
             .border(1.dp, color.copy(alpha = 0.4f), shape)
             .padding(horizontal = 11.dp, vertical = 8.dp),
@@ -676,7 +694,11 @@ private fun MetricChip(
             modifier = Modifier
                 .size(18.dp)
                 .clip(CircleShape)
-                .clickableNoRippleLocal(enabled = true) { onRemove() }
+                .clickable(
+                    interactionSource = interaction,
+                    indication = null,
+                    onClick = onRemove,
+                )
                 .padding(3.dp),
         )
     }
@@ -969,7 +991,27 @@ private fun PairCard(p: PairResult) {
                     modifier = Modifier.weight(1f),
                 )
                 TrendChip(text = signedR(p.r), color = tint)
-                Text("r = ${signedR(p.r)}", style = NoopType.number(18f), color = tint)
+                // Small liquid vessel accent for the headline single value: |r| fills the vessel in the
+                // relationship's own tint, with the signed r rolled up over it (white, tabular, hit-
+                // transparent so a tap falls through). Same r, same tint, same signedR formatting the plain
+                // "r = …" readout used — just visualised as a headline vessel. STATIC (animated = false):
+                // up to six of these render in a scrolling list, so they pose once (the pilot's small-gauge
+                // static-raster rule) rather than each running a live clock.
+                Box(modifier = Modifier.size(38.dp), contentAlignment = Alignment.Center) {
+                    LiquidVessel(
+                        value = abs(p.r).coerceIn(0.0, 1.0),
+                        tint = tint,
+                        animated = false,
+                        modifier = Modifier.size(38.dp),
+                    )
+                    CountUpText(
+                        value = p.r,
+                        format = { signedR(it) },
+                        style = NoopType.number(12f, weight = FontWeight.Bold),
+                        color = Color.White,
+                        modifier = Modifier.clearAndSetSemantics {},
+                    )
+                }
             }
 
             Text(insightSentence(p), style = NoopType.subhead, color = Palette.textSecondary)

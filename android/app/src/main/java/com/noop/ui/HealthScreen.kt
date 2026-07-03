@@ -4,6 +4,7 @@ import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -42,6 +43,7 @@ import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.Path
+import androidx.compose.ui.graphics.Shadow
 import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.StrokeJoin
 import androidx.compose.ui.graphics.drawscope.Stroke
@@ -49,9 +51,12 @@ import androidx.compose.ui.graphics.nativeCanvas
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.graphics.toArgb
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.semantics.clearAndSetSemantics
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.compose.LocalLifecycleOwner
@@ -127,9 +132,18 @@ fun HealthScreen(
     val bpm by vm.bpm.collectAsStateWithLifecycle()
     val hasLiveHr by remember { derivedStateOf { displayHr(bpm, live) != null } }
 
+    // LIQUID SKY BACKDROP (the pilot pattern — LiquidScreenSky.kt): the time-of-day liquid sky settles into
+    // the theme canvas behind this screen's top region, full-bleed up behind the status bar via the
+    // scaffold's topBackground plumbing, replacing the classic scene backdrop. Static (LiquidSkyStatic,
+    // inside the helper) — never an animated sky behind a scrolling list. Gated on the shared "Day-cycle
+    // background" pref (default ON) exactly like Today; OFF passes null so the scaffold paints the flat
+    // surface canvas instead.
+    val showDayCycleBackground = remember { NoopPrefs.showDayCycleBackground(context) }
+
     LazyScreenScaffold(
         title = "Health Monitor",
         subtitle = "Live vitals, streamed from the strap.",
+        topBackground = if (showDayCycleBackground) { { LiquidScreenSky() } } else null,
     ) {
         if (today == null && !hasLiveHr) {
             // Even with no history yet, a freshly-connected strap can be told to sync now (#364) — the
@@ -341,9 +355,17 @@ private fun RecordRow(
     subtitle: String,
     onClick: () -> Unit,
 ) {
+    // liquidPress on the whole tappable row — the SAME interactionSource drives the clickable + the press
+    // so the card settles inward on tap (the pilot LiquidPressStyle feel). Nav route is unchanged.
+    val interaction = remember { MutableInteractionSource() }
     NoopCard(
         modifier = Modifier
-            .clickable(onClick = onClick)
+            .liquidPress(interaction)
+            .clickable(
+                interactionSource = interaction,
+                indication = null,
+                onClick = onClick,
+            )
             .semantics { contentDescription = "$title. $subtitle" },
         padding = Metrics.space16,
     ) {
@@ -667,18 +689,20 @@ private fun VitalityHero(
     val sorted = contributions.sortedBy { it.lnHazard }
     val best = sorted.firstOrNull()
     val worst = sorted.lastOrNull()
-    NoopCard(tint = Palette.chargeColor) {
+    // The frosted liquid hero-card wrapper floats the vessel + white count-up over the sky (the pilot).
+    LiquidHeroCard {
         Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
             Row(modifier = Modifier.fillMaxWidth(), verticalAlignment = Alignment.Top) {
                 Column(modifier = Modifier.weight(1f)) {
                     Overline("Vitality")
-                    // WHITE (textPrimary) headline that ticks up — matches HealthView.swift's reset: the
-                    // synthesis number is neutral, not the charge/recovery hue.
-                    CountUpText(
+                    // The Vitality 0–100 rides a filling LiquidVessel on the charge world, the count-up
+                    // number rolled up over it (white, tabular) — the Today HeroScoreVessel idiom. Same
+                    // value + fraction (vitality / 100) as the bare headline this replaced.
+                    HealthHeroVessel(
+                        fraction = vitality / 100.0,
                         value = vitality,
-                        format = { it.roundToInt().toString() },
-                        style = NoopType.display(56f),
-                        color = Palette.textPrimary,
+                        tint = Palette.chargeColor,
+                        diameter = 96.dp,
                     )
                     Text("out of 100", style = NoopType.footnote, color = Palette.textTertiary)
                 }
@@ -713,6 +737,69 @@ private fun VitalityHero(
     }
 }
 
+// MARK: - Liquid hero-card wrapper + hero vessel (the pilot idiom)
+//
+// The frosted translucent-black hero-card wrapper (mock rgba(13,14,20,.80), radius 26, white@0.11
+// hairline) that floats the hero over the day-of-sky so the vessel + white count-up stay crisp — the
+// card does the contrast work, not a muted sky. Byte-matched to the Today pilot's LIQUID_HERO_* values.
+private val HEALTH_HERO_FILL: Color =
+    Color(red = 13f / 255f, green = 14f / 255f, blue = 20f / 255f, alpha = 0.80f)
+private val HEALTH_HERO_RADIUS: Dp = 26.dp
+
+/** Wrap a hero's content in the frosted liquid glass surface so it floats over the sky backdrop. Applied
+ *  to the HERO cards only (Fitness Age, Vitality), matching the pilot's heroCard: the content sits DIRECTLY
+ *  in the translucent box (no inner NoopCard surface to double up on the glass), padded like a card. */
+@Composable
+private fun LiquidHeroCard(content: @Composable () -> Unit) {
+    Box(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(HEALTH_HERO_RADIUS))
+            .background(HEALTH_HERO_FILL)
+            .border(1.dp, Color.White.copy(alpha = 0.11f), RoundedCornerShape(HEALTH_HERO_RADIUS))
+            .padding(Metrics.cardPadding),
+    ) {
+        content()
+    }
+}
+
+/**
+ * The health hero gauge: a [LiquidVessel] filled to [fraction] (0..1) in the domain [tint], with a
+ * [CountUpText] rolled up over it — white, tabular, a soft shadow, hit-transparent so a tap falls through
+ * to the vessel (which owns its own splash+haptic). The Today `HeroScoreVessel` idiom, reused verbatim so
+ * the Fitness Age / Vitality numbers ride a filling vessel instead of a bare hand-drawn gauge. The number
+ * size tracks the diameter (≈0.27×, capped) so the vessel and numeral stay balanced. Values/fraction/tint
+ * are the SAME as the number this replaced — presentation only.
+ */
+@Composable
+private fun HealthHeroVessel(
+    fraction: Double,
+    value: Double,
+    tint: Color,
+    diameter: Dp,
+    modifier: Modifier = Modifier,
+    animated: Boolean = true,
+    format: (Double) -> String = { it.roundToInt().toString() },
+) {
+    Box(modifier = modifier.size(diameter), contentAlignment = Alignment.Center) {
+        LiquidVessel(
+            value = fraction.coerceIn(0.0, 1.0),
+            tint = tint,
+            animated = animated,
+            modifier = Modifier.size(diameter),
+        )
+        val numberSp = (diameter.value * 0.27f).coerceIn(20f, 30f)
+        CountUpText(
+            value = value,
+            format = format,
+            style = NoopType.number(numberSp, weight = FontWeight.Bold)
+                .copy(shadow = Shadow(color = Color.Black.copy(alpha = 0.5f), offset = Offset(0f, 1f), blurRadius = 6f)),
+            color = Color.White,
+            modifier = Modifier.clearAndSetSemantics {},
+        )
+    }
+}
+
 /** The hero tile: a big Fitness Age number on the gold Charge world, the younger/older read-out, an
  *  optional VO₂max chip, the honest ± band caption, and a "How accurate is this?" toggle. */
 @Composable
@@ -732,20 +819,31 @@ private fun FitnessAgeHero(
         younger -> "$deltaYears ${yearWord(deltaYears)} younger than your age"
         else -> "${kotlin.math.abs(deltaYears)} ${yearWord(deltaYears)} older than your age"
     }
+    // Vessel fill: a bounded, honest reading of the SAME younger/older signal the card already states,
+    // mapped across the ±5 yr band the section advertises — "about your age" is half-full, younger fills
+    // it up, older empties it, clamped to the band. Presentation only; the shown number is unchanged.
+    val youthFraction = if (chronoAge > 0) {
+        (0.5 + (chronoAge - fitnessAge) / 10.0).coerceIn(0.0, 1.0)
+    } else 0.5
 
-    NoopCard(tint = Palette.chargeColor) {
+    // The "How accurate is this?" toggle presses inward on tap (the pilot liquidPress feel); the SAME
+    // interactionSource drives its clickable + press.
+    val howAccurateInteraction = remember { MutableInteractionSource() }
+
+    // The frosted liquid hero-card wrapper floats the vessel + white count-up over the sky (the pilot).
+    LiquidHeroCard {
         Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
             Row(modifier = Modifier.fillMaxWidth(), verticalAlignment = Alignment.Top) {
                 Column(modifier = Modifier.weight(1f)) {
                     Overline("Fitness Age")
-                    // The hero age is WHITE (textPrimary) and ticks up on appear / weekly refresh — the key
-                    // iOS reset: the headline number is the neutral synthesis colour, NOT the recovery/charge
-                    // hue. Mirrors HealthView.swift's `CountUpText(..., color: textPrimary)`.
-                    CountUpText(
+                    // The hero age rides a filling LiquidVessel on the gold Charge world, the age number
+                    // rolled up over it (white, tabular) — the Today HeroScoreVessel idiom. The shown NUMBER
+                    // is the same value (fitnessAge, rounded) as the bare headline this replaced.
+                    HealthHeroVessel(
+                        fraction = youthFraction,
                         value = shown.toDouble(),
-                        format = { it.roundToInt().toString() },
-                        style = NoopType.display(56f),
-                        color = Palette.textPrimary,
+                        tint = Palette.chargeColor,
+                        diameter = 96.dp,
                     )
                     Text(
                         text = deltaWord,
@@ -773,7 +871,12 @@ private fun FitnessAgeHero(
             Row(
                 modifier = Modifier
                     .clip(RoundedCornerShape(Metrics.cornerSm))
-                    .clickable(onClick = onHowAccurate)
+                    .liquidPress(howAccurateInteraction)
+                    .clickable(
+                        interactionSource = howAccurateInteraction,
+                        indication = null,
+                        onClick = onHowAccurate,
+                    )
                     .padding(vertical = Metrics.space4)
                     .semantics { contentDescription = "How accurate is this Fitness Age?" },
                 verticalAlignment = Alignment.CenterVertically,
@@ -1345,10 +1448,19 @@ private fun VitalsSection(
                 horizontalArrangement = Arrangement.spacedBy(Metrics.gap),
             ) {
                 rowVitals.forEach { v ->
+                    // liquidPress on the tappable vital tile — the SAME interactionSource drives its
+                    // clickable + the press so the whole tile settles inward on tap (the pilot feel).
+                    // Keyed on the vital key so each tile keeps a stable source across recomposition.
+                    // The detail route (onVitalClick) is unchanged.
+                    val tileInteraction = remember(v.key) { MutableInteractionSource() }
                     VitalTile(
                         modifier = Modifier
                             .weight(1f)
-                            .clickable { onVitalClick(v.key) }
+                            .liquidPress(tileInteraction)
+                            .clickable(
+                                interactionSource = tileInteraction,
+                                indication = null,
+                            ) { onVitalClick(v.key) }
                             .semantics { contentDescription = v.accessibilityText },
                         vital = v,
                         value = v.formattedValue ?: "—",

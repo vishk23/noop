@@ -3,6 +3,7 @@ package com.noop.ui
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -75,13 +76,18 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.Shadow
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.semantics.clearAndSetSemantics
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import com.noop.analytics.WorkoutSport
 import com.noop.data.WorkoutRow
@@ -190,7 +196,16 @@ fun WorkoutsScreen(vm: AppViewModel) {
     // range/window/group computation that the eager column re-derived inline. The dialog overlay below the
     // scaffold is untouched. The All-Sessions list still lives inside its single enclosing card (appearance
     // is byte-identical) — see the report note on why it isn't flattened to top-level items here.
-    LazyScreenScaffold(title = "Workouts", subtitle = "Every session, threaded together.") {
+    LazyScreenScaffold(
+        title = "Workouts",
+        subtitle = "Every session, threaded together.",
+        // LIQUID SKY BACKDROP (the pilot pattern — LiquidScreenSky.kt): the time-of-day liquid sky settles
+        // into the theme canvas behind the header + top rows (bled full-width up behind the status bar via
+        // the scaffold's topBackground plumbing), and the cards float OVER it on the flat surface below. The
+        // Android equivalent of the iOS `ScreenScaffold(topBackground: liquidScaffoldSky())`. This screen has
+        // no day-cycle preference gate (unlike Today), so the sky is always on.
+        topBackground = { LiquidScreenSky() },
+    ) {
         // Start (or stop) a workout right here, not only on Live — mirrors the Live control (#115).
         item {
         WorkoutStartSection(vm)
@@ -575,12 +590,24 @@ private fun MergeSportDialog(onDismiss: () -> Unit, onPick: (String) -> Unit) {
 /** #64: the selection key for a row (its natural key), stable across a reload so checkmarks persist. */
 private fun sessionSelectionKey(row: WorkoutRow): String = "${row.startTs}|${row.sport}"
 
-// MARK: - Effort hero (weekly effort over a scenic Effort backdrop)
+// MARK: - Liquid hero tokens (the liquid Workouts restyle)
 //
-// A Bevel hero for the windowed range: the typical session Effort on the shared layered StrainGauge,
-// floated over an Effort-tinted ScenicHeroBackground, with the session count + total time alongside.
-// The gauge reads the AVERAGE per-session strain (the stored 0–100 Effort axis mapped to the gauge's
-// 0–21 span, exactly like the Today effort hero); the headline number is shown on the user's scale.
+// The frosted card the Effort vessel floats on, mirroring the iOS/Today LiquidTodayView heroCard. `fill`
+// is a translucent near-black (mock rgba(13,14,20,.80)) so it floats over the day-of-sky; the vessel + the
+// white count-up read crisp on it. Radius 26 + a white@0.11 hairline give the frosted-glass edge. (These
+// are file-scoped to Workouts — the Today equivalents are private to that file.)
+private val LIQUID_HERO_FILL: Color = Color(red = 13f / 255f, green = 14f / 255f, blue = 20f / 255f, alpha = 0.80f)
+private val LIQUID_HERO_RADIUS: Dp = 26.dp
+
+// MARK: - Effort hero (typical-effort liquid vessel over the day-of-sky)
+//
+// The liquid restyle of the Effort hero: the typical session Effort as a filling LiquidVessel with the
+// headline number counting up over it (the Today HeroScoreVessel idiom), inside a translucent near-black
+// frosted card that floats over the screen-level liquid sky. The vessel FILL fraction reads the AVERAGE
+// per-session strain on the stored 0–100 Effort axis (scale-independent, so the fill is identical whether
+// the user's display scale is Effort 0–100 or WHOOP 0–21); the count-up NUMBER is shown on the user's
+// scale via UnitFormatter, exactly as the old StrainGauge label was. The scenic backdrop + BevelGauge are
+// gone — the frosted card does the contrast work over the sky, matching the iOS liquid hero.
 
 @Composable
 private fun EffortHero(
@@ -590,53 +617,76 @@ private fun EffortHero(
 ) {
     val effortScale = UnitPrefs.effortScale(LocalContext.current)
     val strains = rows.mapNotNull { it.strain }
+    val hasEffort = strains.isNotEmpty()
     val avgStrain = if (strains.isEmpty()) 0.0 else strains.sum() / strains.size
+    // Fill fraction on the stored 0–100 Effort axis — scale-independent, so the vessel fills the same on
+    // either display scale. The count-up number below tracks the user's chosen scale.
+    val fraction = (avgStrain / 100.0).coerceIn(0.0, 1.0)
+    val shownEffort = UnitFormatter.effortValue(avgStrain, effortScale)
     val totalTimeH = rows.mapNotNull { it.durationS }.sum() / 3600.0
     val modal = groups.firstOrNull()
 
+    // The liquid hero CARD: a translucent near-black that floats over the day-of-sky so the vessel + white
+    // count-up read crisp. Radius 26 + a faint white hairline give the frosted-glass edge of the iOS liquid
+    // heroCard (heroFill = rgba(13,14,20,.80), stroke white@0.11). Matches the Today pilot.
     Box(
         modifier = Modifier
             .fillMaxWidth()
-            .clip(RoundedCornerShape(Metrics.cardRadius)),
+            .clip(RoundedCornerShape(LIQUID_HERO_RADIUS))
+            .background(LIQUID_HERO_FILL)
+            .border(1.dp, Color.White.copy(alpha = 0.11f), RoundedCornerShape(LIQUID_HERO_RADIUS))
+            .padding(20.dp),
     ) {
-        ScenicHeroBackground(modifier = Modifier.matchParentSize(), domain = DomainTheme.Effort)
-        NoopCard(padding = 20.dp, tint = Palette.effortColor) {
-            Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
-                Column(
-                    horizontalAlignment = Alignment.CenterHorizontally,
-                    verticalArrangement = Arrangement.spacedBy(18.dp),
-                ) {
-                    Overline("Typical effort", color = Palette.effortColor)
-                    StrainGauge(
-                        strain = UnitFormatter.effortValue(avgStrain, effortScale),
-                        outOf = if (effortScale == EffortScale.WHOOP) 21.0 else 100.0,
-                        valueText = UnitFormatter.effortDisplay(avgStrain, effortScale),
-                        diameter = 140.dp,
-                        lineWidth = 14.dp,
-                        showsLabel = strains.isNotEmpty(),
+        Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
+            Column(
+                horizontalAlignment = Alignment.CenterHorizontally,
+                verticalArrangement = Arrangement.spacedBy(18.dp),
+            ) {
+                Overline("Typical effort", color = Palette.effortColor)
+                Box(modifier = Modifier.size(140.dp), contentAlignment = Alignment.Center) {
+                    LiquidVessel(
+                        value = fraction,
+                        tint = Palette.effortColor,
+                        // Only slosh once a real Effort value is loaded; an empty window poses static + empty.
+                        animated = hasEffort,
+                        modifier = Modifier.size(140.dp),
                     )
-                }
-                Spacer(Modifier.width(20.dp))
-                Column(
-                    modifier = Modifier.weight(1f),
-                    verticalArrangement = Arrangement.spacedBy(10.dp),
-                ) {
-                    Text(
-                        "Effort this ${effectiveRange.heroWord}",
-                        style = NoopType.headline,
-                        color = Palette.textPrimary,
-                    )
-                    Row(horizontalArrangement = Arrangement.spacedBy(Metrics.gap), modifier = Modifier.fillMaxWidth()) {
-                        HeroStat("Sessions", "${rows.size}", Palette.effortColor, Modifier.weight(1f))
-                        HeroStat("Active", oneDecimal(totalTimeH) + "h", Palette.textPrimary, Modifier.weight(1f))
+                    if (hasEffort) {
+                        // Count-up number over the vessel — white, tabular, a soft shadow for legibility,
+                        // hit-transparent so the tap reaches the vessel (splash). Honours the Effort scale.
+                        CountUpText(
+                            // `shownEffort` is already the display-scaled value, so the interpolated `it` is
+                            // in the user's scale — roll it up with the same one-decimal format as before.
+                            value = shownEffort,
+                            format = { oneDecimal(it) },
+                            style = NoopType.number(30f, weight = FontWeight.Bold)
+                                .copy(shadow = Shadow(color = Color.Black.copy(alpha = 0.5f), offset = Offset(0f, 1f), blurRadius = 6f)),
+                            color = Color.White,
+                            modifier = Modifier.clearAndSetSemantics {},
+                        )
                     }
-                    Text(
-                        if (modal != null) "Mostly ${WorkoutEditing.displaySport(modal.sport)} (${effectiveRange.caption})."
-                        else "Logged sessions across ${effectiveRange.caption}.",
-                        style = NoopType.footnote,
-                        color = Palette.textTertiary,
-                    )
                 }
+            }
+            Spacer(Modifier.width(20.dp))
+            Column(
+                modifier = Modifier.weight(1f),
+                verticalArrangement = Arrangement.spacedBy(10.dp),
+            ) {
+                Text(
+                    "Effort this ${effectiveRange.heroWord}",
+                    style = NoopType.headline,
+                    color = Palette.textPrimary,
+                )
+                Row(horizontalArrangement = Arrangement.spacedBy(Metrics.gap), modifier = Modifier.fillMaxWidth()) {
+                    HeroStat("Sessions", "${rows.size}", Palette.effortColor, Modifier.weight(1f))
+                    HeroStat("Active", oneDecimal(totalTimeH) + "h", Palette.textPrimary, Modifier.weight(1f))
+                }
+                Text(
+                    if (modal != null) "Mostly ${WorkoutEditing.displaySport(modal.sport)} (${effectiveRange.caption})."
+                    else "Logged sessions across ${effectiveRange.caption}.",
+                    style = NoopType.footnote,
+                    color = Palette.textTertiary,
+                )
             }
         }
     }
@@ -1091,11 +1141,19 @@ private fun SessionRow(
                 else -> ". Not selected."
             }
         } else ""
+    // liquidPress on the whole tappable row — it settles inward on press (the iOS LiquidPressStyle feel).
+    // The SAME interactionSource drives the clickable + the press. The edit/delete overflow menu and the
+    // selection glyph stay their own hit targets on top.
+    val interaction = remember { MutableInteractionSource() }
     Row(
         modifier = Modifier
             .fillMaxWidth()
+            .liquidPress(interaction)
             .background(background)
-            .clickable {
+            .clickable(
+                interactionSource = interaction,
+                indication = null,
+            ) {
                 if (selectionMode) { if (selectable) onToggleRow(row) } else onClick(row)
             }
             .height(56.dp)

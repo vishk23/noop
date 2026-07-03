@@ -10,6 +10,7 @@ import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -61,16 +62,20 @@ import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.Path
+import androidx.compose.ui.graphics.Shadow
 import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.drawscope.DrawScope
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.nativeCanvas
 import androidx.compose.ui.graphics.toArgb
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.semantics.clearAndSetSemantics
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.noop.analytics.AnalyticsEngine
@@ -228,6 +233,11 @@ fun SleepScreen(
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
 
+    // Day-cycle sky backdrop (#698). Default ON. When off, the screen drops the liquid sky and the
+    // scaffold paints the plain dark surface canvas instead — the SAME gate the liquid Today honours.
+    // SharedPreferences isn't reactive, so it's read once into local state (mirrors iOS @AppStorage).
+    val showDayCycleBackground = remember { NoopPrefs.showDayCycleBackground(context) }
+
     // Morning-journal nudge: once per calendar day, when the freshest night ended within the last
     // 12 hours, invite the user to log how they felt. The shown-day is persisted so the sheet never
     // re-pops on a recomposition or a same-day re-open. (PR #260)
@@ -342,7 +352,15 @@ fun SleepScreen(
         if (dayIdx >= 0) nightOffset = dayIdx
     }
 
-    LazyScreenScaffold(title = "Sleep", subtitle = "Last night, read in two seconds.") {
+    LazyScreenScaffold(
+        title = "Sleep",
+        subtitle = "Last night, read in two seconds.",
+        // LIQUID SKY BACKDROP (the pilot pattern — LiquidScreenSky.kt): the static time-of-day liquid sky
+        // settles into the theme canvas behind the header + hero, bled full-width up behind the status bar
+        // via the scaffold's topBackground plumbing. Gated on the day-cycle preference exactly like Today
+        // (showDayCycleBackground ? sky : plain canvas). Replaces the classic per-hero scene backdrop.
+        topBackground = if (showDayCycleBackground) { { LiquidScreenSky() } } else null,
+    ) {
         // #65: the transient UNDO banner after a suppressing delete. Restores the deleted row into its
         // ORIGINAL namespace + lifts the tombstone. Mirrors the macOS SleepView sleepUndoBanner.
         sleepUndo?.let { deleted ->
@@ -612,13 +630,23 @@ private fun SleepUndoBanner(session: SleepSession, onUndo: () -> Unit) {
     }
 }
 
-// MARK: - 0. REST HERO — scenic backdrop + sleep-performance gauge (Bevel)
+// MARK: - Liquid hero tokens (the liquid Sleep restyle)
 //
-// The Rest world's opening: a scenic indigo [ScenicHeroBackground] with — when the night carries a
-// 0–100 sleep-performance score — a layered [BevelGauge] in the Rest gradient; else a big rounded
-// hours-slept headline over the same backdrop. A [SourceBadge] states whether the score is WHOOP's
-// own imported figure or NOOP's on-device estimate. Mirrors the macOS SleepView.restHero. The number
-// comes straight from the existing model figures — presentation-only.
+// The hero card the sleep-performance vessel floats on, ported from the liquid Today (TodayScreen.kt). The
+// fill is a translucent near-black (mock rgba(13,14,20,.80)) so the card floats OVER the day-of-sky and the
+// vessel + white count-up number stay crisp — the CARD does the contrast work, not a muted sky. Radius 26 +
+// a white@0.11 hairline give the frosted-glass edge. Same constants as the liquid Today heroCard.
+private val LIQUID_HERO_FILL: Color = Color(red = 13f / 255f, green = 14f / 255f, blue = 20f / 255f, alpha = 0.80f)
+private val LIQUID_HERO_RADIUS: Dp = 26.dp
+
+// MARK: - 0. REST HERO — liquid sky + sleep-performance vessel (liquid restyle)
+//
+// The Rest world's opening, restyled to the liquid pilot: a frosted translucent-black hero card floating on
+// the screen-level liquid sky (the scaffold's topBackground), carrying — when the night has a 0–100
+// sleep-performance score — a [LiquidVessel] filled to score/100 in the Rest colour with the number counting
+// up over it (the Today HeroScoreVessel idiom). No score → the big count-up hours-slept headline. A
+// [SourceBadge] states whether the score is WHOOP's imported figure or NOOP's on-device estimate. The
+// figures, fraction math and Rest tint are UNCHANGED from the BevelGauge this replaced — presentation-only.
 
 @Composable
 private fun RestHero(score: Double?, asleepMin: Double?, source: String) {
@@ -627,12 +655,13 @@ private fun RestHero(score: Double?, asleepMin: Double?, source: String) {
         Box(
             modifier = Modifier
                 .fillMaxWidth()
-                .clip(RoundedCornerShape(Metrics.cardRadius))
-                // A subtle night atmosphere sits behind the sleep hero ONLY (the Rest world's whisper:
-                // faint indigo wash + crescent moon + a few stars over the near-black canvas, no glow),
-                // clipped to the card. Mirrors the macOS SleepView.restHero .timeOfDayBackground(.night),
-                // replacing the heavier ScenicHeroBackground here. (Bevel)
-                .timeOfDayBackground(DayPart.Night),
+                // The liquid hero CARD: a translucent near-black that floats over the day-of-sky so the
+                // vessel + white count-up number stay crisp. Rounded 26 corner + a faint white hairline give
+                // the frosted-glass edge of the liquid Today heroCard (fill rgba(13,14,20,.80), stroke
+                // white@0.11). Replaces the per-hero night atmosphere (the sky now lives at screen level).
+                .clip(RoundedCornerShape(LIQUID_HERO_RADIUS))
+                .background(LIQUID_HERO_FILL)
+                .border(1.dp, Color.White.copy(alpha = 0.11f), RoundedCornerShape(LIQUID_HERO_RADIUS)),
         ) {
             Column(
                 modifier = Modifier.fillMaxWidth().padding(Metrics.space24),
@@ -640,20 +669,21 @@ private fun RestHero(score: Double?, asleepMin: Double?, source: String) {
                 verticalArrangement = Arrangement.spacedBy(Metrics.space14),
             ) {
                 if (score != null) {
-                    BevelGauge(
+                    // The sleep-performance score as a liquid VESSEL, filled to score/100 in the Rest colour
+                    // (the SAME recovery-colour scale the BevelGauge tipColor used), with the number counting
+                    // up over it. The vessel runs live (slosh + tilt) since a real value is loaded. Mirrors
+                    // the Today HeroScoreVessel.
+                    SleepHeroVessel(
                         fraction = (score / 100.0).coerceIn(0.0, 1.0),
-                        stops = Palette.restGradientStops,
-                        tipColor = Palette.restColor,
-                        numberText = "${score.roundToInt()}",
-                        captionText = "of 100",
-                        stateText = sleepScoreWord(score),
+                        value = score,
+                        tint = Palette.restColor,
                         diameter = 184.dp,
-                        lineWidth = 15.dp,
                     )
+                    Text(sleepScoreWord(score), style = NoopType.subhead, color = Palette.textSecondary)
                 } else {
                     // No 0–100 score for the night — lead with hours slept as a big rounded headline
-                    // whose minutes tick up on appear (the same count-up the scored hero's arc draws in
-                    // with). Mirrors the macOS SleepView.restHero CountUpText fallback.
+                    // whose minutes tick up on appear (the same count-up the scored hero rolls). Mirrors the
+                    // macOS SleepView.restHero CountUpText fallback.
                     Column(
                         horizontalAlignment = Alignment.CenterHorizontally,
                         verticalArrangement = Arrangement.spacedBy(Metrics.space4),
@@ -671,6 +701,37 @@ private fun RestHero(score: Double?, asleepMin: Double?, source: String) {
                 SourceBadge(text = source, tint = Palette.restColor)
             }
         }
+    }
+}
+
+/**
+ * The sleep-performance score as a liquid VESSEL with the value counting up over it — the liquid Sleep hero
+ * element, the Today `HeroScoreVessel` idiom. A [LiquidVessel] fills to [fraction] (0..1) in [tint], sized to
+ * [diameter]; over it a [CountUpText] rolls the number up to [value] (white, tabular, a soft shadow so it
+ * reads on the vessel). The number is hit-transparent (clearAndSetSemantics + no clickable) so a tap falls
+ * THROUGH to the vessel — LiquidVessel owns its own tap→splash+haptic. `animated = true`: a real score is
+ * always loaded when this is drawn (the no-score branch shows the hours headline instead).
+ */
+@Composable
+private fun SleepHeroVessel(fraction: Double, value: Double, tint: Color, diameter: Dp) {
+    Box(modifier = Modifier.size(diameter), contentAlignment = Alignment.Center) {
+        LiquidVessel(
+            value = fraction.coerceIn(0.0, 1.0),
+            tint = tint,
+            animated = true,
+            modifier = Modifier.size(diameter),
+        )
+        // Count-up number over the vessel — white, tabular, a soft shadow for legibility, hit-transparent so
+        // the tap reaches the vessel (splash). Size ≈ diameter × 0.27 (the Today 96→26 ratio), capped.
+        val numberSp = (diameter.value * 0.27f).coerceIn(20f, 52f)
+        CountUpText(
+            value = value,
+            format = { it.roundToInt().toString() },
+            style = NoopType.number(numberSp, weight = FontWeight.Bold)
+                .copy(shadow = Shadow(color = Color.Black.copy(alpha = 0.5f), offset = Offset(0f, 1f), blurRadius = 6f)),
+            color = Color.White,
+            modifier = Modifier.clearAndSetSemantics {},
+        )
     }
 }
 
@@ -1137,12 +1198,15 @@ private fun StageBreakdownRow(stage: String, minutes: Double, total: Double, col
             maxLines = 1,
             modifier = Modifier.width(38.dp),
         )
-        // The NOOP signature: a segmented bar that counts up to the share-of-night fraction, tinted in
-        // the stage colour over the canonical inset track. Flat, crisp, no glow. Takes the remaining width.
-        PipBar(
-            value = (fraction * 100.0).toFloat(),
-            segments = 20,
+        // The stage's share-of-night as a liquid TUBE tinted in the stage colour — a genuine single-value
+        // progress bar (minutes / total), so it liquid-ifies cleanly. Posed static (animated = false): a
+        // hero card carries many stage rows, so a per-frame slosh per row isn't worth the cost — the tube
+        // reads as a filled liquid level, matching the pilot's non-hero tubes. Same fraction the % + the
+        // duration carry, so all three agree.
+        LiquidTube(
+            frac = fraction,
             tint = color,
+            animated = false,
             height = 8.dp,
             modifier = Modifier.weight(1f),
         )
@@ -2317,8 +2381,17 @@ private fun SparkTile(
     sparkColor: Color,
     onClick: (() -> Unit)? = null,
 ) {
-    val clickMod = if (onClick != null) modifier.height(Metrics.tileHeight).clickable(onClick = onClick)
-        else modifier.height(Metrics.tileHeight)
+    // liquidPress on the tappable tile: it settles inward on press (the pilot's card feel). The SAME
+    // interactionSource drives the clickable + the press; indication = null so only the liquid settle shows.
+    val interaction = remember { MutableInteractionSource() }
+    val clickMod = if (onClick != null) {
+        modifier
+            .height(Metrics.tileHeight)
+            .liquidPress(interaction)
+            .clickable(interactionSource = interaction, indication = null, onClick = onClick)
+    } else {
+        modifier.height(Metrics.tileHeight)
+    }
     NoopCard(modifier = clickMod, padding = Metrics.space14) {
         Column(modifier = Modifier.fillMaxWidth()) {
             Overline(label)

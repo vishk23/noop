@@ -15,6 +15,7 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.layout.Arrangement
@@ -516,6 +517,12 @@ fun SettingsScreen(vm: AppViewModel, onOpenTestCentre: () -> Unit = {}) {
     ScreenScaffold(
         title = "Settings",
         subtitle = "Your numbers, your strap, and how NOOP works. All on this phone.",
+        // LIQUID SKY BACKDROP (the pilot pattern — LiquidScreenSky.kt): the static time-of-day sky settles
+        // into the theme canvas behind the top of the list, exactly like the liquid Today. This is a long,
+        // scroll-heavy list with NO hero gauge, so the liquid finish here is just the sky + liquidPress on
+        // the tappable rows. Gated on the same day-cycle background pref Today reads, so turning that off
+        // returns Settings to the plain dark canvas too.
+        topBackground = if (showDayCycleBackground) { { LiquidScreenSky() } } else null,
     ) {
         // Read the revision counter so every profile write recomposes this subtree
         // (SharedPreferences is not observable; `mutate` bumps `rev` after each write).
@@ -738,12 +745,17 @@ fun SettingsScreen(vm: AppViewModel, onOpenTestCentre: () -> Unit = {}) {
                         "Auto · ${StepsCalibrationFormat.confidenceLabel(profile.stepsCalibrationConfidence)} confidence"
                     else -> "Not calibrated"
                 }
+                val stepsRowInteraction = remember { MutableInteractionSource() }
                 Row(
                     modifier = Modifier
                         .fillMaxWidth()
                         .heightIn(min = 44.dp)
                         .clip(RoundedCornerShape(8.dp))
-                        .clickable { showStepsCalibration = true }
+                        .liquidPress(stepsRowInteraction)
+                        .clickable(
+                            interactionSource = stepsRowInteraction,
+                            indication = null,
+                        ) { showStepsCalibration = true }
                         .semantics {
                             contentDescription =
                                 "Steps estimate calibration. $stepsSummary. Opens the calibration screen."
@@ -1175,13 +1187,18 @@ fun SettingsScreen(vm: AppViewModel, onOpenTestCentre: () -> Unit = {}) {
                 // "WHOOP 4.0 vs 5.0/MG — what each can read and why" (FI-2 / #490). Shown to BOTH model
                 // owners, so a 4.0 user understands their strap is fully supported (and why the firmware
                 // broadcast-out is 5/MG-only while NOOP's own re-broadcast in Data Sources works on a 4.0).
+                val modelComparisonInteraction = remember { MutableInteractionSource() }
                 Box(
                     modifier = Modifier
                         .fillMaxWidth()
+                        .liquidPress(modelComparisonInteraction)
                         .clip(RoundedCornerShape(10.dp))
                         .background(Palette.surfaceInset)
                         .border(1.dp, Palette.hairline, RoundedCornerShape(10.dp))
-                        .clickable { showModelComparison = true }
+                        .clickable(
+                            interactionSource = modelComparisonInteraction,
+                            indication = null,
+                        ) { showModelComparison = true }
                         .padding(horizontal = 14.dp, vertical = 12.dp)
                         .semantics { contentDescription = "WHOOP 4.0 versus 5.0: what each can read and why" },
                 ) {
@@ -1919,13 +1936,18 @@ fun SettingsScreen(vm: AppViewModel, onOpenTestCentre: () -> Unit = {}) {
 
                 // Project home — NOOP's code, releases, issues and wiki live on GitHub
                 // (canonical; noop.fans is kept as a mirror).
+                val projectHomeInteraction = remember { MutableInteractionSource() }
                 Box(
                     modifier = Modifier
                         .fillMaxWidth()
+                        .liquidPress(projectHomeInteraction)
                         .clip(RoundedCornerShape(10.dp))
                         .background(Palette.accent.copy(alpha = 0.10f))
                         .border(1.dp, Palette.accent.copy(alpha = 0.25f), RoundedCornerShape(10.dp))
-                        .clickable {
+                        .clickable(
+                            interactionSource = projectHomeInteraction,
+                            indication = null,
+                        ) {
                             val intent = Intent(Intent.ACTION_VIEW, Uri.parse("https://github.com/NoopApp/noop"))
                             try {
                                 context.startActivity(intent)
@@ -1948,13 +1970,18 @@ fun SettingsScreen(vm: AppViewModel, onOpenTestCentre: () -> Unit = {}) {
 
                 // Mirror — noop.fans carries every release alongside GitHub, so users have a
                 // fallback if GitHub is ever unreachable (#606). Same downloads, release for release.
+                val mirrorInteraction = remember { MutableInteractionSource() }
                 Box(
                     modifier = Modifier
                         .fillMaxWidth()
+                        .liquidPress(mirrorInteraction)
                         .clip(RoundedCornerShape(10.dp))
                         .background(Palette.accent.copy(alpha = 0.10f))
                         .border(1.dp, Palette.accent.copy(alpha = 0.25f), RoundedCornerShape(10.dp))
-                        .clickable {
+                        .clickable(
+                            interactionSource = mirrorInteraction,
+                            indication = null,
+                        ) {
                             val intent = Intent(Intent.ACTION_VIEW, Uri.parse("https://noop.fans"))
                             try {
                                 context.startActivity(intent)
@@ -2076,13 +2103,18 @@ fun SettingsScreen(vm: AppViewModel, onOpenTestCentre: () -> Unit = {}) {
                 )
 
                 // What's new — re-open the changelog sheet any time (macOS About parity).
+                val whatsNewInteraction = remember { MutableInteractionSource() }
                 Box(
                     modifier = Modifier
                         .fillMaxWidth()
+                        .liquidPress(whatsNewInteraction)
                         .clip(RoundedCornerShape(10.dp))
                         .background(Palette.surfaceInset)
                         .border(1.dp, Palette.hairline, RoundedCornerShape(10.dp))
-                        .clickable { showWhatsNew = true }
+                        .clickable(
+                            interactionSource = whatsNewInteraction,
+                            indication = null,
+                        ) { showWhatsNew = true }
                         .padding(horizontal = 14.dp, vertical = 12.dp)
                         .semantics { contentDescription = "What's new in NOOP ${AppChangelog.CURRENT_VERSION}" },
                 ) {
@@ -2111,13 +2143,18 @@ fun SettingsScreen(vm: AppViewModel, onOpenTestCentre: () -> Unit = {}) {
 
                 // How your scores work — the honest explainer for Charge/Effort/Rest + the
                 // confidence labels, opened any time (macOS/iOS About parity).
+                val scoringGuideInteraction = remember { MutableInteractionSource() }
                 Box(
                     modifier = Modifier
                         .fillMaxWidth()
+                        .liquidPress(scoringGuideInteraction)
                         .clip(RoundedCornerShape(10.dp))
                         .background(Palette.surfaceInset)
                         .border(1.dp, Palette.hairline, RoundedCornerShape(10.dp))
-                        .clickable { showScoringGuide = true }
+                        .clickable(
+                            interactionSource = scoringGuideInteraction,
+                            indication = null,
+                        ) { showScoringGuide = true }
                         .padding(horizontal = 14.dp, vertical = 12.dp)
                         .semantics { contentDescription = "How your scores work" },
                 ) {
@@ -2147,13 +2184,18 @@ fun SettingsScreen(vm: AppViewModel, onOpenTestCentre: () -> Unit = {}) {
                 // How NOOP works — the plain-English primer (COMPONENT 5 of the explainability layer):
                 // how sleep is sorted, how scores + calibration work, what recording means, and where
                 // each number comes from. The one "?" entry point into the primer (macOS/iOS parity).
+                val howNoopWorksInteraction = remember { MutableInteractionSource() }
                 Box(
                     modifier = Modifier
                         .fillMaxWidth()
+                        .liquidPress(howNoopWorksInteraction)
                         .clip(RoundedCornerShape(10.dp))
                         .background(Palette.surfaceInset)
                         .border(1.dp, Palette.hairline, RoundedCornerShape(10.dp))
-                        .clickable { showHowNoopWorks = true }
+                        .clickable(
+                            interactionSource = howNoopWorksInteraction,
+                            indication = null,
+                        ) { showHowNoopWorks = true }
                         .padding(horizontal = 14.dp, vertical = 12.dp)
                         .semantics { contentDescription = "How NOOP works" },
                 ) {
@@ -2221,13 +2263,18 @@ fun SettingsScreen(vm: AppViewModel, onOpenTestCentre: () -> Unit = {}) {
 
                 // Support link — opens the project's contact email (same address the
                 // Support screen lists). NOOP is anonymous, so email is the support channel.
+                val supportInteraction = remember { MutableInteractionSource() }
                 Box(
                     modifier = Modifier
                         .fillMaxWidth()
+                        .liquidPress(supportInteraction)
                         .clip(RoundedCornerShape(10.dp))
                         .background(Palette.accent.copy(alpha = 0.10f))
                         .border(1.dp, Palette.accent.copy(alpha = 0.25f), RoundedCornerShape(10.dp))
-                        .clickable {
+                        .clickable(
+                            interactionSource = supportInteraction,
+                            indication = null,
+                        ) {
                             val intent = Intent(Intent.ACTION_SENDTO).apply {
                                 data = Uri.parse("mailto:$SUPPORT_EMAIL")
                                 putExtra(Intent.EXTRA_SUBJECT, "NOOP support")
@@ -2464,12 +2511,18 @@ private fun SettingsDisclosure(
         targetValue = if (expanded) 0f else -90f,
         label = "advancedChevron",
     )
+    val headerInteraction = remember { MutableInteractionSource() }
     Column(verticalArrangement = Arrangement.spacedBy(Metrics.screenRowSpacing)) {
         Row(
             modifier = Modifier
                 .fillMaxWidth()
+                .liquidPress(headerInteraction)
                 .clip(RoundedCornerShape(12.dp))
-                .clickable(onClick = onToggle)
+                .clickable(
+                    interactionSource = headerInteraction,
+                    indication = null,
+                    onClick = onToggle,
+                )
                 .semantics {
                     contentDescription = title
                     stateDescription = if (expanded) "Expanded" else "Collapsed"

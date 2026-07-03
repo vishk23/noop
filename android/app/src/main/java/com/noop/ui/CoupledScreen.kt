@@ -3,6 +3,7 @@ package com.noop.ui
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -28,9 +29,14 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.Shadow
+import androidx.compose.ui.semantics.clearAndSetSemantics
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
@@ -65,6 +71,14 @@ private const val COUPLED_STRAIN_OUT_OF = 21.0
 /** The missing-value placeholder, matching the app's shipped "No Data" token (TodayScreen.COUPLED_NO_DATA is
  *  file-private, so the coupled screen carries its own copy of the same string). */
 private const val COUPLED_NO_DATA = "No Data"
+
+// The liquid hero-card wrapper values, byte-identical to the liquid Today pilot (TodayScreen's
+// LIQUID_HERO_FILL / LIQUID_HERO_RADIUS are file-private, so the coupled screen carries its own copy):
+// a translucent near-black that floats over the day-of-sky so the vessel + white count-up numbers stay
+// crisp — the card does the contrast work, not a muted sky. heroFill = rgba(13,14,20,.80), stroke
+// white@0.11, radius 26. Mirrors the iOS LiquidTodayView heroCard.
+private val LIQUID_HERO_FILL: Color = Color(red = 13f / 255f, green = 14f / 255f, blue = 20f / 255f, alpha = 0.80f)
+private val LIQUID_HERO_RADIUS: Dp = 26.dp
 
 @Composable
 fun CoupledScreen(
@@ -143,7 +157,18 @@ fun CoupledScreen(
     var showChargeBreakdown by remember { mutableStateOf(false) }
     var showGuide by remember { mutableStateOf(false) }
 
-    ScreenScaffold(title = "Day", subtitle = subtitleToday()) {
+    ScreenScaffold(
+        title = "Day",
+        subtitle = subtitleToday(),
+        // LIQUID SKY BACKDROP (the pilot pattern — LiquidScreenSky.kt): the reusable time-of-day liquid sky
+        // sits behind the top region, full-bleed up behind the status bar via the scaffold's topBackground
+        // plumbing, top-aligned, settling into the flat canvas over its lower half so the cards float OVER it.
+        // The Android equivalent of the iOS `ScreenScaffold(topBackground: liquidScaffoldSky())`; it replaces
+        // the classic flat-canvas backdrop with the liquid day-of-sky (LiquidSkyStatic — no per-frame cost on
+        // this scrolling column). The other liquid screens drop in the SAME LiquidScreenSky() slot verbatim.
+        // Coupled has no per-screen day-cycle toggle of its own, so the sky is unconditional here.
+        topBackground = { LiquidScreenSky() },
+    ) {
         HeroCard(
             recovery = recovery,
             isCarrying = isCarrying,
@@ -233,39 +258,50 @@ private fun HeroCard(
             "Recovery calibrating, $calibrationNights of ${Baselines.minNightsSeed} nights"
         else -> "Recovery, no data yet"
     }
-    // The whole hero is the breakdown's tap target, mirroring Today's Charge-ring tap (A1). The
-    // clickable wraps the card so the ripple clips to the card shape.
+    // The vessel runs LIVE (per-frame slosh + tilt) once there's a real value to show; an empty/calibrating
+    // hero poses it static so a brand-new user's launch churn isn't fighting a live canvas (the Today
+    // `dataLoaded` gate on HeroScoreVessel). A carried Charge counts as data (its dimmed vessel should slosh).
+    val animated = recovery != null
+    // The whole hero is the breakdown's tap target, mirroring Today's Charge-vessel tap (A1). The SAME
+    // interactionSource drives the clickable + the liquidPress so the card settles inward on press.
+    val interaction = remember { MutableInteractionSource() }
+    // The liquid hero CARD: a translucent near-black that floats over the day-of-sky so the vessel + white
+    // count-up number stay crisp — the card does the contrast work, not a muted sky. A rounded 26 corner + a
+    // faint white hairline give it the frosted-glass edge of the iOS liquid heroCard. Mirrors the pilot.
     Box(
         modifier = Modifier
             .fillMaxWidth()
-            .clip(RoundedCornerShape(Metrics.cardRadius))
-            .clickable(onClickLabel = "See what shaped your Charge", onClick = onTap)
+            .liquidPress(interaction)
+            .clip(RoundedCornerShape(LIQUID_HERO_RADIUS))
+            .background(LIQUID_HERO_FILL)
+            .border(1.dp, Color.White.copy(alpha = 0.11f), RoundedCornerShape(LIQUID_HERO_RADIUS))
+            .clickable(
+                interactionSource = interaction,
+                indication = null,
+                onClickLabel = "See what shaped your Charge",
+                onClick = onTap,
+            )
             .semantics { contentDescription = a11y },
     ) {
-        NoopCard(padding = 20.dp) {
+        Box(modifier = Modifier.fillMaxWidth().padding(20.dp)) {
             Column(
                 modifier = Modifier.fillMaxWidth(),
                 horizontalAlignment = Alignment.CenterHorizontally,
                 verticalArrangement = Arrangement.spacedBy(12.dp),
             ) {
                 Box(modifier = Modifier.size(232.dp), contentAlignment = Alignment.Center) {
-                    if (recovery != null) {
-                        // The ring WITHOUT its built-in read-out, so the coupled centre stack layers over
-                        // the arc. A carried (not-yet-rescored) morning reads dimmed, the Today #802 idiom.
-                        RecoveryRing(
-                            score = recovery,
-                            diameter = 232.dp,
-                            lineWidth = 20.dp,
-                            showsLabel = false,
-                            modifier = Modifier.alpha(if (isCarrying) 0.8f else 1f),
-                        )
-                    } else {
-                        // No scored recovery yet: a faint full track so the hero never reads as broken.
-                        GlowRing(
-                            fraction = 0f, value = 0.0, color = Palette.chargeColor,
-                            diameter = 232.dp, lineWidth = 20.dp, showsLabel = false,
-                        )
-                    }
+                    // The recovery ring becomes a liquid VESSEL filled to the recovery fraction in the sampled
+                    // recovery colour, with the number counting up over it (the Today HeroScoreVessel idiom).
+                    // A carried (not-yet-rescored) morning reads dimmed, the Today #802 idiom. Empty (no score)
+                    // draws an empty vessel and the centre stack shows the "No Data" token instead of a number.
+                    LiquidVessel(
+                        value = ((recovery ?: 0.0) / 100.0).coerceIn(0.0, 1.0),
+                        tint = if (recovery != null) Palette.recoveryColor(recovery) else Palette.chargeColor,
+                        animated = animated,
+                        modifier = Modifier
+                            .size(232.dp)
+                            .alpha(if (isCarrying) 0.8f else 1f),
+                    )
                     HeroCentre(recovery = recovery, readinessLevel = readinessLevel)
                 }
                 // The honest state line under the ring: the "Last night · <date>" stamp when carrying a
@@ -297,11 +333,16 @@ private fun HeroCentre(recovery: Double?, readinessLevel: ReadinessEngine.Level)
         verticalArrangement = Arrangement.spacedBy(4.dp),
     ) {
         if (recovery != null) {
-            Text(
-                "${recovery.roundToInt()}%",
-                style = NoopType.number(56f),
-                color = Palette.textPrimary,
-                maxLines = 1,
+            // Count-up number over the vessel — white, tabular, a soft shadow for legibility, hit-transparent
+            // (clearAndSetSemantics + no clickable) so the tap reaches the vessel (splash) and the enclosing
+            // hero card. The Today HeroScoreVessel idiom, sized to this larger 232dp coupled hero.
+            CountUpText(
+                value = recovery,
+                format = { "${it.roundToInt()}%" },
+                style = NoopType.number(56f, weight = FontWeight.Bold)
+                    .copy(shadow = Shadow(color = Color.Black.copy(alpha = 0.5f), offset = Offset(0f, 1f), blurRadius = 6f)),
+                color = Color.White,
+                modifier = Modifier.clearAndSetSemantics {},
             )
         } else {
             // The honest empty read at the ring-label size (never the 56sp numeral, "No Data" would
@@ -348,20 +389,43 @@ private fun StrainCard(dayStrain21: Double?, recovery: Double?, calories: Double
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.spacedBy(16.dp),
         ) {
-            // Left: the shipped StrainGauge on the 0-21 axis (number + "of 21"), with the band word as an
-            // overline above it (the Android StrainGauge has no internal state word, so we add it here to
-            // match the Swift StrainGauge's LIGHT/MODERATE/STRENUOUS/HIGH overline).
+            // Left: the effort gauge on the 0-21 axis as a liquid VESSEL (the Today HeroScoreVessel idiom),
+            // with the band word as an overline above it (the Swift StrainGauge's LIGHT/MODERATE/STRENUOUS/
+            // HIGH overline). Same fraction (strain / 21) and effort tint as the Today hero effort vessel.
             Column(
                 modifier = Modifier.size(168.dp),
                 horizontalAlignment = Alignment.CenterHorizontally,
                 verticalArrangement = Arrangement.Center,
             ) {
                 if (dayStrain21 != null) {
+                    val strainFrac = (dayStrain21 / COUPLED_STRAIN_OUT_OF).coerceIn(0.0, 1.0)
                     Text(strainBandWord(dayStrain21 / COUPLED_STRAIN_OUT_OF), style = NoopType.overline, color = Palette.effortColor)
                     Spacer(Modifier.size(4.dp))
-                    StrainGauge(strain = dayStrain21, outOf = COUPLED_STRAIN_OUT_OF, diameter = 148.dp, lineWidth = 14.dp)
+                    Box(modifier = Modifier.size(148.dp), contentAlignment = Alignment.Center) {
+                        LiquidVessel(
+                            value = strainFrac,
+                            tint = Palette.effortTint(strainFrac),
+                            animated = true,
+                            modifier = Modifier.size(148.dp),
+                        )
+                        CountUpText(
+                            value = dayStrain21,
+                            format = { String.format(Locale.US, "%.1f", it) },
+                            style = NoopType.number(30f, weight = FontWeight.Bold)
+                                .copy(shadow = Shadow(color = Color.Black.copy(alpha = 0.5f), offset = Offset(0f, 1f), blurRadius = 6f)),
+                            color = Color.White,
+                            modifier = Modifier.clearAndSetSemantics {},
+                        )
+                    }
                 } else {
-                    GlowRing(fraction = 0f, value = 0.0, color = Palette.effortColor, diameter = 148.dp, lineWidth = 14.dp, showsLabel = false)
+                    // No scored effort yet: an empty (posed) vessel so the card never reads as broken, with
+                    // the honest caption below it, mirroring the empty-hero treatment on Today.
+                    LiquidVessel(
+                        value = 0.0,
+                        tint = Palette.effortColor,
+                        animated = false,
+                        modifier = Modifier.size(148.dp),
+                    )
                     Text("No effort yet", style = NoopType.footnote, color = Palette.textTertiary, modifier = Modifier.padding(top = 6.dp))
                 }
             }
@@ -402,26 +466,44 @@ private fun SleepCard(
     bedWakeSpan: String?,
     onOpenSleep: () -> Unit,
 ) {
+    // liquidPress on the whole tappable card (the SAME interactionSource drives the clickable + the press),
+    // so it settles inward on press, mirroring the Today liquid cards.
+    val interaction = remember { MutableInteractionSource() }
     NoopCard(
         padding = 20.dp,
         tint = Palette.restColor,
-        modifier = Modifier.clickable(onClickLabel = "Open Sleep", onClick = onOpenSleep),
+        modifier = Modifier
+            .clickable(
+                interactionSource = interaction,
+                indication = null,
+                onClickLabel = "Open Sleep",
+                onClick = onOpenSleep,
+            )
+            .liquidPress(interaction),
     ) {
         Row(
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.spacedBy(16.dp),
         ) {
             Box(modifier = Modifier.size(96.dp), contentAlignment = Alignment.Center) {
+                // The sleep-performance ring becomes a liquid VESSEL filled to the performance fraction in the
+                // rest tint, with the number counting up over it (the Today HeroScoreVessel idiom). Empty draws
+                // a posed empty vessel, no number.
+                LiquidVessel(
+                    value = ((sleepPerformance ?: 0.0) / 100.0).coerceIn(0.0, 1.0),
+                    tint = Palette.restColor,
+                    animated = sleepPerformance != null,
+                    modifier = Modifier.size(96.dp),
+                )
                 if (sleepPerformance != null) {
-                    GlowRing(
-                        fraction = (sleepPerformance / 100.0).toFloat(),
+                    CountUpText(
                         value = sleepPerformance,
-                        color = Palette.restColor,
-                        diameter = 96.dp, lineWidth = 10.dp,
                         format = { it.roundToInt().toString() },
+                        style = NoopType.number(26f, weight = FontWeight.Bold)
+                            .copy(shadow = Shadow(color = Color.Black.copy(alpha = 0.5f), offset = Offset(0f, 1f), blurRadius = 6f)),
+                        color = Color.White,
+                        modifier = Modifier.clearAndSetSemantics {},
                     )
-                } else {
-                    GlowRing(fraction = 0f, value = 0.0, color = Palette.restColor, diameter = 96.dp, lineWidth = 10.dp, showsLabel = false)
                 }
             }
 

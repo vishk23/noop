@@ -3,6 +3,7 @@ package com.noop.ui
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -71,10 +72,17 @@ fun CoachScreen(vm: CoachViewModel = viewModel()) {
     val customConnected by vm.customConnected.collectAsStateWithLifecycle()
     // Re-evaluate the gate whenever the stored key, provider, or custom-connect state changes.
     val configured = remember(keyVersion, provider, customConnected) { vm.isConfigured(context) }
+    // Same day-cycle gate as the liquid Today: the time-of-day sky settles behind the top content when the
+    // user hasn't opted out; otherwise the scaffold paints the plain dark canvas.
+    val showDayCycleBackground = remember { NoopPrefs.showDayCycleBackground(context) }
 
     ScreenScaffold(
         title = "Coach",
         subtitle = "Ask about your recovery, strain, sleep and HRV, grounded in your own numbers.",
+        // LIQUID SKY BACKDROP (the pilot pattern — LiquidScreenSky.kt): the liquid sky sits behind the
+        // header and the cards float over the flat canvas below. Reuses the shared LiquidScreenSky() slot
+        // verbatim; when the day-cycle background is off, the scaffold paints the plain surface instead.
+        topBackground = if (showDayCycleBackground) { { LiquidScreenSky() } } else null,
     ) {
         if (!configured) {
             CoachSetup(vm = vm)
@@ -217,13 +225,15 @@ private fun CoachChat(vm: CoachViewModel) {
             Row(verticalAlignment = Alignment.CenterVertically) {
                 StatePill(title = "${provider.displayName} · $model", tone = StrandTone.Accent, showsDot = true)
                 Spacer(Modifier.weight(1f))
+                val disconnectInteraction = remember { MutableInteractionSource() }
                 Text(
                     "Disconnect",
                     style = NoopType.caption,
                     color = Palette.textSecondary,
                     modifier = Modifier
                         .clip(RoundedCornerShape(50))
-                        .clickable { vm.disconnect(context) }
+                        .liquidPress(disconnectInteraction)
+                        .clickable(interactionSource = disconnectInteraction, indication = null) { vm.disconnect(context) }
                         .padding(horizontal = 10.dp, vertical = 6.dp)
                         .semantics { contentDescription = "Disconnect provider" },
                 )
@@ -334,13 +344,15 @@ private fun CoachInstructions(vm: CoachViewModel) {
     val hasCustom by vm.hasCustomPrompt.collectAsStateWithLifecycle()
     var expanded by remember { mutableStateOf(false) }
 
+    val headerInteraction = remember { MutableInteractionSource() }
     NoopCard(padding = 14.dp, tint = Palette.chargeColor) {
         Column(verticalArrangement = Arrangement.spacedBy(if (expanded) 10.dp else 0.dp)) {
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
                     .clip(RoundedCornerShape(10.dp))
-                    .clickable { expanded = !expanded }
+                    .liquidPress(headerInteraction)
+                    .clickable(interactionSource = headerInteraction, indication = null) { expanded = !expanded }
                     .semantics {
                         contentDescription = if (expanded) "Collapse coach instructions" else "Edit coach instructions"
                     },
@@ -474,6 +486,7 @@ private fun SuggestedPrompts(onPick: (String) -> Unit) {
         // Simple wrapped column of chips (one per row keeps long prompts readable).
         SUGGESTED_PROMPTS.forEach { prompt ->
             val shape = RoundedCornerShape(50)
+            val chipInteraction = remember { MutableInteractionSource() }
             Text(
                 prompt,
                 style = NoopType.caption,
@@ -483,7 +496,8 @@ private fun SuggestedPrompts(onPick: (String) -> Unit) {
                     .clip(shape)
                     .background(Palette.surfaceInset)
                     .border(1.dp, Palette.hairline, shape)
-                    .clickable { onPick(prompt) }
+                    .liquidPress(chipInteraction)
+                    .clickable(interactionSource = chipInteraction, indication = null) { onPick(prompt) }
                     .padding(horizontal = 12.dp, vertical = 8.dp)
                     .semantics { contentDescription = "Suggested prompt: $prompt" },
             )
@@ -502,6 +516,7 @@ private fun ModelDropdown(
     var expanded by remember { mutableStateOf(false) }
     var showCustom by remember { mutableStateOf(false) }
     val shape = RoundedCornerShape(14.dp)
+    val triggerInteraction = remember { MutableInteractionSource() }
     Box {
         Row(
             modifier = Modifier
@@ -509,7 +524,8 @@ private fun ModelDropdown(
                 .clip(shape)
                 .background(Palette.surfaceInset)
                 .border(1.dp, Palette.hairline, shape)
-                .clickable { expanded = true }
+                .liquidPress(triggerInteraction)
+                .clickable(interactionSource = triggerInteraction, indication = null) { expanded = true }
                 .padding(horizontal = 14.dp, vertical = 12.dp)
                 .semantics { contentDescription = "Model: $selected. Tap to change." },
             verticalAlignment = Alignment.CenterVertically,
@@ -620,12 +636,19 @@ private fun RefreshModelsButton(
 ) {
     val shape = RoundedCornerShape(50)
     val active = enabled && !refreshing
+    val refreshInteraction = remember { MutableInteractionSource() }
     Row(
         modifier = Modifier
             .clip(shape)
             .background(Palette.surfaceInset)
             .border(1.dp, Palette.hairline, shape)
-            .let { if (active) it.clickable(onClick = onClick) else it }
+            .let {
+                if (active)
+                    it
+                        .liquidPress(refreshInteraction)
+                        .clickable(interactionSource = refreshInteraction, indication = null, onClick = onClick)
+                else it
+            }
             .padding(horizontal = 10.dp, vertical = 6.dp)
             .semantics { contentDescription = "Fetch models from provider" },
         verticalAlignment = Alignment.CenterVertically,
@@ -679,13 +702,20 @@ private fun CoachKeyField(
 private fun CoachPrimaryButton(label: String, enabled: Boolean, onClick: () -> Unit) {
     val shape = RoundedCornerShape(14.dp)
     val bg = if (enabled) Palette.accent else Palette.accent.copy(alpha = Palette.disabledOpacity)
+    val interaction = remember { MutableInteractionSource() }
     Box(
         modifier = Modifier
             .fillMaxWidth()
             .height(48.dp)
             .clip(shape)
             .background(bg)
-            .let { if (enabled) it.clickable(onClick = onClick) else it }
+            .let {
+                if (enabled)
+                    it
+                        .liquidPress(interaction)
+                        .clickable(interactionSource = interaction, indication = null, onClick = onClick)
+                else it
+            }
             .semantics { contentDescription = label },
         contentAlignment = Alignment.Center,
     ) {
@@ -696,13 +726,20 @@ private fun CoachPrimaryButton(label: String, enabled: Boolean, onClick: () -> U
 @Composable
 private fun SendButton(enabled: Boolean, sending: Boolean, onClick: () -> Unit) {
     val bg = if (enabled) Palette.accent else Palette.surfaceInset
+    val interaction = remember { MutableInteractionSource() }
     Box(
         modifier = Modifier
             .size(52.dp)
             .clip(RoundedCornerShape(14.dp))
             .background(bg)
             .border(1.dp, if (enabled) Color.Transparent else Palette.hairline, RoundedCornerShape(14.dp))
-            .let { if (enabled) it.clickable(onClick = onClick) else it }
+            .let {
+                if (enabled)
+                    it
+                        .liquidPress(interaction)
+                        .clickable(interactionSource = interaction, indication = null, onClick = onClick)
+                else it
+            }
             .semantics { contentDescription = "Send message" },
         contentAlignment = Alignment.Center,
     ) {

@@ -4,6 +4,7 @@ import android.content.Context
 import androidx.compose.foundation.border
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -304,7 +305,17 @@ fun InsightsScreen(vm: AppViewModel, onOpenInsightsHub: () -> Unit = {}) {
     // otherwise insert a 0-height row that the 20dp arrangement flanks, shifting layout. The one
     // composable-only block (`run { … remember(snapshot) … }`) moves inside its `item { }` (which is
     // @Composable). Order is preserved exactly.
-    LazyScreenScaffold(title = "Insights", subtitle = "Interrogate what affects what.") {
+    // LIQUID SKY BACKDROP (the pilot pattern — LiquidScreenSky.kt): the static time-of-day liquid sky
+    // settles into the theme canvas behind the header + the first cards (and bleeds full-width up behind the
+    // status bar via the scaffold's topBackground plumbing), top-aligned, so the analysis cards float OVER
+    // the sky on the flat surface below. The Android equivalent of the iOS
+    // `ScreenScaffold(topBackground: liquidScaffoldSky())`; reuses the shared LiquidScreenSky() slot verbatim.
+    // Insights has no day-cycle gate of its own, so the sky is always drawn (matching the liquid explorer).
+    LazyScreenScaffold(
+        title = "Insights",
+        subtitle = "Interrogate what affects what.",
+        topBackground = { LiquidScreenSky() },
+    ) {
 
         // --- "What moves you" deep-link into the v5 Insights Hub (ranked, lag-aware ranked-effect feed +
         //     personal alcohol/caffeine dose-response). The honest in-Insights entry point; the hub is its
@@ -511,10 +522,15 @@ fun InsightsScreen(vm: AppViewModel, onOpenInsightsHub: () -> Unit = {}) {
 
 @Composable
 private fun WhatMovesYouLink(onOpen: () -> Unit) {
+    // liquidPress: the tappable card settles inward on press (the iOS LiquidPressStyle feel). The SAME
+    // interactionSource drives the clickable + the press, and indication is nulled so only the liquid
+    // settle reads (no ripple). Same onOpen nav + same combined accessibility label.
+    val interaction = remember { MutableInteractionSource() }
     NoopCard(
         tint = Palette.chargeColor,
         modifier = Modifier
-            .clickable(onClick = onOpen)
+            .clickable(interactionSource = interaction, indication = null, onClick = onOpen)
+            .liquidPress(interaction)
             .semantics {
                 contentDescription =
                     "What moves you. Ranked patterns in your own data, and your dose-response."
@@ -1090,25 +1106,22 @@ private fun ActiveExperimentCard(
 
         // Progress bar + day count + confidence pill.
         Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
-            Box(
+            // LiquidTube: a genuine SINGLE-value goal bar (day N of the window), so it liquid-fills to
+            // `snapshot.progress` in the accent tint. Static (animated = false) — a scrolling explorer must
+            // not carry a live Canvas clock. Same fraction, same tint, same accessibility label as the
+            // hand-drawn track it replaces.
+            LiquidTube(
+                frac = snapshot.progress.toDouble(),
+                tint = Palette.accent,
+                height = 6.dp,
+                animated = false,
                 modifier = Modifier
                     .fillMaxWidth()
-                    .height(4.dp)
-                    .clip(RoundedCornerShape(50))
-                    .background(Palette.hairline)
                     .semantics {
                         contentDescription =
                             "Experiment progress ${snapshot.daysElapsed} of ${snapshot.durationDays} days"
                     },
-            ) {
-                Box(
-                    modifier = Modifier
-                        .fillMaxWidth(snapshot.progress)
-                        .height(4.dp)
-                        .clip(RoundedCornerShape(50))
-                        .background(Palette.accent),
-                )
-            }
+            )
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 verticalAlignment = Alignment.CenterVertically,
@@ -1215,6 +1228,9 @@ private fun ExperimentBehaviourPicker(
     onSelect: (String) -> Unit,
 ) {
     var expanded by remember { mutableStateOf(false) }
+    // liquidPress on the tappable picker row (same interactionSource on the clickable + press; indication
+    // nulled so only the liquid settle reads). Same expand-on-tap + same accessibility label.
+    val interaction = remember { MutableInteractionSource() }
     Box {
         Row(
             modifier = Modifier
@@ -1222,7 +1238,8 @@ private fun ExperimentBehaviourPicker(
                 .clip(RoundedCornerShape(6.dp))
                 .background(Palette.surfaceBase)
                 .border(1.dp, Palette.hairline, RoundedCornerShape(6.dp))
-                .clickable { expanded = true }
+                .clickable(interactionSource = interaction, indication = null) { expanded = true }
+                .liquidPress(interaction)
                 .padding(horizontal = 12.dp, vertical = 8.dp)
                 .semantics { contentDescription = "Experiment behaviour: $selection" },
             verticalAlignment = Alignment.CenterVertically,
