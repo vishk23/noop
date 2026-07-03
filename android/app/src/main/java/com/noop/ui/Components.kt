@@ -1237,6 +1237,11 @@ fun LazyScreenScaffold(
     // above its first row, and supply leading/trailing header actions + a screen-level scene backdrop.
     // All defaulted, so the existing flat callers (Intelligence) are byte-for-byte untouched.
     topPadding: Dp = 28.dp,
+    // The inter-row vertical spacing between top-level items. Defaults to the shared `screenRowSpacing`
+    // (20dp) so every existing caller is byte-for-byte untouched; the liquid Today passes a tighter value
+    // to match the iOS Today's compact `VStack(spacing: 12)` section rhythm (the maintainer's "iOS is
+    // tighter/slicker" note). Scoped per-scaffold so no other screen's rhythm shifts.
+    rowSpacing: Dp = Metrics.screenRowSpacing,
     leading: (@Composable () -> Unit)? = null,
     trailing: (@Composable () -> Unit)? = null,
     // Optional full-bleed scene drawn behind the scroll content at the TOP of the screen — the SAME slot
@@ -1289,9 +1294,10 @@ fun LazyScreenScaffold(
         LazyColumn(
             modifier = listModifier,
             contentPadding = PaddingValues(start = 28.dp, top = topPadding, end = 28.dp, bottom = 28.dp),
-            // #765: the SAME shared inter-card spacing token as the eager ScreenScaffold, so Today/Explore
-            // (both lazy) and the eager screens share one uniform card rhythm.
-            verticalArrangement = Arrangement.spacedBy(Metrics.screenRowSpacing),
+            // #765: the shared inter-card spacing token by default (Today/Explore + the eager screens share
+            // one uniform card rhythm); a caller may pass a tighter [rowSpacing] (the liquid Today does, for
+            // the iOS-compact section rhythm).
+            verticalArrangement = Arrangement.spacedBy(rowSpacing),
         ) {
             if (header != null) {
                 item { header() }
