@@ -538,6 +538,33 @@ class WhoopBleClient(
          *  (GATT_CONN_TERMINATE_LOCAL_HOST). Distinct from [GATT_CONN_TIMEOUT] (0x08, the strap/link timing
          *  out): a bounce we initiated must NOT be mistaken for the #617 loop's remote timeout. */
         private const val GATT_CONN_TERMINATE_LOCAL_HOST = 0x16  // GATT_CONN_TERMINATE_LOCAL_HOST (local host ended it)
+
+        /**
+         * #982: should this involuntary disconnect feed the #971 bond-watchdog give-up counter? A WHOOP 4.0
+         * that reaches STATE_CONNECTED and subscribes but never lands a genuine bond can self-drop (status 0)
+         * at ~7s, BEFORE the escalating bond watchdog fires — so [onBondWatchdog]'s recordBounce (which only
+         * runs when OUR OWN gatt.disconnect reports GATT_CONN_TERMINATE_LOCAL_HOST) never runs, and the #617
+         * [PostBondTimeoutLoopDetector] skips it (never bonded, and status != GATT_CONN_TIMEOUT). Neither
+         * give-up counter advances while STATE_CONNECTED keeps zeroing the reconnect backoff, so the connect →
+         * subscribe → drop loop runs unbounded and drains the battery (#982). Pulled out as a pure function so
+         * the gate is unit-testable without a BLE seam (same shape as [BondWatchdogBackoff]).
+         *
+         * True ONLY for that case: the link reached STATE_CONNECTED ([wasConnected]) but never bonded
+         * ([didBond] false), the drop was involuntary (not [intentionalDisconnect]), it was not the
+         * stale-direct-bond scan-fallback ([staleDirectBond]), it was not our OWN localTerminate bounce
+         * (already counted by [onBondWatchdog]), and we are not already paused. A healthy strap that bonds on
+         * the first connect has didBond == true, so it is never counted and its behaviour is unchanged.
+         */
+        internal fun shouldCountNeverBondedSelfDrop(
+            wasConnected: Boolean,
+            didBond: Boolean,
+            intentionalDisconnect: Boolean,
+            staleDirectBond: Boolean,
+            status: Int,
+            alreadyPausedForBondLoop: Boolean,
+        ): Boolean = wasConnected && !didBond && !intentionalDisconnect && !staleDirectBond &&
+            status != GATT_CONN_TERMINATE_LOCAL_HOST && !alreadyPausedForBondLoop
+
         /** Consecutive bond refusals on the pinned strap before handing the pin off to a different,
          *  live-bonding strap (#52). 3 (not 1): a single "insufficient" can be a transient just-works
          *  race; three in a row on the pin while ANOTHER strap bonds fine is an unrecoverable stale pin.
@@ -4722,6 +4749,40 @@ class WhoopBleClient(
             }
         }
         bondedAtMs = null   // cleared after the bond-loop detector above read it (#617)
+
+        // #982: the OTHER unbounded loop — a strap that connects + subscribes but never bonds, then
+        // self-drops (status 0) BEFORE the escalating bond watchdog fires, advances neither give-up counter
+        // ([onBondWatchdog] only counts its own localTerminate bounce; #617 needs a genuine bond + a
+        // GATT_CONN_TIMEOUT). Feed THIS drop into the SAME #971 give-up counter so the loop is bounded and
+        // hands off to the identical re-pair guide + paused auto-reconnect. `didBond` is still valid here
+        // ([reset] clears it below); [shouldCountNeverBondedSelfDrop] excludes our own localTerminate bounce
+        // to avoid double-counting a cycle. recordBounce() (short-circuited off the gate) increments the
+        // shared streak and returns true only on the bounce that first crosses the give-up threshold.
+        if (shouldCountNeverBondedSelfDrop(
+                wasConnected = wasConnected,
+                didBond = didBond,
+                intentionalDisconnect = intentionalDisconnect,
+                staleDirectBond = staleDirectBond,
+                status = status,
+                alreadyPausedForBondLoop = autoReconnectPausedForBondLoop,
+            ) && bondWatchdogBackoff.recordBounce()
+        ) {
+            log("Strap connects and subscribes but never finishes pairing, then self-drops before the bond watchdog fires (${bondWatchdogBackoff.consecutiveBounces} cycles) — pausing auto-reconnect and surfacing the re-pair guide (#982/#971)")
+            autoReconnectPausedForBondLoop = true
+            bondLoopPausedAtMs = System.currentTimeMillis()   // the #78 hole-4 salvage probe covers this pause too
+            if (_state.value.reconnectGuide == null) {
+                _state.update { it.copy(
+                    reconnectGuide = """
+                    Your strap connects but never finishes pairing with NOOP, so it drops and retries in a loop. This is almost always a stale Bluetooth pairing, usually after a WHOOP firmware update, or the official WHOOP app holding the strap. NOOP works fine once it's re-paired:
+
+                    1. Quit the official WHOOP app (or turn off Bluetooth on that phone).
+                    2. Open Settings → Bluetooth, find your WHOOP, and Forget / Unpair it.
+                    3. Tap the band repeatedly until its LEDs flash blue (pairing mode).
+                    4. Come back here and tap Connect.
+                    """.trimIndent()
+                ) }
+            }
+        }
 
         // Persist anything buffered before tearing down (port of the collector.flush() +
         // flushStandardHR() calls in didDisconnectPeripheral). Runs on the IO scope.
