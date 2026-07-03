@@ -336,6 +336,9 @@ fun AppRoot(viewModel: AppViewModel = viewModel()) {
                             viewModel.openActiveWorkout()
                             nav.navigate(Destination.Live.route)
                         },
+                        // The liquid header's strap battery ring taps through to Devices (iOS parity: the
+                        // battery ring → router.openDevices()).
+                        onOpenDevices = { nav.navigateTopLevel(Destination.Devices.route) },
                     )
                 }
                 composable(Destination.Live.route) {
@@ -448,6 +451,34 @@ fun AppRoot(viewModel: AppViewModel = viewModel()) {
                         "Quick actions",
                         modifier = Modifier.padding(start = 16.dp, top = 4.dp, bottom = 6.dp),
                         color = Palette.textTertiary,
+                    )
+                    // Updates inbox — relocated here off the Today header (the liquid Today header mirrors iOS,
+                    // which has no notifications bell). The feature is fully intact and one tap away: this row
+                    // opens the same inbox sheet, showing the unread count as a trailing badge.
+                    NavigationDrawerItem(
+                        selected = false,
+                        onClick = {
+                            showQuickActions = false
+                            showUpdatesInbox = true
+                        },
+                        icon = { Icon(Icons.Filled.Notifications, contentDescription = null) },
+                        label = { Text("Updates", style = NoopType.body) },
+                        badge = {
+                            val unread = updateStore.unreadCount
+                            if (unread > 0) {
+                                Text(
+                                    if (unread > 99) "99+" else unread.toString(),
+                                    style = NoopType.captionNumber,
+                                    color = Palette.statusCritical,
+                                )
+                            }
+                        },
+                        colors = NavigationDrawerItemDefaults.colors(
+                            unselectedContainerColor = Palette.surfaceRaised,
+                            unselectedIconColor = Palette.accent,
+                            unselectedTextColor = Palette.textPrimary,
+                        ),
+                        modifier = Modifier.padding(NavigationDrawerItemDefaults.ItemPadding),
                     )
                     quickActions.forEach { action ->
                         NavigationDrawerItem(

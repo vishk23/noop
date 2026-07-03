@@ -25,8 +25,8 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
-import androidx.compose.animation.Crossfade
-import androidx.compose.animation.animateColorAsState
+import androidx.compose.animation.core.animateFloatAsState
+import androidx.compose.animation.core.tween
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.DirectionsRun
 import androidx.compose.material.icons.automirrored.filled.DirectionsWalk
@@ -34,6 +34,7 @@ import androidx.compose.material.icons.automirrored.filled.KeyboardArrowRight
 import androidx.compose.material.icons.filled.Accessibility
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Air
+import androidx.compose.material.icons.filled.BatteryUnknown
 import androidx.compose.material.icons.filled.Bedtime
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Favorite
@@ -43,11 +44,9 @@ import androidx.compose.material.icons.filled.Info
 import androidx.compose.material.icons.filled.KeyboardArrowDown
 import androidx.compose.material.icons.filled.MonitorHeart
 import androidx.compose.material.icons.filled.KeyboardArrowUp
-import androidx.compose.material.icons.filled.NotificationsActive
 import androidx.compose.material.icons.filled.Tune
 import androidx.compose.material.icons.filled.Warning
 import androidx.compose.material.icons.outlined.Info
-import androidx.compose.material.icons.outlined.Notifications
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.HorizontalDivider
@@ -80,6 +79,8 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.PathEffect
 import androidx.compose.ui.graphics.Shadow
+import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.input.pointer.PointerEventPass
 import androidx.compose.ui.input.pointer.PointerInputScope
@@ -94,6 +95,7 @@ import androidx.compose.foundation.gestures.detectHorizontalDragGestures
 import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.semantics.clearAndSetSemantics
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
@@ -105,6 +107,7 @@ import androidx.compose.ui.unit.sp
 import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
 import android.app.DatePickerDialog
+import android.view.HapticFeedbackConstants
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.noop.analytics.BaselineState
 import com.noop.analytics.Baselines
@@ -129,9 +132,7 @@ import com.noop.ingest.HealthConnectImporter
 import java.time.Instant
 import java.time.LocalDate
 import java.time.ZoneId
-import java.time.chrono.IsoChronology
 import java.time.format.DateTimeFormatter
-import java.time.format.DateTimeFormatterBuilder
 import java.time.format.FormatStyle
 import java.time.temporal.ChronoUnit
 import java.util.Calendar
@@ -224,6 +225,9 @@ fun TodayScreen(
     // The "workout in progress" indicator card routes to Live and re-opens the in-exercise overlay. Defaulted
     // to a no-op so the call site stays compiling; AppRoot binds it to openActiveWorkout() + nav.navigate(Live).
     onOpenActiveWorkout: () -> Unit = {},
+    // The liquid header battery ring taps through to Devices (iOS parity: the battery ring → router.openDevices()).
+    // Defaulted to fall back to Settings so the call site stays compiling; AppRoot binds it to the Devices route.
+    onOpenDevices: () -> Unit = onOpenSettings,
 ) {
     val today by viewModel.today.collectAsStateWithLifecycle()
     val alert by viewModel.healthAlert.collectAsStateWithLifecycle()
@@ -886,7 +890,7 @@ fun TodayScreen(
         // expresses iOS's `.padding(top: -16)` as a smaller scaffold top padding).
         topPadding = 12.dp,
         // LIQUID SKY BACKDROP (the pilot pattern — LiquidScreenSky.kt): the time-of-day liquid sky sits
-        // behind the WHOLE top region, the TodayTopBar AND the hero vessels, full-bleed (full-width, up
+        // behind the WHOLE top region, the liquid header + wordmark AND the hero vessels, full-bleed (full-width, up
         // behind the status bar via the scaffold's topBackground plumbing), top-aligned, settling into the
         // flat canvas over its lower half so the cards float OVER it on the theme surface. This is the
         // Android equivalent of the iOS `ScreenScaffold(topBackground: liquidScaffoldSky())`: it replaces
@@ -897,47 +901,53 @@ fun TodayScreen(
         // paints the plain dark surface canvas instead, mirroring iOS's `showDayCycleBackground ? ... : nil`.
         topBackground = if (showDayCycleBackground) { { LiquidScreenSky() } } else null,
     ) {
-        // The header recording-status (COMPONENT 3) the top-bar light reflects: Recording while the strap
-        // is connected and a live HR is streaming, else "Last synced Xm ago" from the last offload, else
-        // "Not recording". Today only, a past day isn't "recording", so the light is omitted then.
-        // #580, a connected WHOOP 5/MG streaming live HR but offloading no history reads "Connected"
-        // (history sync experimental on 5.0), overriding the honest resolver. Mirrors Swift `recordingState`.
         item {
-        val headerRecordingState: RecordingState? = if (selectedDayOffset == 0) {
-            if (liveSnap.connected && liveSnap.historySyncExperimental) {
-                RecordingState.HistoryExperimental
-            } else {
-                recordingStateFor(
-                    connected = liveSnap.connected,
-                    // `recordingStateFor` only checks liveHeartRate for nullness (is a stream present), so
-                    // the streaming boolean is sufficient and keeps the per-second bpm tick out of this body.
-                    liveHeartRate = if (liveSnap.hrStreaming) 1 else null,
-                    lastSyncAtSec = liveSnap.lastSyncAt,
-                    nowSec = System.currentTimeMillis() / 1000,
-                )
+        // LIQUID Today header (iOS LiquidTodayView.scene parity), a full structural rebuild to mirror the
+        // iOS liquid Today element-for-element (NOT the old numeric-date + recording-light + bell header):
+        //   LEFT  — a tappable title block: the big rounded-bold day title ("Today" / "Yesterday" / the
+        //           weekday) over a human date line ("Friday, 3 July"). Tap opens the day picker.
+        //   RIGHT — exactly the iOS four controls, in order: a filled HEART (→ Support), the PROFILE
+        //           AVATAR (→ Settings), a "+" ADD button (→ quick actions), and the strap BATTERY RING.
+        // The recording-status light and the notifications BELL are GONE from the header (iOS has neither);
+        // the Updates inbox is relocated into the "+" quick-actions sheet (AppRoot), so the feature stays one
+        // tap away without sitting in the Today header. Staggered in as the first section (index 0).
+        val dayTitle = when (selectedDayOffset) {
+            0 -> "Today"
+            1 -> "Yesterday"
+            else -> {
+                val keyDate = runCatching { LocalDate.parse(selectedDayKey) }.getOrNull() ?: selectedDay
+                keyDate.format(DateTimeFormatter.ofPattern("EEEE", Locale.US))
             }
-        } else {
-            null
         }
-
-        // Apple-style large-title top bar (iOS TodayView.todayTopBar parity): a tappable "Today ⌄" big
-        // title + full date on the LEFT (taps to change day), then a row of UNIFORM 36dp circular icons on
-        // the RIGHT, a recording-status light, the updates bell, the gold quick-add (+), and the
-        // menu/settings avatar. Plain header (no atmosphere card): the day-cycle scene now backs the rings
-        // hero below, mirroring iOS. Staggered in as the first section (index 0).
+        // Human date line under the title — "Friday, 3 July" (weekday + day + month), NOT a numeric date.
+        // Dated by the row ACTUALLY on screen (selectedDayKey follows the resolver at offset 0), matching
+        // the iOS `dateLine` (EEEE, d MMMM). Mirrors iOS's date-under-title block.
+        val humanDate = run {
+            val keyDate = runCatching { LocalDate.parse(selectedDayKey) }.getOrNull() ?: selectedDay
+            keyDate.format(DateTimeFormatter.ofPattern("EEEE, d MMMM", Locale.US))
+        }
         Box(modifier = Modifier.fillMaxWidth().staggeredAppear(0)) {
-            TodayTopBar(
-                dateText = dayNavNumericDate(selectedDay),
+            LiquidTodayHeader(
+                dayTitle = dayTitle,
+                humanDate = humanDate,
                 selectedDay = selectedDay,
-                recordingState = headerRecordingState,
+                batteryPct = if (liveSnap.connected) liveSnap.batteryPct else null,
                 onPickDay = { offset -> selectedDayOffset = offset },
-                updateStore = updateStore,
-                onOpenUpdates = onOpenUpdates,
+                onSupport = onSupport,
                 onQuickActions = onQuickActions,
                 onOpenSettings = onOpenSettings,
-                onRecordingTap = onOpenSettings,
+                onOpenDevices = onOpenDevices,
             )
         }
+        }
+
+        // WORDMARK, a subtle centred "N O O P" on the sky between the header and the hero (iOS LiquidWordmark
+        // parity). White @ ~50% opacity, letter-spaced, perfectly centred; a tap plays a small random wiggle
+        // easter egg. The old Android Today had NO wordmark; this adds it. Staggered in just after the header.
+        item {
+            Box(modifier = Modifier.fillMaxWidth().staggeredAppear(0)) {
+                LiquidWordmark()
+            }
         }
 
         // A "workout in progress" indicator whenever a manual workout is active (iOS parity: the Today
@@ -1063,6 +1073,17 @@ fun TodayScreen(
                 onScoreInfo = openGuide,
                 onChargeTap = { showChargeBreakdown = true },
             )
+        }
+        }
+
+        // HEART RATE, the live HR thread / trend card, directly under the hero — the SAME order as the iOS
+        // liquid Today (scene → heartRateSection → yourCardsSection). It carries its own live-HR thread + the
+        // banked 5-minute fallback + the "connect your strap" empty state, all self-contained (its own data
+        // loads), so moving it up here is a pure re-order that preserves every binding. Mirrors iOS
+        // heartRateSection sitting first after the hero.
+        item {
+        Box(modifier = Modifier.fillMaxWidth().staggeredAppear(5)) {
+            HeartRateTrendCard(viewModel, days, selectedDay, todayDate, displayMetric, effortScale)
         }
         }
 
@@ -1232,11 +1253,6 @@ fun TodayScreen(
                 metricsExpanded = metricsExpanded,
                 onToggleMetrics = { metricsExpanded = !metricsExpanded },
             )
-        }
-        }
-        item {
-        Box(modifier = Modifier.fillMaxWidth().staggeredAppear(5)) {
-            HeartRateTrendCard(viewModel, days, selectedDay, todayDate, displayMetric, effortScale)
         }
         }
         item {
@@ -1439,66 +1455,6 @@ private fun WorkoutInProgressCard(
 }
 
 /**
- * The Updates "ringer": a bell glyph on a 36dp inset disc (textSecondary tint) with a small unread-count
- * badge overlaid top-trailing when [unreadCount] > 0. Sized to the uniform 36dp top-bar icon
- * ([Metrics.iconButton]) so it matches the recording light, the + and the avatar. Tapping opens the inbox
- * sheet. Mirrors the iOS `updateBell` (bell.badge + a statusCritical capsule on a 36pt circle). No glow.
- */
-@Composable
-private fun UpdateBell(unreadCount: Int, onClick: () -> Unit) {
-    val label = if (unreadCount > 0) "Updates, $unreadCount unread" else "Updates"
-    Box(
-        // The outer Box is NOT clipped so the gold count pill can overflow the disc's top-trailing corner;
-        // the inset disc inside carries the CircleShape clip + fill. There's no ripple (indication = null).
-        modifier = Modifier
-            .size(Metrics.iconButton)
-            .clickable(
-                interactionSource = remember { MutableInteractionSource() },
-                indication = null,
-                onClick = onClick,
-            )
-            .semantics { contentDescription = label },
-        contentAlignment = Alignment.Center,
-    ) {
-        Box(
-            modifier = Modifier
-                .size(Metrics.iconButton)
-                .clip(CircleShape)
-                .background(Palette.surfaceInset),
-            contentAlignment = Alignment.Center,
-        ) {
-            Icon(
-                if (unreadCount > 0) Icons.Filled.NotificationsActive else Icons.Outlined.Notifications,
-                contentDescription = null,
-                tint = Palette.textSecondary,
-                modifier = Modifier.size(Metrics.iconSmall),
-            )
-        }
-        if (unreadCount > 0) {
-            // Unread count pill (statusCritical, crisp-white count), nudged into the top-trailing corner
-            // over the bell, the Design-Reset semantic for an unread/attention dot. Mirrors the iOS
-            // updateBell, which fills the capsule with StrandPalette.statusCritical and reads the count white.
-            Box(
-                modifier = Modifier
-                    .align(Alignment.TopEnd)
-                    .offset(x = 3.dp, y = (-2).dp)
-                    .clip(RoundedCornerShape(Metrics.cornerPill))
-                    .background(Palette.statusCritical)
-                    .padding(horizontal = 4.dp, vertical = 1.dp),
-            ) {
-                Text(
-                    if (unreadCount > 99) "99" else unreadCount.toString(),
-                    style = NoopType.footnote.copy(fontSize = 9.sp),
-                    // Crisp white on the critical fill (iOS goldDeepText = #FFFFFF post-reset); a fixed white
-                    // here, not the theme-dependent goldDeepText (brown in light mode), keeps the count legible.
-                    color = Color(0xFFFFFFFF),
-                )
-            }
-        }
-    }
-}
-
-/**
  * A small top-trailing × for a Today info-card that has no built-in dismiss control (the shared
  * [DataPendingNote]). Matches the "New here?" card's × styling. Dismisses the card into the inbox.
  */
@@ -1521,18 +1477,18 @@ private fun TodayCardDismissButton(onClick: () -> Unit, modifier: Modifier = Mod
 
 @Composable
 private fun QuickActionDisc(onClick: () -> Unit) {
+    val interaction = remember { MutableInteractionSource() }
     Box(
         modifier = Modifier
-            // Uniform 36dp top-bar icon ([Metrics.iconButton]) so the + matches the recording light, bell
-            // and avatar, the accented (reset-blue) primary among an otherwise neutral set (iOS parity).
-            .size(Metrics.iconButton)
+            // 34dp to sit level with the heart / avatar / battery ring in the liquid header cluster.
+            .size(34.dp)
+            .liquidPress(interaction)
             .clip(CircleShape)
-            // Flat accent fill + a faint accent hairline (Design Reset: a + action reads on the blue accent,
-            // never gold). Mirrors the iOS quick-action +, a glyph on Circle().fill(StrandPalette.accent).
-            .background(Palette.accent)
-            .border(0.5.dp, Palette.accent.copy(alpha = 0.5f), CircleShape)
+            // A translucent-white disc so the + reads on the day-of-sky like the rest of the liquid cluster,
+            // with a crisp white glyph. Mirrors iOS LiquidAddButton (a "plus" on Circle().fill(.white@0.16)).
+            .background(Color.White.copy(alpha = 0.16f))
             .clickable(
-                interactionSource = remember { MutableInteractionSource() },
+                interactionSource = interaction,
                 indication = null,
                 onClick = onClick,
             )
@@ -1542,9 +1498,8 @@ private fun QuickActionDisc(onClick: () -> Unit) {
         Icon(
             Icons.Filled.Add,
             contentDescription = null,
-            // Crisp white glyph on the accent fill (iOS goldDeepText = #FFFFFF post-reset).
-            tint = Color(0xFFFFFFFF),
-            modifier = Modifier.size(18.dp),
+            tint = Color.White,
+            modifier = Modifier.size(16.dp),
         )
     }
 }
@@ -1624,37 +1579,6 @@ private fun ScoringGuideIntroCard(onOpen: () -> Unit, onDismiss: () -> Unit) {
     }
 }
 
-// MARK: - Today top bar (iOS TodayView.todayTopBar parity)
-//
-// A compact header: JUST the selected day as a small locale-numeric date on the LEFT (taps to open the date
-// picker), then a trailing row of UNIFORM 36dp circular icons (a recording-status light, the updates bell,
-// the gold quick-add (+), and the menu/settings avatar). No "Today" / "Yesterday" word, no prev/next
-// chevrons and no full-date subtitle now: day-change is by horizontal swipe across the dashboard or by
-// tapping the date, and a one-word "Swipe" / "Tap" hint flashes periodically in the accent colour to teach
-// the now-invisible gestures. Mirrors iOS todayTopBar.
-
-/** The top-bar date: JUST the selected day as a SMALL locale-numeric string ("28/06/2026" or "6/28/2026"
- *  per region), driven by the screen's own day (NOT LocalDate.now()) so the header and the data day never
- *  drift. No "Today" / "Yesterday" word and no prev/next arrows now: day-change is by horizontal swipe or
- *  by tapping to open the picker, and a rotating one-word hint teaches both. Mirrors iOS dayNavDateText. */
-private fun dayNavNumericDate(selectedDay: LocalDate): String {
-    // iOS `.numeric` yields a 4-digit year (e.g. 28/06/2026). The plain localized SHORT style yields a
-    // 2-digit year (M/d/yy) in many locales, so we take the locale's SHORT pattern, widen any 2-y year
-    // field ("yy") to a 4-digit one ("yyyy"), and keep every other locale ordering/separator as-is. Locale
-    // -aware: the field order is never hardcoded to a single region.
-    val locale = Locale.getDefault()
-    val shortPattern = DateTimeFormatterBuilder.getLocalizedDateTimePattern(
-        FormatStyle.SHORT, null, IsoChronology.INSTANCE, locale,
-    )
-    // Replace a run of EXACTLY two y (a 2-digit year) with yyyy; leave single-y or already-4-y untouched.
-    val fourDigitYearPattern = shortPattern.replace(Regex("(?<!y)yy(?!y)"), "yyyy")
-    return selectedDay.format(DateTimeFormatter.ofPattern(fourDigitYearPattern, locale))
-}
-
-/** The two one-word day-nav hints flashed in place of the date, alternating, in the accent colour. With the
- *  arrows gone the swipe / tap affordances are otherwise invisible, so this teaches them. Mirrors iOS. */
-private val DAY_NAV_HINTS = listOf("Swipe", "Tap")
-
 // MARK: - Day navigation (#817) - chevron arrows + horizontal swipe, iOS parity
 //
 // `selectedDayOffset` is days-back-from-today (0 = today, 1 = yesterday, …). The header chevrons and a
@@ -1713,17 +1637,26 @@ internal fun dayNavSwipeTarget(selectedOffset: Int, dragX: Float, thresholdPx: F
     else -> dayNavNewer(selectedOffset)
 }
 
+// MARK: - Liquid Today header (iOS LiquidTodayView.scene parity)
+//
+// A STRUCTURAL rebuild to mirror the iOS liquid Today header element-for-element (NOT the old numeric-date +
+// recording-light + bell header). LEFT: a tappable title block — the big rounded-bold day title over a human
+// date line ("Friday, 3 July"), tap opens the day picker. RIGHT: exactly the iOS four controls, in order —
+// a filled HEART (→ Support), the PROFILE AVATAR (→ Settings), a "+" ADD button (→ quick actions), and the
+// strap BATTERY RING (→ Devices). Each ~34dp, spacing ~8dp. There is no recording light and no bell here;
+// iOS's Today header has neither, and the Updates inbox is relocated into the "+" quick-actions sheet.
+
 @Composable
-private fun TodayTopBar(
-    dateText: String,
+private fun LiquidTodayHeader(
+    dayTitle: String,
+    humanDate: String,
     selectedDay: LocalDate,
-    recordingState: RecordingState?,
+    batteryPct: Double?,
     onPickDay: (Int) -> Unit,
-    updateStore: UpdateStore?,
-    onOpenUpdates: () -> Unit,
+    onSupport: () -> Unit,
     onQuickActions: () -> Unit,
     onOpenSettings: () -> Unit,
-    onRecordingTap: () -> Unit,
+    onOpenDevices: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
     var showPicker by remember { mutableStateOf(false) }
@@ -1756,39 +1689,15 @@ private fun TodayTopBar(
         }
     }
 
-    // The rotating one-word hint shown in place of the date (null = show the date). Roughly every 10s it
-    // flashes a hint for ~1.5s, alternating "Swipe" / "Tap", in the accent colour, then returns to the date.
-    // With the arrows gone these are the only cues for the swipe / tap day-nav, so this teaches them. One
-    // coroutine, auto-cancelled when the top bar leaves composition (no leaked timer). Mirrors iOS .task.
-    var dayNavHint by remember { mutableStateOf<String?>(null) }
-    LaunchedEffect(Unit) {
-        var i = 0
-        while (true) {
-            kotlinx.coroutines.delay(10_000)
-            dayNavHint = DAY_NAV_HINTS[i % DAY_NAV_HINTS.size]
-            i++
-            kotlinx.coroutines.delay(1_500)
-            dayNavHint = null
-        }
-    }
-    // Fade the colour between the normal date (primary) and the accent-coloured hint, mirroring the iOS
-    // easeInOut colour swap. The text itself crossfades between the date string and the hint word.
-    val dateColor by animateColorAsState(
-        targetValue = if (dayNavHint != null) Palette.accent else Palette.textPrimary,
-        label = "day-nav-hint-color",
-    )
-
     Row(
         modifier = modifier.fillMaxWidth(),
-        verticalAlignment = Alignment.CenterVertically,
+        verticalAlignment = Alignment.Top,
         horizontalArrangement = Arrangement.spacedBy(8.dp),
     ) {
-        // LEFT side: JUST the date, small (locale numeric), no relative word and no prev/next arrows. Taps open
-        // the date picker; a horizontal swipe across the dashboard still changes the day. Every ~10s it
-        // swaps for ~1.5s to a one-word "Swipe" / "Tap" hint in the accent colour so users learn the now-
-        // invisible day-nav gestures. weight(1f) so the date claims the leading room and never pushes the
-        // trailing icon cluster, which sits after this. Mirrors iOS dayNavDateText + the .task hint loop.
-        Box(
+        // LEFT: the tappable title block — big rounded-bold day title over the human date line. Taps open the
+        // day picker; a horizontal swipe across the dashboard still changes the day. weight(1f) so the title
+        // claims the leading room and never pushes the trailing control cluster. Mirrors iOS's title Button.
+        Column(
             modifier = Modifier
                 .weight(1f)
                 .clip(RoundedCornerShape(Metrics.cornerSm))
@@ -1798,102 +1707,225 @@ private fun TodayTopBar(
                     onClickLabel = "Change day",
                     onClick = { showPicker = true },
                 )
-                .semantics { contentDescription = "$dateText. Swipe or tap to change day" },
+                .semantics { contentDescription = "$dayTitle, $humanDate. Tap to pick a day, swipe to change day." },
+            verticalArrangement = Arrangement.spacedBy(2.dp),
         ) {
-            Crossfade(targetState = dayNavHint ?: dateText, label = "day-nav-date") { label ->
-                Text(
-                    label,
-                    // ~13sp SemiBold, matching the iOS .system(size: 13, weight: .semibold). subhead is the
-                    // 13sp house style; override its weight to semibold for the bolder date stamp.
-                    style = NoopType.subhead.copy(fontWeight = FontWeight.SemiBold),
-                    color = dateColor,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis,
-                )
-            }
+            Text(
+                dayTitle,
+                // ~28sp Bold rounded, matching iOS `StrandFont.rounded(28)`. A soft shadow so it reads on the
+                // day-of-sky. NoopType.number is the house tabular sans; Bold at 28 is the display day title.
+                style = NoopType.number(28f, weight = FontWeight.Bold)
+                    .copy(shadow = Shadow(color = Color.Black.copy(alpha = 0.4f), offset = Offset(0f, 1f), blurRadius = 10f)),
+                color = Color.White,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+            Text(
+                humanDate,
+                style = NoopType.caption.copy(shadow = Shadow(color = Color.Black.copy(alpha = 0.35f), offset = Offset(0f, 1f), blurRadius = 8f)),
+                color = Color.White.copy(alpha = 0.78f),
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
         }
 
-        // RIGHT, the UNIFORM 36dp circular icon set: recording-status light · bell · + · avatar. All
-        // share Metrics.iconButton (36dp), matching iOS's uniform-size top-bar icons.
+        // RIGHT: the iOS four controls, in order — heart · avatar · + · battery ring. Each ~34dp, 8dp apart.
         Row(
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.spacedBy(8.dp),
         ) {
-            // Recording-status light, a colour-coded dot inside a 36dp inset disc (green recording /
-            // amber synced / red not-recording / accent experimental). The chip ALWAYS renders so the icon
-            // row never jumps when you scrub to a past day; a past day (null state) shows a muted,
-            // non-interactive dot, recording status only means something for today. Mirrors iOS.
-            RecordingStatusLight(state = recordingState, onClick = onRecordingTap)
-            // Updates bell (36dp inset disc + gold unread pill).
-            if (updateStore != null) {
-                UpdateBell(unreadCount = updateStore.unreadCount, onClick = onOpenUpdates)
-            }
-            // Quick-add (+), the accented gold primary, same 36dp as the rest.
-            QuickActionDisc(onClick = onQuickActions)
-            // Menu / settings avatar, the loop mark when no photo, same 36dp.
+            // (a) Support / donate heart — a filled heart in the charge-green tint (iOS chargeColor). NOOP is
+            // free forever; donations are optional. Mirrors iOS `heart.fill` → showSupport.
+            HeaderHeartButton(onSupport = onSupport)
+            // (b) Profile avatar (the photo set in Settings, or the NOOP loop mark) → Settings. Mirrors iOS.
             Box(
                 modifier = Modifier
-                    .size(Metrics.iconButton)
+                    .size(34.dp)
                     .clip(CircleShape)
                     .clickable(
                         interactionSource = remember { MutableInteractionSource() },
                         indication = null,
                         onClick = onOpenSettings,
                     )
-                    .semantics { contentDescription = "Menu and settings" },
+                    .semantics { contentDescription = "Profile and settings" },
                 contentAlignment = Alignment.Center,
             ) {
-                ProfileAvatar(size = Metrics.iconButton)
+                ProfileAvatar(size = 34.dp)
             }
+            // (c) Quick-add (+), the accented primary. Mirrors iOS's LiquidAddButton (a glyph on a translucent
+            // disc → the quick-actions menu). Sized 34dp to match the rest of the liquid cluster.
+            QuickActionDisc(onClick = onQuickActions)
+            // (d) Strap battery ring showing the % (iOS LiquidBatteryButton). Tap → Devices.
+            LiquidBatteryRing(batteryPct = batteryPct, onClick = onOpenDevices)
         }
     }
 }
 
-/** The top-bar recording-status light: a 36dp inset disc with a centred colour-coded dot, green while
- *  recording, amber after a recent sync, red when not recording, accent for the 5.0 experimental-history
- *  state. The chip ALWAYS renders so the top-bar icon row never jumps when you scrub to a past day; a past
- *  day ([state] == null, no live state) shows a MUTED dot (textTertiary at 0.4 alpha) and is NON-clickable,
- *  recording status only means something for today. Tap (today only) routes to connect. Mirrors the iOS
- *  top-bar RecordingStatusLight + recordingHue (a plain dot). */
+/** The header Support heart (iOS `heart.fill` → showSupport): a filled heart in the charge-green tint on a
+ *  34dp tap target, with a soft shadow so it reads on the day-of-sky. NOOP is free forever; a tap opens the
+ *  optional Support sheet. Mirrors the iOS liquid header heart. */
 @Composable
-private fun RecordingStatusLight(state: RecordingState?, onClick: () -> Unit) {
-    // A live state colours the dot; a past day (null) reads as a muted, non-actionable tertiary dot.
-    val hue = when (state) {
-        RecordingState.Recording -> Palette.statusPositive
-        is RecordingState.LastSynced -> Palette.statusWarning
-        RecordingState.NotRecording -> Palette.statusCritical
-        RecordingState.HistoryExperimental -> Palette.accent
-        null -> Palette.textTertiary.copy(alpha = 0.4f)
-    }
-    val label = if (state != null) {
-        "${state.title}. ${state.detail}"
-    } else {
-        "Recording status, not shown for a past day"
-    }
-    // Only today's chip is tappable; a past day's muted dot is inert (no clickable, matching iOS .disabled).
-    val base = Modifier
-        .size(Metrics.iconButton)
-        .clip(CircleShape)
-        .background(Palette.surfaceInset)
-    val tappable = if (state != null) {
-        base.clickable(
-            interactionSource = remember { MutableInteractionSource() },
-            indication = null,
-            onClick = onClick,
-        )
-    } else {
-        base
-    }
+private fun HeaderHeartButton(onSupport: () -> Unit) {
+    val interaction = remember { MutableInteractionSource() }
     Box(
-        modifier = tappable.semantics { contentDescription = label },
+        modifier = Modifier
+            .size(34.dp)
+            .liquidPress(interaction)
+            .clickable(
+                interactionSource = interaction,
+                indication = null,
+                onClick = onSupport,
+            )
+            .semantics {
+                contentDescription =
+                    "Support NOOP. It's free; donations are optional and help development."
+            },
         contentAlignment = Alignment.Center,
     ) {
-        Box(
-            modifier = Modifier
-                .size(10.dp)
-                .clip(CircleShape)
-                .background(hue),
+        Icon(
+            Icons.Filled.Favorite,
+            contentDescription = null,
+            tint = Palette.chargeColor,
+            modifier = Modifier.size(19.dp),
         )
+    }
+}
+
+/** The strap battery ring (iOS LiquidBatteryButton): a 34dp translucent disc with a hairline rim; when a
+ *  reading exists it draws a trimmed ring in the charge/warning/critical hue plus the % inside, else a
+ *  bolt-slash glyph. Tap → Devices. Mirrors the iOS liquid header battery ring. */
+@Composable
+private fun LiquidBatteryRing(batteryPct: Double?, onClick: () -> Unit) {
+    val interaction = remember { MutableInteractionSource() }
+    val label = batteryPct?.let { "Strap battery ${it.roundToInt()} percent" } ?: "Strap battery"
+    Box(
+        modifier = Modifier
+            .size(34.dp)
+            .liquidPress(interaction)
+            .clip(CircleShape)
+            // A translucent near-black disc + faint white rim, matching iOS (rgba(10,11,16,.5) + white@.15).
+            .background(Color(red = 10f / 255f, green = 11f / 255f, blue = 16f / 255f, alpha = 0.5f))
+            .border(1.dp, Color.White.copy(alpha = 0.15f), CircleShape)
+            .clickable(
+                interactionSource = interaction,
+                indication = null,
+                onClick = onClick,
+            )
+            .semantics { contentDescription = label },
+        contentAlignment = Alignment.Center,
+    ) {
+        if (batteryPct != null) {
+            val pct = batteryPct.coerceIn(0.0, 100.0)
+            val ringColor = when {
+                pct < 15 -> Palette.statusCritical
+                pct < 35 -> Palette.statusWarning
+                else -> Palette.chargeColor
+            }
+            Canvas(modifier = Modifier.size(34.dp).padding(2.5.dp)) {
+                val strokePx = 3.dp.toPx()
+                val d = size.minDimension - strokePx
+                val topLeft = Offset((size.width - d) / 2f, (size.height - d) / 2f)
+                // Track.
+                drawArc(
+                    color = Color.White.copy(alpha = 0.10f),
+                    startAngle = -90f,
+                    sweepAngle = 360f,
+                    useCenter = false,
+                    topLeft = topLeft,
+                    size = Size(d, d),
+                    style = Stroke(width = strokePx, cap = StrokeCap.Round),
+                )
+                // Fill arc (min 2% so a near-flat battery still shows a cap), clockwise from 12 o'clock.
+                drawArc(
+                    color = ringColor,
+                    startAngle = -90f,
+                    sweepAngle = (360f * (pct / 100.0).coerceIn(0.02, 1.0)).toFloat(),
+                    useCenter = false,
+                    topLeft = topLeft,
+                    size = Size(d, d),
+                    style = Stroke(width = strokePx, cap = StrokeCap.Round),
+                )
+            }
+            Text(
+                "${pct.roundToInt()}",
+                style = NoopType.number(9f, weight = FontWeight.Bold),
+                color = Color.White.copy(alpha = 0.9f),
+            )
+        } else {
+            Icon(
+                Icons.Filled.BatteryUnknown,
+                contentDescription = null,
+                tint = Color.White.copy(alpha = 0.5f),
+                modifier = Modifier.size(15.dp),
+            )
+        }
+    }
+}
+
+// MARK: - NOOP wordmark (iOS LiquidWordmark parity — centred, with a tap easter egg)
+//
+// The subtle "N O O P" wordmark that sits on the sky between the header and the hero. Built as a row of
+// letters (not one tracked string, which adds a trailing gap after the last glyph and pushes the word
+// off-centre), so it sits DEAD centre, white @ ~50% opacity. A tap plays one of several random one-shot
+// animations — wiggle / shake / flip / spin / bounce / jelly squash. Mirrors iOS LiquidWordmark.
+
+@Composable
+private fun LiquidWordmark() {
+    val reduced = rememberReduceMotion()
+    var rot by remember { mutableStateOf(0f) }        // z-rotation (wiggle / spin)
+    var scaleX by remember { mutableStateOf(1f) }     // horizontal scale (jelly squash)
+    var scaleY by remember { mutableStateOf(1f) }     // vertical scale (bounce / jelly)
+    var dx by remember { mutableStateOf(0f) }         // horizontal offset (shake)
+    var egg by remember { mutableIntStateOf(0) }      // which egg to play (drives the LaunchedEffect)
+
+    val view = LocalView.current
+    val animRot by animateFloatAsState(rot, tween(durationMillis = if (reduced) 0 else 520), label = "wordmark-rot")
+    val animScaleX by animateFloatAsState(scaleX, tween(durationMillis = if (reduced) 0 else 380), label = "wordmark-sx")
+    val animScaleY by animateFloatAsState(scaleY, tween(durationMillis = if (reduced) 0 else 380), label = "wordmark-sy")
+    val animDx by animateFloatAsState(dx, tween(durationMillis = if (reduced) 0 else 420), label = "wordmark-dx")
+
+    // On each tap, kick a value to an extreme then settle it back so the animateFloatAsState eases through
+    // to rest — a natural wobble without hand-authored keyframes. Six variants, chosen at random per tap.
+    LaunchedEffect(egg) {
+        if (egg == 0) return@LaunchedEffect
+        when ((0..5).random()) {
+            0 -> { rot = -12f; kotlinx.coroutines.delay(90); rot = 0f }            // wiggle
+            1 -> { dx = -12f; kotlinx.coroutines.delay(90); dx = 0f }              // shake
+            2 -> { rot += 360f }                                                    // spin
+            3 -> { scaleX = 1.28f; scaleY = 1.28f; kotlinx.coroutines.delay(90); scaleX = 1f; scaleY = 1f } // bounce
+            4 -> { scaleX = 1.35f; scaleY = 0.7f; kotlinx.coroutines.delay(90); scaleX = 1f; scaleY = 1f }  // jelly
+            else -> { rot += 360f }                                                 // flip (spin twin)
+        }
+    }
+
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clickable(
+                interactionSource = remember { MutableInteractionSource() },
+                indication = null,
+            ) {
+                egg += 1
+                view.performHapticFeedback(HapticFeedbackConstants.KEYBOARD_TAP)
+            }
+            .graphicsLayer {
+                rotationZ = animRot
+                this.scaleX = animScaleX
+                this.scaleY = animScaleY
+                translationX = animDx
+            }
+            .clearAndSetSemantics {}, // decorative wordmark — invisible to TalkBack
+        horizontalArrangement = Arrangement.spacedBy(14.dp, Alignment.CenterHorizontally),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        "NOOP".forEach { ch ->
+            Text(
+                ch.toString(),
+                style = NoopType.number(16f, weight = FontWeight.Bold)
+                    .copy(shadow = Shadow(color = Color.Black.copy(alpha = 0.25f), offset = Offset(0f, 1f), blurRadius = 6f)),
+                color = Color.White.copy(alpha = 0.5f),
+            )
+        }
     }
 }
 
