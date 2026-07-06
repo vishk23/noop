@@ -1066,10 +1066,15 @@ class WhoopBleClient(
      *  The wire value is `incrementAndGet() and 0xFF` (0..255, wraps). iOS is @MainActor so needs no atomic. */
     private val seq = AtomicInteger(0)
 
-    /** True once the confirmed-write bond ACK lands (Swift `didBond`). */
+    /** True once the confirmed-write bond ACK lands (Swift `didBond`). @Volatile: written in a GATT
+     *  callback (binder thread on API 26/27) and read in the onBondWatchdog / keepAlive main-looper
+     *  timers, so it needs cross-thread visibility. (ryanbr, #1032) */
+    @Volatile
     private var didBond = false
 
-    /** Runs the connect handshake EXACTLY ONCE per connection (Swift `connectHandshakeDone`). */
+    /** Runs the connect handshake EXACTLY ONCE per connection (Swift `connectHandshakeDone`). @Volatile:
+     *  written in a GATT callback (binder thread), read in beginBackfill (main-looper timer). (ryanbr, #1032) */
+    @Volatile
     private var connectHandshakeDone = false
 
     /** True when the user asked to disconnect; suppresses the auto-rescan (Swift `intentionalDisconnect`).
@@ -3539,8 +3544,10 @@ class WhoopBleClient(
             while (idx + 1 < data.size) {
                 val raw = (data[idx].toInt() and 0xFF) or ((data[idx + 1].toInt() and 0xFF) shl 8)
                 idx += 2
-                // Convert 1/1024 s units to milliseconds (matches the WHOOP store's R-R in ms).
-                rr.add((raw * 1000) / 1024)
+                // Convert 1/1024 s units to milliseconds (matches the WHOOP store's R-R in ms). ROUNDED,
+                // byte-identical to StandardHeartRate.parse + the Swift twin; plain integer division
+                // truncated, diverging up to ~0.5 ms per interval into RMSSD/HRV. (ryanbr, #1032)
+                rr.add(Math.round(raw / 1024.0 * 1000.0).toInt())
             }
         }
 

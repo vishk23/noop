@@ -15,6 +15,8 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 
 /**
  * Runs exactly ONE device's live BLE at a time, driven by [DeviceRegistry]'s active device id.
@@ -158,6 +160,12 @@ class SourceCoordinator(
      *  reconnect through the scan path. Cleared on disconnect (null address). */
     private var connectedWhoopAddress: String? = null
 
+    /** Serializes [reconcile] so two device switches — or [start] racing [onActiveDeviceChanged] — can't
+     *  interleave on the multi-threaded [scope] (Dispatchers.IO is a pool) and leak a half-torn-down live
+     *  source. The Swift twin gets this free from `@MainActor`; on Android we serialize the state machine
+     *  explicitly. The persist launches stay OUTSIDE this lock (they touch no coordinator state). (ryanbr, #1031) */
+    private val reconcileLock = Mutex()
+
     /**
      * Reconcile once against the CURRENT active id (launch). For a single-WHOOP install this resolves to
      * the WHOOP and is a pure no-op, so the existing WHOOP startup is untouched.
@@ -165,7 +173,7 @@ class SourceCoordinator(
     fun start() {
         scope.launch {
             val id = registry.activeDeviceId() ?: WhoopBleClient.DEFAULT_DEVICE_ID
-            reconcile(id)
+            reconcileLock.withLock { reconcile(id) }
         }
     }
 
@@ -175,7 +183,7 @@ class SourceCoordinator(
      * repeated call for the same id is dropped (the `removeDuplicates()` equivalent).
      */
     fun onActiveDeviceChanged(id: String) {
-        scope.launch { reconcile(id) }
+        scope.launch { reconcileLock.withLock { reconcile(id) } }
     }
 
     /**

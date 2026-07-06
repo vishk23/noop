@@ -442,6 +442,23 @@ abstract class WhoopDatabase : RoomDatabase() {
                     MIGRATION_10_11, MIGRATION_11_12, MIGRATION_12_13, MIGRATION_13_14,
                     MIGRATION_14_15, MIGRATION_15_16,
                 )
+                // #1037: a FRESH install builds the schema straight at the current version and runs NO
+                // migrations, so the MIGRATION_7_8 "my-whoop" registry seed never fires and the WHOOP,
+                // though paired and streaming fine, never appears in the Devices list. Seed the canonical
+                // row on create too (same idempotent INSERT OR IGNORE as the migration) so a first-ever
+                // install still lists its WHOOP. iOS/GRDB re-runs migrations on a fresh DB, so it never hit this.
+                .addCallback(object : RoomDatabase.Callback() {
+                    override fun onCreate(db: SupportSQLiteDatabase) {
+                        val now = System.currentTimeMillis() / 1000
+                        db.execSQL(
+                            "INSERT OR IGNORE INTO `pairedDevice` " +
+                                "(`id`, `brand`, `model`, `nickname`, `sourceKind`, `capabilities`, " +
+                                "`status`, `addedAt`, `lastSeenAt`) VALUES " +
+                                "('my-whoop', 'WHOOP', 'WHOOP', NULL, 'liveBLE', " +
+                                "'hr,hrv,spo2,skinTemp,sleep,strainLoad', 'active', $now, $now)",
+                        )
+                    }
+                })
                 .build()
     }
 }
