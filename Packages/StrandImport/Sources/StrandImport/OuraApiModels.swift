@@ -30,3 +30,17 @@ public struct OuraDailyExtra: Sendable, Equatable {
     public let value: Double
     public init(day: String, key: String, value: Double) { self.day = day; self.key = key; self.value = value }
 }
+
+/// One Oura workout (→ the `workout` table on write). Times are UTC; metric fields nil when absent.
+public struct OuraWorkout: Sendable, Equatable {
+    public let start: Date
+    public let end: Date
+    public let activity: String
+    public let source: String
+    public let energyKcal: Double?
+    public let distanceM: Double?
+    public init(start: Date, end: Date, activity: String, source: String, energyKcal: Double?, distanceM: Double?) {
+        self.start = start; self.end = end; self.activity = activity; self.source = source
+        self.energyKcal = energyKcal; self.distanceM = distanceM
+    }
+}
