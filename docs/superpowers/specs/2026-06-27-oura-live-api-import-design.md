@@ -8,6 +8,19 @@
 
 ---
 
+## 0. v8.5.2 reconciliation (2026-06-30)
+
+This spec was written against v7.2.3; work now targets upstream **v8.5.2** (`ryanbr/noop`, on branch `oura-cloud-import`). Corrections below are verified against current code and **supersede the inline references** further down:
+
+- **Migration number.** The WhoopStore migrator is at **v23** (not v18); the `ouraRaw` table (§4/§8.5/§14) is migration **v24** (not v19 — `v19-step-activity-class`…`v23-daily-spo2-raw` already exist).
+- **Provenance (§8.4).** Register the cloud source as `PairedDevice.sourceKind = .cloudImport` — it already exists (`PairedDevice.swift:42`) and is treated as non-day-owning (`IntelligenceEngine.swift:1369`), so **no new SourceKind is needed**. `deviceId = "oura-api"` stands; `DataSourceKind.ouraApi` is now *optional* (add only if a StrandImport-level provenance tag is actually consumed).
+- **`motionJSON` (§8.2).** Written via the dedicated `persistSessionMotion(deviceId:sessionStart:motionEpochs:[Double])` (`MetricsCache.swift:234`), **not** through `upsertSleepSessions` (`CachedSleepSession` has no `motionJSON` field). Map `movement30s` `[Int]→[Double]`.
+- **New integration points.** Add `"oura-api"` to `Repository.wearableImportSources` (`Repository.swift:452`) if it should join the import-source union; disconnect via the actor `store.deleteAllData(deviceId:)` (`DataSourcesView.swift:598`), not `DeviceRegistryStore` directly (avoids a main-actor stall).
+- **UI (§9).** `DataSourcesView` is entirely file-picker cards today; the live "connect/adopt" precedent is `AddDeviceWizard.swift`. Decide explicitly whether cloud Oura is an *import card* (mirrors the export card) or a *connect-device* flow — the OAuth "Connect" button is a new pattern here.
+- **Confirmed intact (no change):** the `Wearable*` models + initializers, all five upsert APIs and their row structs, every target table shape, and the network-free-packages invariant. The `#862` export-parser hardening **confirmed** our field mapping (incl. the nested `spo2_percentage.average`). The foundation design holds.
+
+---
+
 ## 1. Summary
 
 NOOP already imports a user's own Oura data from the **account export file** (a single JSON), parsed by

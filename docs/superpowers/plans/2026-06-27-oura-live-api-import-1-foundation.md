@@ -2,9 +2,16 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
+> **⚠️ v8.5.2 reconciliation (2026-06-30).** Written against v7.2.3; this branch (`oura-cloud-import`) is rebased onto upstream **v8.5.2** (`ryanbr/noop`). Deltas verified against current code:
+> 1. **Migration is `v24`, not `v19`.** The migrator is at **v23** (`v19-step-activity-class` … `v23-daily-spo2-raw`); append `v24-oura-raw` after the v23 block. (Fixed inline in Task 1.)
+> 2. **Provenance (Plan 3):** register the source with `PairedDevice.sourceKind = .cloudImport` — it already exists (`PairedDevice.swift:42`) and is treated as non-day-owning (`IntelligenceEngine.swift:1369`). Do **not** invent a new SourceKind; keep `deviceId = "oura-api"`.
+> 3. **`motionJSON` (Plan 3)** is written via the dedicated `persistSessionMotion(deviceId:sessionStart:motionEpochs:[Double])` (`MetricsCache.swift:234`) after the sleep upsert (not through it); map `movement30s` `[Int]→[Double]`.
+> 4. Also add `"oura-api"` to `Repository.wearableImportSources` (`Repository.swift:452`); disconnect via the actor `store.deleteAllData(deviceId:)` (`DataSourcesView.swift:598`).
+> 5. Citations shifted: `WhoopTime.parseISOWithOffset` → `CSVParsing.swift:509`; `WearableJSON` is in `WearableExportImporter.swift:329`. **Tasks 2–5 compile against v8.5.2 unchanged** — only Task 1's migration number moves.
+
 **Goal:** Build the network-free core of the Oura live-API lane — the lossless raw payload store and the pure JSON→model parsers (incl. the sleep hypnogram) — fully unit-tested, touching only new files plus one additive migration.
 
-**Architecture:** Two packages, additive only. `WhoopStore` gains a `ouraRaw` table (migration **v19**) and an `OuraRawStore` extension mirroring `MetricSeriesStore`. `StrandImport` gains pure decoders (`OuraHypnogram`, `OuraApiParser`) and small neutral model structs that reuse the existing `OuraExportParser` field semantics, `WhoopTime`, and `WearableJSON`. No networking, no edits to existing exhaustive switches, no app-target changes — so this plan can't break any existing build path. The fetch layer, auth, writer, and UI come in Plans 2–3.
+**Architecture:** Two packages, additive only. `WhoopStore` gains a `ouraRaw` table (migration **v24**) and an `OuraRawStore` extension mirroring `MetricSeriesStore`. `StrandImport` gains pure decoders (`OuraHypnogram`, `OuraApiParser`) and small neutral model structs that reuse the existing `OuraExportParser` field semantics, `WhoopTime`, and `WearableJSON`. No networking, no edits to existing exhaustive switches, no app-target changes — so this plan can't break any existing build path. The fetch layer, auth, writer, and UI come in Plans 2–3.
 
 **Tech Stack:** Swift 5.9, GRDB 6.29.3 (pinned), XCTest, `Foundation`. iOS 16 / macOS 13 (both package platforms; the lane ships iOS-only but the packages stay multi-platform).
 
@@ -14,18 +21,18 @@ Every task implicitly includes these (verbatim from the spec):
 - **Packages stay network-free.** No `URLSession`/`URLRequest`/`NWConnection` in `StrandImport` or `WhoopStore`. (`StrandImport` banner: "STAY OFFLINE: nothing here touches the network.")
 - **Honest data.** Oura's own scores (readiness/sleep/activity/resilience) are written ONLY under reference keys (`ref_*`) or namespaced (`oura_*`) — never as a NOOP score column (`recovery`/`strain`). NOOP recomputes downstream.
 - **Untrusted input is hostile.** Parse via the existing `WearableJSON` finite/range-checked coercion (`dbl`/`int`/`posInt`/`posDbl`/`str`); never trap on attacker NaN/inf/huge values.
-- **Additive migrations only.** New tables/indexes; never alter or drop existing rows. The live migrator is at **v18** (`Packages/WhoopStore/Sources/WhoopStore/Database.swift`); this adds **v19**.
+- **Additive migrations only.** New tables/indexes; never alter or drop existing rows. The live migrator is at **v23** (`Packages/WhoopStore/Sources/WhoopStore/Database.swift`); this adds **v24** (`v19`–`v23` already exist).
 - **Pinned deps.** Add no new dependency. Versions across `Packages/*/Package.swift` must stay identical (`GRDB.swift exact 6.29.3`, `ZIPFoundation exact 0.9.20`).
 - **Provenance string.** The live-API partition is `deviceId = "oura-api"` (distinct from the file lane's `"oura-import"`).
 
 ---
 
-### Task 1: `ouraRaw` table (migration v19) + `OuraRawStore`
+### Task 1: `ouraRaw` table (migration v24) + `OuraRawStore`
 
 Lossless archive of every raw Oura payload, keyed by `(deviceId, endpoint, documentId)`, idempotent on re-pull.
 
 **Files:**
-- Modify: `Packages/WhoopStore/Sources/WhoopStore/Database.swift` (add migration after the `v18-sleep-motion-state` block, before `return migrator`)
+- Modify: `Packages/WhoopStore/Sources/WhoopStore/Database.swift` (add migration after the `v23-daily-spo2-raw` block, before `return migrator`)
 - Create: `Packages/WhoopStore/Sources/WhoopStore/OuraRawStore.swift`
 - Test: `Packages/WhoopStore/Tests/WhoopStoreTests/OuraRawStoreTests.swift`
 
@@ -75,15 +82,15 @@ final class OuraRawStoreTests: XCTestCase {
 Run: `swift test --package-path Packages/WhoopStore --filter OuraRawStoreTests`
 Expected: FAIL — compile error, `OuraRawRow` / `upsertOuraRaw` undefined.
 
-- [ ] **Step 3: Add migration v19**
+- [ ] **Step 3: Add migration v24**
 
-In `Packages/WhoopStore/Sources/WhoopStore/Database.swift`, insert immediately before `return migrator`:
+In `Packages/WhoopStore/Sources/WhoopStore/Database.swift`, insert immediately **after the `v23-daily-spo2-raw` block** and before `return migrator` (`v19`–`v23` already exist, so v24 is the next free slot — do NOT reuse v19):
 
 ```swift
-        // v19: Oura live-API raw payload archive (lossless). One row per (deviceId, endpoint, documentId);
+        // v24: Oura live-API raw payload archive (lossless). One row per (deviceId, endpoint, documentId);
         // payloadJSON holds the verbatim Oura object so any field can be re-derived later without re-fetching
         // from the API. Additive only — a NEW table, no existing row touched, old readers unaffected.
-        migrator.registerMigration("v19-oura-raw") { db in
+        migrator.registerMigration("v24-oura-raw") { db in
             try db.create(table: "ouraRaw") { t in
                 t.column("deviceId", .text).notNull()
                 t.column("endpoint", .text).notNull()       // "sleep" | "daily_readiness" | "heartrate" | …
@@ -184,7 +191,7 @@ Expected: PASS.
 git add Packages/WhoopStore/Sources/WhoopStore/Database.swift \
         Packages/WhoopStore/Sources/WhoopStore/OuraRawStore.swift \
         Packages/WhoopStore/Tests/WhoopStoreTests/OuraRawStoreTests.swift
-git commit -m "feat(store): ouraRaw lossless payload archive (migration v19) + OuraRawStore"
+git commit -m "feat(store): ouraRaw lossless payload archive (migration v24) + OuraRawStore"
 ```
 
 ---
@@ -326,7 +333,7 @@ Parse detailed `sleep` periods into the shared `WearableSleepSession` (now WITH 
 - Test: `Packages/StrandImport/Tests/StrandImportTests/OuraApiParserSleepTests.swift`
 
 **Interfaces:**
-- Consumes: `OuraHypnogram` (Task 2); existing `WearableSleepSession`, `WearableDailyRow`, `WearableJSON` (`str`/`dbl`/`posDbl`/`posInt`), `WhoopTime.parseISOWithOffset(_:)` (`CSVParsing.swift:478`), `WearableExportImporter.dayString(_:)`.
+- Consumes: `OuraHypnogram` (Task 2); existing `WearableSleepSession`, `WearableDailyRow`, `WearableJSON` (`str`/`dbl`/`posDbl`/`posInt`, in `WearableExportImporter.swift:329`), `WhoopTime.parseISOWithOffset(_:)` (`CSVParsing.swift:509`), `WearableExportImporter.dayString(_:)`.
 - Produces:
   - `struct OuraHRPoint { let ts: Int; let bpm: Int }`
   - `struct OuraSleepPeriod { var session: WearableSleepSession; var movement30s: [Int]; var hr: [OuraHRPoint] }`
