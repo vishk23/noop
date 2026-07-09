@@ -456,6 +456,23 @@ extension WhoopStore {
                 t.add(column: "spo2Ir", .integer)
             }
         }
+        // v24: Oura live-API raw payload archive (lossless). One row per (deviceId, endpoint, documentId);
+        // payloadJSON holds the verbatim Oura object so any field can be re-derived later without re-fetching
+        // from the API. Additive only — a NEW table, no existing row touched, old readers unaffected.
+        migrator.registerMigration("v24-oura-raw") { db in
+            try db.create(table: "ouraRaw") { t in
+                t.column("deviceId", .text).notNull()
+                t.column("endpoint", .text).notNull()       // "sleep" | "daily_readiness" | "heartrate" | …
+                t.column("documentId", .text).notNull()     // Oura `id`; heartrate pages use a window key
+                t.column("day", .text)                       // YYYY-MM-DD when day-keyed (nullable)
+                t.column("payloadJSON", .text).notNull()     // verbatim object
+                t.column("fetchedAt", .integer).notNull()    // unix seconds
+                t.primaryKey(["deviceId", "endpoint", "documentId"])
+            }
+            // Per-endpoint reads scan (deviceId, endpoint) then walk day in order.
+            try db.create(index: "idx_ouraRaw_device_endpoint_day",
+                          on: "ouraRaw", columns: ["deviceId", "endpoint", "day"])
+        }
         return migrator
     }
 }
