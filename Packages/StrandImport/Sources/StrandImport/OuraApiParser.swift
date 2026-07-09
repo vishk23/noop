@@ -62,6 +62,7 @@ public enum OuraApiParser {
             row.awakeMin = row.awakeMin ?? session.awakeMin
             row.efficiencyPct = row.efficiencyPct ?? session.efficiencyPct
             row.avgHrvMs = row.avgHrvMs ?? session.avgHrvMs
+            row.respRateBpm = row.respRateBpm ?? session.respRateBpm
             if row.restingHr == nil { row.restingHr = session.lowestHr }
             byDay[key] = row
         }
@@ -78,7 +79,11 @@ public enum OuraApiParser {
         var out: [OuraHRPoint] = []
         for (i, item) in items.enumerated() {
             guard let v = (item as? Double) ?? (item as? NSNumber)?.doubleValue, v.isFinite, v > 0 else { continue }
-            out.append(OuraHRPoint(ts: Int(t0.timeIntervalSince1970 + Double(i) * interval), bpm: Int(v)))
+            // Finite-but-huge `ts` or `bpm` (e.g. a crafted `interval`/item of 1e300) must never trap
+            // Int(...); skip the sample instead, mirroring WearableJSON.int's -9e18...9e18 range guard.
+            let ts = t0.timeIntervalSince1970 + Double(i) * interval
+            guard ts.isFinite, ts >= -9e18, ts <= 9e18, v <= 9e18 else { continue }
+            out.append(OuraHRPoint(ts: Int(ts), bpm: Int(v)))
         }
         return out
     }
