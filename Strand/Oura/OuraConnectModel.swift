@@ -51,11 +51,18 @@ final class OuraConnectModel: ObservableObject {
         Task {
             OuraOAuthProvider(credentials: OuraCredentials.fromBundle ?? .init(clientId: "", clientSecret: "", redirectURI: "")).signOut()
             if let store = await repo.storeHandle() {
-                try? await store.deleteAllData(deviceId: "oura-api")
-                try? await store.deleteOuraRaw(deviceId: "oura-api")
+                do {
+                    try await store.deleteAllData(deviceId: "oura-api")
+                    try await store.deleteOuraRaw(deviceId: "oura-api")
+                    statusText = "Disconnected."
+                } catch {
+                    statusText = "Disconnected, but couldn't fully clear local Oura data: \(error.localizedDescription)"
+                }
                 await repo.refresh()
+            } else {
+                statusText = "Disconnected."
             }
-            isConnected = false; statusText = "Disconnected."; busy = false
+            isConnected = false; busy = false
         }
     }
 

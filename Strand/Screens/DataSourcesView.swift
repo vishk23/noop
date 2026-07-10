@@ -292,18 +292,22 @@ struct DataSourcesView: View {
     /// above. `oura.connectAndImport(repo:)`/`disconnect(repo:)` take `repo` at call time (see the
     /// `@StateObject` declaration's note) rather than storing it in `OuraConnectModel` at construction.
     private var ouraCloudCard: some View {
-        card(title: "Oura (cloud)", icon: "circle.circle", tint: StrandPalette.metricPurple,
-             subtitle: "Connect your Oura account and import your full history over the API.") {
+        card(title: String(localized: "Oura (cloud)"), icon: "circle.circle", tint: StrandPalette.metricPurple,
+             subtitle: String(localized: "Connect your Oura account and import your full history over the API.")) {
             VStack(alignment: .leading, spacing: 8) {
                 if oura.isConnected {
                     HStack {
                         Button { oura.connectAndImport(repo: repo) } label: { Label("Sync again", systemImage: "arrow.clockwise") }
+                            .buttonStyle(NoopButtonStyle(.primary))
                         Button(role: .destructive) { oura.disconnect(repo: repo) } label: { Label("Disconnect", systemImage: "xmark.circle") }
+                            .buttonStyle(NoopButtonStyle(.destructive))
                     }.disabled(oura.busy)
                 } else {
                     Button { oura.connectAndImport(repo: repo) } label: {
                         Label(oura.busy ? "Working…" : "Connect Oura & Import Everything", systemImage: "link")
-                    }.disabled(oura.busy || !oura.isConfigured)
+                    }
+                    .buttonStyle(NoopButtonStyle(.primary))
+                    .disabled(oura.busy || !oura.isConfigured)
                     if !oura.isConfigured {
                         Text("Add your Oura app credentials to OuraSecrets.xcconfig to enable this.")
                             .font(.caption).foregroundStyle(.secondary)
