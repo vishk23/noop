@@ -89,7 +89,7 @@ final class OuraAPIClient {
                 if backoff > 0 { try? await Task.sleep(nanoseconds: UInt64(backoff * 1_000_000_000)) }
                 continue
             case 401 where attempt == 0:
-                _ = try? await auth.validAccessToken()   // force a refresh, then retry once
+                _ = try? await auth.refreshedAccessToken()   // force a real refresh; the loop-top re-reads the saved token
                 continue
             default:
                 throw OuraError.badResponse(code, String(data: data, encoding: .utf8) ?? "")

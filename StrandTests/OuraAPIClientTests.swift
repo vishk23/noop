@@ -6,8 +6,10 @@ import AuthenticationServices
 private final class StubAuth: AuthProvider {
     var token = "tok-1"
     var validCalls = 0
+    var refreshCount = 0
     var isConnected: Bool { true }
     func validAccessToken() async throws -> String { validCalls += 1; return token }
+    func refreshedAccessToken() async throws -> String { refreshCount += 1; token = "tok-refreshed"; return token }
     @MainActor func authorize(presentationAnchor: ASPresentationAnchor) async throws {}
     func signOut() {}
 }
@@ -53,5 +55,34 @@ final class OuraAPIClientTests: XCTestCase {
                                    session: OuraURLProtocolStub.session())
         _ = try await client.fetchAll(endpoint: "personal_info", query: [:])
         XCTAssertTrue(OuraURLProtocolStub.requestedURLs.first?.absoluteString.contains("/v2/sandbox/") ?? false)
+    }
+
+    func test401TriggersRefreshThenRetrySucceeds() async throws {
+        OuraURLProtocolStub.queue = [
+            .init(status: 401, body: Data()),
+            .init(status: 200, body: #"{"data":[{"id":"a"}],"next_token":null}"#.data(using: .utf8)!),
+        ]
+        let stub = StubAuth()
+        let client = OuraAPIClient(auth: stub, environment: .production,
+                                   session: OuraURLProtocolStub.session())
+        let rows = try await client.fetchAll(endpoint: "daily_sleep", query: [:])
+        XCTAssertEqual(rows.count, 1)
+        XCTAssertEqual(stub.refreshCount, 1)
+    }
+
+    func test429ExhaustionThrowsRateLimited() async throws {
+        OuraURLProtocolStub.queue = [
+            .init(status: 429, body: Data()),
+            .init(status: 429, body: Data()),
+            .init(status: 429, body: Data()),
+        ]
+        let client = OuraAPIClient(auth: StubAuth(), environment: .production,
+                                   session: OuraURLProtocolStub.session(), backoff: 0)
+        do {
+            _ = try await client.fetchAll(endpoint: "daily_sleep", query: [:])
+            XCTFail("expected rateLimited to be thrown")
+        } catch {
+            XCTAssertEqual(error as? OuraError, OuraError.rateLimited)
+        }
     }
 }

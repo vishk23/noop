@@ -20,9 +20,13 @@ final class OuraOAuthProvider: NSObject, AuthProvider, ASWebAuthenticationPresen
     func validAccessToken() async throws -> String {
         guard let tokens = OuraTokenStore.load() else { throw OuraError.notConnected }
         if !tokens.isExpired { return tokens.accessToken }
-        guard let refresh = tokens.refreshToken else { throw OuraError.notConnected }
-        let req = OuraOAuth.refreshRequest(credentials: credentials, refreshToken: refresh)
-        let refreshed = try await exchange(req)
+        return try await refreshedAccessToken()
+    }
+
+    /// Unconditionally refresh, regardless of the stored token's expiry state.
+    func refreshedAccessToken() async throws -> String {
+        guard let refresh = OuraTokenStore.load()?.refreshToken else { throw OuraError.notConnected }
+        let refreshed = try await exchange(OuraOAuth.refreshRequest(credentials: credentials, refreshToken: refresh))
         guard OuraTokenStore.save(refreshed) else { throw OuraError.tokenExchangeFailed("keychain write failed") }
         return refreshed.accessToken
     }
