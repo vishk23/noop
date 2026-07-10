@@ -52,4 +52,13 @@ final class OuraOAuthTests: XCTestCase {
         let json = #"{"error":"invalid_grant"}"#.data(using: .utf8)!
         XCTAssertThrowsError(try OuraOAuth.parseTokenResponse(json, now: Date()))
     }
+
+    func testTokenExchangeRequestEscapesReservedCharsInSecret() {
+        let c = OuraCredentials(clientId: "cid", clientSecret: "aB+cd/eF12==", redirectURI: "noop://oura/callback")
+        let req = OuraOAuth.tokenExchangeRequest(credentials: c, code: "x+y")
+        let body = String(data: req.httpBody ?? Data(), encoding: .utf8) ?? ""
+        XCTAssertTrue(body.contains("client_secret=aB%2Bcd%2FeF12%3D%3D"))   // + -> %2B, / -> %2F, = -> %3D
+        XCTAssertTrue(body.contains("code=x%2By"))                            // + escaped, not left literal
+        XCTAssertFalse(body.contains("aB+cd"))                                // no raw '+'
+    }
 }

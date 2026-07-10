@@ -58,9 +58,14 @@ enum OuraOAuth {
         var req = URLRequest(url: url)
         req.httpMethod = "POST"
         req.setValue("application/x-www-form-urlencoded", forHTTPHeaderField: "Content-Type")
-        var comps = URLComponents()
-        comps.queryItems = fields.map { URLQueryItem(name: $0.key, value: $0.value) }
-        req.httpBody = comps.percentEncodedQuery?.data(using: .utf8)
+        // x-www-form-urlencoded: escape everything but unreserved chars. Crucially '+' (else the server
+        // decodes it to a space) and the '&'/'=' separators — URLComponents.percentEncodedQuery leaves '+'
+        // unescaped, which silently corrupts base64 client_secret/code/refresh_token values.
+        var allowed = CharacterSet.alphanumerics
+        allowed.insert(charactersIn: "-._~")
+        func enc(_ s: String) -> String { s.addingPercentEncoding(withAllowedCharacters: allowed) ?? s }
+        req.httpBody = fields.map { "\(enc($0.key))=\(enc($0.value))" }
+            .joined(separator: "&").data(using: .utf8)
         return req
     }
 }
