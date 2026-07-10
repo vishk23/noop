@@ -38,15 +38,17 @@ final class OuraSyncWriterTests: XCTestCase {
         XCTAssertEqual(summary.days, 1)
         XCTAssertEqual(summary.sleeps, 1)
         XCTAssertEqual(summary.workouts, 1)
-        XCTAssertGreaterThan(summary.hrSamples, 0)     // in-sleep + whole-day HR
+        XCTAssertEqual(summary.hrSamples, 2)           // in-sleep 60bpm + whole-day 120bpm, distinct ts
         XCTAssertGreaterThan(summary.metricPoints, 0)
         XCTAssertEqual(summary.rawPages, 1)
 
-        // Cloud source registered as .cloudImport (so it never seizes a WHOOP day).
+        // Cloud source registered as .cloudImport, .paired (never .active — single-active invariant;
+        // an import source must never seize the live-device slot alongside a paired WHOOP).
         let devices = try DeviceRegistryStore(dbQueue: store.registryWriter).all()
         let oura = devices.first { $0.id == "oura-api" }
         XCTAssertEqual(oura?.sourceKind, .cloudImport)
         XCTAssertEqual(oura?.model, "Oura Ring Gen3")
+        XCTAssertEqual(oura?.status, .paired)
 
         // Honest data: the reference score is a metricSeries key, never a DailyMetric score column.
         let refs = try await store.metricSeries(deviceId: "oura-api", key: "ref_readiness_score",
@@ -55,5 +57,10 @@ final class OuraSyncWriterTests: XCTestCase {
         let vo2 = try await store.metricSeries(deviceId: "oura-api", key: "vo2max",
                                                from: "2026-01-01", to: "2026-01-03")
         XCTAssertEqual(vo2.first?.value, 44)          // vo2max parity via extras
+
+        // Honest data, read back through the day accessor: recovery/strain stay nil (never Oura's readiness).
+        let days = try await store.dailyMetrics(deviceId: "oura-api", from: "2026-01-01", to: "2026-01-03")
+        XCTAssertNil(days.first?.recovery)
+        XCTAssertNil(days.first?.strain)
     }
 }

@@ -18,7 +18,7 @@ enum OuraSyncWriter {
         let now = Int(Date().timeIntervalSince1970)
         let device = PairedDevice(
             id: deviceId, brand: "Oura", model: result.ringModel ?? "Oura (cloud)",
-            sourceKind: .cloudImport, capabilities: [], status: .active,
+            sourceKind: .cloudImport, capabilities: [], status: .paired,
             addedAt: now, lastSeenAt: now)
         try DeviceRegistryStore(dbQueue: store.registryWriter).add(device)
 
