@@ -1,0 +1,68 @@
+import Foundation
+import Combine
+import AuthenticationServices
+
+/// Drives the Data Sources "Connect Oura" card: connect (OAuth) → one-time backfill → honest summary →
+/// disconnect. @MainActor so all @Published mutations are main-thread; the network/backfill hops off-main.
+///
+/// `repo: Repository` is taken as a PARAMETER on each action rather than stored at construction. `Repository`
+/// only reaches `DataSourcesView` via `@EnvironmentObject`, which SwiftUI populates after `init()` runs —
+/// storing it in a property initializer (`@StateObject private var oura = OuraConnectModel(repo: repo)`)
+/// either fails to compile (a property initializer can't reference another instance member) or, moved into
+/// a custom `init()`, crashes at runtime ("No ObservableObject of type Repository found") because the
+/// environment isn't resolved yet. This mirrors how the sibling `wearableCard`/`importWearable(url:)` on
+/// `DataSourcesView` read `repo` lazily inside their action closures instead of at construction time.
+@MainActor
+final class OuraConnectModel: ObservableObject {
+    @Published var busy = false
+    @Published var statusText: String?
+    @Published var isConnected = OuraTokenStore.isConnected
+
+    /// True when the BYO-app credentials are present (else the lane is disabled with guidance).
+    var isConfigured: Bool { OuraCredentials.fromBundle != nil }
+
+    func connectAndImport(repo: Repository) {
+        guard let creds = OuraCredentials.fromBundle else {
+            statusText = "Add your Oura app's client_id/secret to OuraSecrets.xcconfig first."; return
+        }
+        busy = true; statusText = "Connecting to Oura…"
+        Task {
+            do {
+                let provider = OuraOAuthProvider(credentials: creds)
+                try await provider.authorize(presentationAnchor: ouraPresentationAnchor())
+                isConnected = true
+                guard let store = await repo.storeHandle() else { fail("No local store."); return }
+                let client = OuraAPIClient(auth: provider, environment: .production)
+                let coord = OuraSyncCoordinator(fetcher: client, store: store)
+                let today = Self.dayFormatter.string(from: Date())
+                statusText = "Importing your Oura history…"
+                let s = try await coord.runFullImport(today: today) { [weak self] p in
+                    Task { @MainActor in self?.statusText = "Importing \(p.endpoint)…" }
+                }
+                await repo.refresh()
+                statusText = "Imported \(s.days) days · \(s.sleeps) sleeps · \(s.workouts) workouts · \(s.hrSamples) HR samples"
+            } catch { fail((error as? LocalizedError)?.errorDescription ?? error.localizedDescription) }
+            busy = false
+        }
+    }
+
+    func disconnect(repo: Repository) {
+        busy = true
+        Task {
+            OuraOAuthProvider(credentials: OuraCredentials.fromBundle ?? .init(clientId: "", clientSecret: "", redirectURI: "")).signOut()
+            if let store = await repo.storeHandle() {
+                try? await store.deleteAllData(deviceId: "oura-api")
+                try? await store.deleteOuraRaw(deviceId: "oura-api")
+                await repo.refresh()
+            }
+            isConnected = false; statusText = "Disconnected."; busy = false
+        }
+    }
+
+    private func fail(_ m: String) { statusText = m; busy = false }
+    private static let dayFormatter: DateFormatter = {
+        let f = DateFormatter(); f.calendar = Calendar(identifier: .gregorian)
+        f.locale = Locale(identifier: "en_US_POSIX"); f.timeZone = TimeZone(identifier: "UTC")
+        f.dateFormat = "yyyy-MM-dd"; return f
+    }()
+}
