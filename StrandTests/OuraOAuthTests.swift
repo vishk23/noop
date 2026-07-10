@@ -39,6 +39,15 @@ final class OuraOAuthTests: XCTestCase {
         XCTAssertEqual(tokens.expiresAt, now.addingTimeInterval(86400))
     }
 
+    func testParseTokenResponseDefaultsExpiryWhenExpiresInAbsent() throws {
+        let now = Date(timeIntervalSince1970: 1_000_000)
+        let json = #"{"access_token":"acc"}"#.data(using: .utf8)!
+        let tokens = try OuraOAuth.parseTokenResponse(json, now: now)
+        XCTAssertEqual(tokens.accessToken, "acc")
+        XCTAssertNil(tokens.refreshToken)
+        XCTAssertEqual(tokens.expiresAt, now.addingTimeInterval(2_592_000))
+    }
+
     func testParseTokenResponseThrowsOnMissingAccessToken() {
         let json = #"{"error":"invalid_grant"}"#.data(using: .utf8)!
         XCTAssertThrowsError(try OuraOAuth.parseTokenResponse(json, now: Date()))

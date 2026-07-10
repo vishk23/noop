@@ -23,7 +23,7 @@ final class OuraOAuthProvider: NSObject, AuthProvider, ASWebAuthenticationPresen
         guard let refresh = tokens.refreshToken else { throw OuraError.notConnected }
         let req = OuraOAuth.refreshRequest(credentials: credentials, refreshToken: refresh)
         let refreshed = try await exchange(req)
-        _ = OuraTokenStore.save(refreshed)
+        guard OuraTokenStore.save(refreshed) else { throw OuraError.tokenExchangeFailed("keychain write failed") }
         return refreshed.accessToken
     }
 
