@@ -115,6 +115,10 @@ final class IntelligenceEngine: ObservableObject {
         /// deep-only vs last-SWS summary) for this day, collected off the main actor and replayed tagged
         /// `.hrv` in per-day order. Empty unless the HRV mode is active. (#141)
         let hrvTrace: [String]
+        /// #195: the ALWAYS-ON whole-night HRV cleaning summary (`hrv diag …`), built off the main actor
+        /// where `rr` is in scope and replayed through `diagnosticSink` in pass 2 (which is main-actor
+        /// isolated). nil when the night has no in-sleep R-R.
+        let hrvDiag: String?
     }
 
     struct Computed: Identifiable {
@@ -422,7 +426,8 @@ final class IntelligenceEngine: ObservableObject {
         var scoredNights: [(daily: DailyMetric, strain: Double?, cachedSleep: [CachedSleepSession],
                             workouts: [ExerciseSession], nightlySkin: Double?,
                             sessionMotion: [Int: [Double]],
-                            sessionSleepState: [Int: [Int]])] = []
+                            sessionSleepState: [Int: [Int]],
+                            hrvDiag: String?)] = []   // #195: carried from loop 1, emitted in the main-actor loop
         // Nightly values harvested in pass 1, keyed by day, to seed the pass-2 baseline.
         var nightlyHrvByDay: [String: Double?] = [:]
         var nightlyRhrByDay: [String: Double?] = [:]
@@ -532,6 +537,18 @@ final class IntelligenceEngine: ObservableObject {
                 // registry knows each device's model; unknown/non-WHOOP owners fall back to `.whoop5` (the prior
                 // /100 behaviour), so this only changes the mapping for a device positively identified as a 4.0.
                 let skinFamily = Self.skinTempFamily(forOwner: owner, devices: regDevices)
+                // #938 (second capture): learn THIS device's worn skin-temp anchor raw ONCE, WINDOW-WIDE (the
+                // whole scan window's skin samples), not per-night. The @72 skin-temp ADC's register offset is
+                // per-device — a second real 4.0 strap shares the no-contact floor (~509) + 11-bit saturation
+                // (2047) but a worn band ~1100–1600 (nightly mean raw ~1290), which the global 826 anchor maps
+                // to 47–72 °C, so 100% of its worn samples fail the 28–42 °C gate (kept=0, no baseline, no
+                // signal). WINDOW-WIDE, not per-night: a per-night re-centre would subtract each night's own
+                // mean and ERASE the cross-night deviation the skinTempDevC signal exists to carry.
+                // Deterministic per run; SAFE because the skin baseline is re-folded from the SAME window's
+                // nightly means every run, so this constant offset cancels in the deviation. nil for a non-4.0
+                // owner (`.whoop5` ignores the anchor) or when <100 in-band samples exist → the conversion
+                // falls back to the global anchor (byte-identical to today).
+                let skinAnchorRaw = skinFamily == .whoop4 ? Whoop4SkinTemp.deviceAnchorRaw(skin.map { $0.raw }) : nil
                 // Wrist-wear events in the night window, paired into off-wrist [start, end) intervals for the
                 // off-wrist sleep backstop (#500). The HR-gap proxy in the stager is the always-on guard;
                 // these explicit intervals sharpen it under the FRACTIONAL rule (#504) , a session is dropped
@@ -625,6 +642,7 @@ final class IntelligenceEngine: ObservableObject {
                                                      dayGravity: dayGrav,
                                                      skinTemp: skin,
                                                      skinTempFamily: skinFamily,   // #938
+                                                     skinTempAnchorRaw: skinAnchorRaw,   // #938 second capture
                                                      spo2: spo2,                   // #93
                                                      profile: up, baselines: baselines1, maxHROverride: maxHR,
                                                      tzOffsetSeconds: tzOffset, wristOff: wristOff,
@@ -640,6 +658,27 @@ final class IntelligenceEngine: ObservableObject {
                                                      // ring buffer isn't flooded; every night keeps the summary.
                                                      hrvWindowDetail: dayStart == nowLocalMidnight,
                                                      deepHrvWindow: deepHrvWindow)
+                // #195: whole-night HRV cleaning-pipeline summary for the always-on strap log, so a "reads ~2x
+                // too high" report is triageable without the HRV test mode: RMSSD vs SDNN (rmssd >> sdnn =
+                // beat-to-beat jitter surviving the ectopic filter, not real HRV), meanNN as an HR sanity-check,
+                // and how many R-R intervals survived cleaning (a low count also flags the sparse-capture /
+                // calibration side — `nInput` is set before the min-beats gate, so a sparse night still shows
+                // its count with rmssd=nil). A SEPARATE analyzer pass over the in-sleep R-R — does NOT touch the
+                // shipped windowed avgHrv. Built here (loop 1) where `rr` is in scope, but EMITTED in the
+                // main-actor replay loop below (diagnosticSink is main-actor isolated), carried on `hrvDiag`.
+                // Byte-identical to the Kotlin line.
+                let sleepRr = rr.filter { r in res.cachedSleep.contains { r.ts >= $0.startTs && r.ts < $0.endTs } }
+                    .map { Double($0.rrMs) }
+                let hrvDiag: String?
+                if sleepRr.isEmpty {
+                    hrvDiag = nil
+                } else {
+                    let h = HRVAnalyzer.analyze(rawRR: sleepRr)
+                    func ms(_ v: Double?) -> String { v.map { String(format: "%.0f", $0) } ?? "nil" }
+                    let rej = h.nInput > 0 ? String(format: "%.0f", 100 * (1 - Double(h.nClean) / Double(h.nInput))) : "0"
+                    hrvDiag = "hrv diag day=\(res.daily.day) rmssd=\(ms(h.rmssd))ms sdnn=\(ms(h.sdnn))ms "
+                        + "meanNN=\(ms(h.meanNN))ms rr=\(h.nInput)/\(h.nClean) rejected=\(rej)%"
+                }
                 // ── Steps test mode: 5/MG raw-counter trace ──────────────────────────────────────────────
                 // Only built when the Steps mode is on (the gate was read once before the loop). Recomputes
                 // the SAME wrap-aware @57 sum analyzeDay just ran, over the SAME `daySteps` calendar-day
@@ -677,7 +716,8 @@ final class IntelligenceEngine: ObservableObject {
                 }
                 out.append(DayScan(result: res, rhrLine: rhrLine,
                                    readOwner: owner, hrRows: hr.count,
-                                   sleepTrace: sleepTrace, stepsTrace: stepsTrace, hrvTrace: hrvTrace))
+                                   sleepTrace: sleepTrace, stepsTrace: stepsTrace, hrvTrace: hrvTrace,
+                                   hrvDiag: hrvDiag))
             }
             return out
         }.value
@@ -712,7 +752,8 @@ final class IntelligenceEngine: ObservableObject {
             scoredNights.append((daily: res.daily, strain: res.strain, cachedSleep: res.cachedSleep,
                                  workouts: res.workouts, nightlySkin: res.nightlySkinTempC,
                                  sessionMotion: res.sessionMotionByStart,
-                                 sessionSleepState: res.sessionSleepStateByStart))
+                                 sessionSleepState: res.sessionSleepStateByStart,
+                                 hrvDiag: scan.hrvDiag))
         }
 
         // ── Seed the baseline from the UNION of imported nightly history + the values just computed.
@@ -866,6 +907,15 @@ final class IntelligenceEngine: ObservableObject {
             let tsmLog = daily.totalSleepMin.map { String(Int($0.rounded())) } ?? "nil"
             diagnosticSink?("sleep day=\(daily.day) totalSleepMin=\(tsmLog) "
                             + "matched=\(night.cachedSleep.count) source=\(source.logToken)", nil)
+            // #195: one always-on line per scored night with the computed HRV value + the window it used,
+            // so an "HRV reads high / deep-sleep window not changing" report is self-diagnosing straight
+            // from the strap log — the whole-night vs deep-sleep value, and `avgHrv=nil window=deep` when a
+            // deep-window night has no detected deep sleep — without needing the HRV & Autonomic test mode.
+            // Counts-only (a rounded ms + the window), PII-free; byte-identical to the Kotlin line.
+            let hrvLog = daily.avgHrv.map { String(format: "%.1f", $0) } ?? "nil"
+            diagnosticSink?("hrv day=\(daily.day) window=\(deepHrvWindow ? "deep" : "whole") avgHrv=\(hrvLog)", nil)
+            // #195: the whole-night HRV cleaning summary built in loop 1 (rmssd vs sdnn / cleaning counts).
+            if let hrvDiagLine = night.hrvDiag { diagnosticSink?(hrvDiagLine, nil) }
             // ── CAPTURE-B: universal dayOwner self-diagnostic (#814/#799) ────────────────────────────────
             // ONE line per scored day, tagged `.universal` so it rides EVERY Test Centre export regardless
             // of which mode is on. It pins down the read/write split #814 is about: `readId` is the owner
@@ -1377,15 +1427,10 @@ final class IntelligenceEngine: ObservableObject {
     }
 
     /// The strap family that wrote `owner`'s skin-temp rows (#938), so the nightly funnel converts the raw
-    /// register on the right scale. The registry stores each device's model string; a positively-identified
-    /// WHOOP 4.0 maps to `.whoop4` (raw-ADC skin-temp map), and EVERYTHING else — a 5/MG, a non-WHOOP source
-    /// (Oura/Apple Watch/etc. whose imported skin temp is already °C, not a strap register), or an unknown
-    /// owner not in the snapshot — falls back to `.whoop5`, the prior /100 behaviour. So this only changes
-    /// the mapping for a device we KNOW is a 4.0, never risking a wrong scale on anything else.
+    /// register on the right scale. The model-label → family mapping (and the `.whoop5` fallback for
+    /// unknowns) lives in `DeviceFamily.forRegistryModel` (#171).
     nonisolated static func skinTempFamily(forOwner owner: String, devices: [PairedDevice]) -> DeviceFamily {
-        guard let model = devices.first(where: { $0.id == owner })?.model,
-              WhoopModel(rawValue: model) == .whoop4 else { return .whoop5 }
-        return .whoop4
+        DeviceFamily.forRegistryModel(devices.first(where: { $0.id == owner })?.model)
     }
 
     /// #137: re-score under-sampled manual workouts. A `manual` workout is scored from the live HR

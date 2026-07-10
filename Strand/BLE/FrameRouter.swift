@@ -105,6 +105,16 @@ public final class FrameRouter {
             // cmdName carries a "(rawValue)" suffix (Schema.enumName appends it, e.g.
             // "GET_ALARM_TIME(67)"), so match by prefix like every other cmdName consumer in the
             // codebase - never by equality, which is silently dead.
+            // Reboot ack (#166): log the COMMAND_RESPONSE result for a user reboot on BOTH families. This is
+            // the accept/reject signal — the same one that exposed 5/MG haptics rejection (result=0x03) — so
+            // a 5/MG owner's strap log confirms whether the (unverified) puffin reboot frame is accepted
+            // (0x00) or rejected. Log-only. A reboot that's accepted may drop the link before/after this ack.
+            if let cmd = parsed.cmdName, cmd.hasPrefix("REBOOT_STRAP") {
+                let r = Self.commandResultByte(in: frame)
+                let rhex = r.map { String(format: "0x%02x", UInt8(truncatingIfNeeded: $0)) } ?? "none"
+                let verdict = r == nil ? "no result byte" : (r == 0 ? "accepted" : "REJECTED")
+                state.append(log: "reboot: strap acked result=\(rhex) (\(verdict))")
+            }
             if family == .whoop4, let cmd = parsed.cmdName {
                 if cmd.hasPrefix("GET_ADVERTISING_NAME_HARVARD") {
                     if let name = Self.advertisingName(in: frame), !name.isEmpty {
@@ -121,7 +131,13 @@ public final class FrameRouter {
                     // exactly as diagnostic. Labelled "strap reports", not "verified" (one firmware's
                     // answer format must never mislead a triage).
                     if let epoch = Self.armedAlarmEpoch(in: frame) {
-                        state.append(log: "Alarm: strap reports armed for \(Self.alarmLocalTime(epoch: epoch)) (epoch \(epoch))")
+                        // #34: log the RAW response bytes alongside the decoded epoch (previously only the
+                        // decode-FAILURE branch below carried them). A successful-but-mismatched decode — the
+                        // strap reporting a plausible epoch that never matches what we armed, the corrupted-
+                        // register signature — needs the raw frame to tell a genuinely-stored stale alarm from
+                        // a misdecode of a fixed response field. Log-only; the decode/behaviour is unchanged.
+                        let raw = Self.commandResponsePayloadHex(in: frame) ?? "empty"
+                        state.append(log: "Alarm: strap reports armed for \(Self.alarmLocalTime(epoch: epoch)) (epoch \(epoch)) [raw \(raw)]")
                         // #34: persist what the strap reports so the debug export can show sent-vs-reported.
                         let d = UserDefaults.standard
                         d.set(Int(epoch), forKey: "alarm.lastReportedEpoch")

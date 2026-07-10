@@ -64,7 +64,7 @@ thread) through the `syncRead` / `syncWrite` helpers. `WhoopStoreInfo.schemaVers
 separate, manually-maintained constant (currently `18`) that has lagged the real migration
 history for a while and should not be read as the schema's true version. The migrator itself
 (`makeMigrator()`, below) is the source of truth for what tables/columns exist, and has run
-through **v24** (`v24-oura-raw` — the Oura raw-payload archive, the newest addition; see
+through **v25** (`v25-oura-raw` — the Oura raw-payload archive, the newest addition; see
 below).
 
 ---
@@ -82,7 +82,7 @@ post-v9 addition currently documented here):
 | **Raw outbox** (transient) | `rawBatch` | Compressed raw BLE frames, prunable |
 | **Bookkeeping** | `cursors` | Highwater / read cursors |
 | **Metric caches** | `sleepSession`, `dailyMetric`, `journal`, `workout`, `appleDaily`, `metricSeries` | Derived metrics + CSV / Apple-Health imports |
-| **Oura raw archive** (durable, v24) | `ouraRaw` | Verbatim Oura API payloads behind the opt-in cloud import — see below |
+| **Oura raw archive** (durable, v25) | `ouraRaw` | Verbatim Oura API payloads behind the opt-in cloud import — see below |
 
 All timestamp columns named `ts`, `startTs`, `endTs`, `capturedAt`, etc. are **unix seconds**
 (integers). Day-keyed cache tables use a `day` text column in `YYYY-MM-DD` form and compare it
@@ -456,12 +456,12 @@ schema-version note above): the lossless backstop behind the opt-in Oura cloud i
 **not** a metric cache like the tables above — it stores verbatim API responses, not decoded
 values, so any field Oura returns can be re-derived later without re-fetching.
 
-### `ouraRaw` *(v24)*
+### `ouraRaw` *(v25)*
 
 One row per fetched PAGE of an Oura API endpoint response — not one row per Oura document; a
 single page's `data` array can carry many documents (`OuraRawStore.swift`, `struct OuraRawRow`).
 Written by `OuraSyncCoordinator.fetchRaw(_:dateParam:)` in the app target (`Strand/Oura/`).
-Natural key `(deviceId, endpoint, documentId)`. Migration `v24-oura-raw`
+Natural key `(deviceId, endpoint, documentId)`. Migration `v25-oura-raw`
 (`Packages/WhoopStore/Sources/WhoopStore/Database.swift`) — additive only, a new table, no
 existing row touched.
 

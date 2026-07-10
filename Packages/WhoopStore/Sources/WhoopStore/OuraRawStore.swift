@@ -1,7 +1,7 @@
 import Foundation
 import GRDB
 
-// MARK: - v24 store: lossless Oura live-API payload archive
+// MARK: - v25 store: lossless Oura live-API payload archive
 // Mirrors MetricSeriesStore exactly: a Codable row struct, an idempotent ON CONFLICT upsert keyed by the
 // natural key (deviceId, endpoint, documentId), and range reads — all GRDB work via syncWrite/syncRead.
 // This is the "as much as we can get" backstop: the verbatim payload is kept so a future metric can be

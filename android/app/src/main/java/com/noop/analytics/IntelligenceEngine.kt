@@ -6,6 +6,7 @@ import com.noop.data.SleepSession
 import com.noop.data.WhoopRepository
 import com.noop.data.WorkoutRow
 import com.noop.protocol.DeviceFamily
+import com.noop.protocol.Whoop4SkinTemp
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
@@ -464,6 +465,22 @@ object IntelligenceEngine {
             val skinFamily = skinFamilyByOwner.getOrPut(owner) {
                 ownerSource?.skinTempFamily(owner) ?: DeviceFamily.WHOOP5
             }
+            // #938 (second capture): learn THIS device's worn skin-temp anchor raw ONCE, WINDOW-WIDE (the
+            // whole scan window's skin samples), not per-night. The @72 skin-temp ADC's register offset is
+            // per-device — a second real 4.0 strap shares the no-contact floor (~509) + 11-bit saturation
+            // (2047) but a worn band ~1100–1600 (nightly mean raw ~1290), which the global 826 anchor maps to
+            // 47–72 °C, so 100% of its worn samples fail the 28–42 °C gate (kept=0, no baseline, no signal).
+            // WINDOW-WIDE, not per-night: a per-night re-centre would subtract each night's own mean and ERASE
+            // the cross-night deviation the skinTempDevC signal exists to carry. Deterministic per run; SAFE
+            // because the skin baseline is re-folded from the SAME window's nightly means every run, so this
+            // constant offset cancels in the deviation. null for a non-4.0 owner (WHOOP5 ignores the anchor)
+            // or when <100 in-band samples exist → the conversion falls back to the global anchor (byte-
+            // identical to today). Computed here once per owner alongside the family resolution.
+            val skinAnchorRaw = if (skinFamily == DeviceFamily.WHOOP4) {
+                Whoop4SkinTemp.deviceAnchorRaw(skin.map { it.raw })
+            } else {
+                null
+            }
             // Wrist-wear events in the night window, paired into off-wrist [start, end) intervals for the
             // off-wrist sleep backstop (#500). The HR-gap proxy in the stager is the always-on guard;
             // these explicit intervals sharpen it under the FRACTIONAL rule (#504) , a session is dropped
@@ -519,6 +536,7 @@ object IntelligenceEngine {
                 dayGravity = dayGrav,
                 skinTemp = skin,
                 skinTempFamily = skinFamily,   // #938
+                skinTempAnchorRaw = skinAnchorRaw,   // #938 second capture: per-device worn anchor
                 spo2 = spo2,                   // #93
                 profile = profile,
                 baselines = baselines1,
@@ -543,6 +561,23 @@ object IntelligenceEngine {
                 hrvWindowDetail = dayStart == nowLocalMidnight,
                 deepHrvWindow = deepHrvWindow,
             )
+
+            // #195: whole-night HRV cleaning-pipeline summary to the always-on strap log, so a "reads ~2x too
+            // high" report is triageable without the HRV test mode: RMSSD vs SDNN (rmssd >> sdnn = beat-to-beat
+            // jitter surviving the ectopic filter, not real HRV), meanNN as an HR sanity-check, and how many R-R
+            // intervals survived cleaning (a low count also flags the sparse-capture / calibration side —
+            // `nInput` is set before the min-beats gate, so a sparse night still shows its count with
+            // rmssd=nil). A SEPARATE analyzeRaw pass over the in-sleep R-R — does NOT touch the shipped
+            // windowed avgHrv. Emitted here where `rr` is in scope; byte-identical to the Swift line.
+            val sleepRr = rr.filter { r -> res.sleepSessions.any { r.ts >= it.start && r.ts < it.end } }
+                .map { it.rrMs.toDouble() }
+            if (sleepRr.isNotEmpty()) {
+                val h = HrvAnalyzer.analyzeRaw(sleepRr)
+                val ms = { v: Double? -> v?.let { String.format(java.util.Locale.US, "%.0f", it) } ?: "nil" }
+                val rej = if (h.nInput > 0) String.format(java.util.Locale.US, "%.0f", 100.0 * (1.0 - h.nClean.toDouble() / h.nInput)) else "0"
+                diag("hrv diag day=${res.daily.day} rmssd=${ms(h.rmssd)}ms sdnn=${ms(h.sdnn)}ms meanNN=${ms(h.meanNN)}ms " +
+                    "rr=${h.nInput}/${h.nClean} rejected=$rej%")
+            }
 
             // Steps test mode: emit the 5/MG raw-counter trace for this day (cumulative @57 series +
             // wrap-aware deltas + dropped deltas), tagged .steps. Only when the mode is on (the sink is
@@ -765,6 +800,13 @@ object IntelligenceEngine {
                     "matched=${res.sleepSessions.size} " +
                     "source=${daySourceToken(daily.day, importedWhoopDays, appleHealthDays)}",
             )
+            // #195: one always-on line per scored night with the computed HRV value + the window it used,
+            // so an "HRV reads high / deep-sleep window not changing" report is self-diagnosing straight
+            // from the strap log — the whole-night vs deep-sleep value, and `avgHrv=nil window=deep` when a
+            // deep-window night has no detected deep sleep — without needing the HRV & Autonomic test mode.
+            // Counts-only (a rounded ms + the window), PII-free; byte-identical to the Swift line.
+            val hrvLog = daily.avgHrv?.let { String.format(java.util.Locale.US, "%.1f", it) } ?: "nil"
+            diag("hrv day=${daily.day} window=${if (deepHrvWindow) "deep" else "whole"} avgHrv=$hrvLog")
             // ── CAPTURE-B: universal dayOwner self-diagnostic (#814/#799) ────────────────────────────────
             // ONE line per SCORED day, tagged .universal so it rides EVERY Test Centre export regardless of
             // which mode is on. It pins the read/write split #814 is about: readId is the owner this day was

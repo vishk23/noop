@@ -1,5 +1,6 @@
 package com.noop.ui
 
+import android.widget.Toast
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -21,12 +22,14 @@ import androidx.compose.material.icons.automirrored.filled.DirectionsRun
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Bolt
 import androidx.compose.material.icons.filled.Circle
+import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material.icons.filled.FavoriteBorder
 import androidx.compose.material.icons.filled.GraphicEq
 import androidx.compose.material.icons.filled.Info
 import androidx.compose.material.icons.filled.MoreVert
+import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.RemoveCircleOutline
 import androidx.compose.material.icons.filled.Watch
 import androidx.compose.material3.AlertDialog
@@ -114,6 +117,7 @@ fun DevicesScreen(
     var renameTarget by remember { mutableStateOf<PairedDeviceRow?>(null) }
     var removeTarget by remember { mutableStateOf<PairedDeviceRow?>(null) }
     var deleteDataTarget by remember { mutableStateOf<PairedDeviceRow?>(null) }
+    var rebootTarget by remember { mutableStateOf<PairedDeviceRow?>(null) }
     // After removing the ACTIVE device with other devices still paired, prompt to pick a new active one.
     var pickNewActive by remember { mutableStateOf(false) }
 
@@ -153,6 +157,8 @@ fun DevicesScreen(
                 device = device,
                 isActive = device.status == DeviceStatus.active.name,
                 isLiveConnected = device.status == DeviceStatus.active.name && live.connected,
+                // Reboot in flight + link currently down → "Reconnecting…" (#166).
+                isReconnecting = device.status == DeviceStatus.active.name && live.rebootInProgress && !live.connected,
                 // The live battery belongs to whichever device is ACTIVE + connected (WHOOP, a generic
                 // strap, or an FTMS machine all funnel into live.batteryPct). null otherwise.
                 liveBatteryPct = if (device.status == DeviceStatus.active.name && live.connected)
@@ -163,6 +169,15 @@ fun DevicesScreen(
                 onMakeActive = { switchTarget = device },
                 onRename = { renameTarget = device },
                 onRemove = { removeTarget = device },
+                // Manual connect and disconnect for the WHOOP. A short toast confirms the tap, since the link
+                // state only changes a few seconds later.
+                onConnect = if (device.brand.equals("WHOOP", ignoreCase = true)) {
+                    { Toast.makeText(context, "Reconnecting…", Toast.LENGTH_SHORT).show(); viewModel.connect() }
+                } else null,
+                onDisconnect = if (device.brand.equals("WHOOP", ignoreCase = true)) {
+                    { Toast.makeText(context, "Disconnecting", Toast.LENGTH_SHORT).show(); viewModel.disconnect() }
+                } else null,
+                onReboot = { rebootTarget = device },
             )
         }
 
@@ -252,6 +267,20 @@ fun DevicesScreen(
         )
     }
 
+    // --- Restart strap confirm (#166) ---
+    rebootTarget?.let { device ->
+        ConfirmDialog(
+            title = "Restart this strap?",
+            message = "Restart ${displayName(device)}? It disconnects for about 30 seconds while it " +
+                "reboots, then reconnects on its own. Your recorded data is kept. On WHOOP 5.0/MG this is " +
+                "experimental — if it doesn't restart, your strap log helps us confirm the command.",
+            confirmLabel = "Restart",
+            destructive = false,
+            onConfirm = { viewModel.rebootStrap(); rebootTarget = null },
+            onDismiss = { rebootTarget = null },
+        )
+    }
+
     // --- Second, strongly-worded delete-data confirm (from the Removed card's secondary control) ---
     deleteDataTarget?.let { device ->
         ConfirmDialog(
@@ -290,6 +319,9 @@ private fun DeviceCard(
     device: PairedDeviceRow,
     isActive: Boolean,
     isLiveConnected: Boolean,
+    /** The active strap's link dropped for a user-initiated reboot and NOOP is auto-reconnecting (#166).
+     *  Drives the transient "Reconnecting…" pill; false for every non-reboot state. */
+    isReconnecting: Boolean = false,
     dimmed: Boolean = false,
     /** The active+connected device's live battery percent (0–100) — surfaced the same way for WHOOP, a
      *  generic strap, or an FTMS machine. null when not active/connected or no battery was reported. */
@@ -302,6 +334,9 @@ private fun DeviceCard(
     onRemove: (() -> Unit)?,
     onReAdd: (() -> Unit)? = null,
     onDeleteData: (() -> Unit)? = null,
+    onConnect: (() -> Unit)? = null,
+    onDisconnect: (() -> Unit)? = null,
+    onReboot: (() -> Unit)? = null,
 ) {
     val profile = deviceProfile(device)
     // The per-device actions menu's open state is hoisted here so the WHOLE card is a tap target that opens
@@ -348,7 +383,7 @@ private fun DeviceCard(
                     StatePill("Beta", tone = StrandTone.Warning, showsDot = false)
                     Spacer(Modifier.width(6.dp))
                 }
-                StatePill(device, isActive, isLiveConnected)
+                StatePill(device, isActive, isLiveConnected, isReconnecting)
             }
 
             // Honest local-takeover state row for an adopted Oura ring that is paired but not the
@@ -391,6 +426,7 @@ private fun DeviceCard(
                 DeviceActionsMenu(
                     device = device,
                     isActive = isActive,
+                    isLiveConnected = isLiveConnected,
                     open = menuOpen,
                     onOpenChange = { menuOpen = it },
                     onMakeActive = onMakeActive,
@@ -398,6 +434,9 @@ private fun DeviceCard(
                     onRemove = onRemove,
                     onReAdd = onReAdd,
                     onDeleteData = onDeleteData,
+                    onConnect = onConnect,
+                    onDisconnect = onDisconnect,
+                    onReboot = onReboot,
                 )
             }
         }
@@ -449,10 +488,19 @@ private fun BatteryTube(pct: Int) {
 }
 
 @Composable
-private fun StatePill(device: PairedDeviceRow, isActive: Boolean, isLiveConnected: Boolean) {
+private fun StatePill(
+    device: PairedDeviceRow,
+    isActive: Boolean,
+    isLiveConnected: Boolean,
+    isReconnecting: Boolean = false,
+) {
     when {
         device.status == DeviceStatus.archived.name ->
             StatePill("Removed", tone = StrandTone.Neutral, showsDot = false)
+        // Reboot window (#166): the user's Restart dropped the link and NOOP is auto-reconnecting. Show it
+        // as intentional rather than a silent drop to "Active"; clears to "Active · Live" once the link is back.
+        isActive && isReconnecting ->
+            StatePill("Reconnecting…", tone = StrandTone.Warning, pulsing = true)
         isActive ->
             StatePill(
                 if (isLiveConnected) "Active · Live" else "Active",
@@ -467,6 +515,7 @@ private fun StatePill(device: PairedDeviceRow, isActive: Boolean, isLiveConnecte
 private fun DeviceActionsMenu(
     device: PairedDeviceRow,
     isActive: Boolean,
+    isLiveConnected: Boolean,
     // Open state is hoisted to the DeviceCard so the whole card (not just this ⋮ button) can open the menu.
     open: Boolean,
     onOpenChange: (Boolean) -> Unit,
@@ -475,6 +524,9 @@ private fun DeviceActionsMenu(
     onRemove: (() -> Unit)?,
     onReAdd: (() -> Unit)?,
     onDeleteData: (() -> Unit)?,
+    onConnect: (() -> Unit)? = null,
+    onDisconnect: (() -> Unit)? = null,
+    onReboot: (() -> Unit)? = null,
 ) {
     Box {
         IconButton(
@@ -498,10 +550,26 @@ private fun DeviceActionsMenu(
                     }
                 }
             } else {
+                // Manual connect and disconnect (WHOOP only; onConnect is null for other sources). Connect
+                // runs the same direct path as the initial connect, so it recovers a link the automatic
+                // reconnect left stuck. Shown first as the obvious recovery action.
+                if (onConnect != null) {
+                    if (isLiveConnected) {
+                        MenuItem("Disconnect", Icons.Filled.Close) { onOpenChange(false); onDisconnect?.invoke() }
+                    } else {
+                        MenuItem("Reconnect", Icons.Filled.Refresh) { onOpenChange(false); onConnect() }
+                    }
+                    HorizontalDivider(color = Palette.hairline)
+                }
                 if (!isActive) {
                     MenuItem("Make active", Icons.Filled.Bolt) { onOpenChange(false); onMakeActive() }
                 }
                 MenuItem("Rename", Icons.Filled.Edit) { onOpenChange(false); onRename() }
+                // Restart the strap — only for the live-connected WHOOP (the reboot travels over the active
+                // BLE link). Confirmation-gated by the parent. (#166)
+                if (isLiveConnected && SourceCoordinator.isWhoop(device) && onReboot != null) {
+                    MenuItem("Restart strap…", Icons.Filled.Refresh) { onOpenChange(false); onReboot() }
+                }
                 if (onRemove != null) {
                     HorizontalDivider(color = Palette.hairline)
                     MenuItem("Remove", Icons.Filled.RemoveCircleOutline, destructive = true) {

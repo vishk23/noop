@@ -93,6 +93,7 @@ import androidx.compose.foundation.gestures.calculateCentroid
 import androidx.compose.foundation.gestures.calculatePan
 import androidx.compose.foundation.gestures.calculateZoom
 import androidx.compose.foundation.gestures.detectHorizontalDragGestures
+import androidx.compose.ui.layout.Layout
 import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
@@ -105,11 +106,13 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
 import android.app.DatePickerDialog
 import android.view.HapticFeedbackConstants
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import com.noop.R
 import com.noop.analytics.BaselineState
 import com.noop.analytics.Baselines
 import com.noop.analytics.BatteryEstimator
@@ -661,7 +664,8 @@ fun TodayScreen(
     var stepsEstForDay by remember { mutableStateOf<Int?>(null) }
     LaunchedEffect(days, selectedDayKey) {
         val byDay = runCatching {
-            viewModel.repo.resolvedSeries("steps_est", "my-whoop", "0000-00-00", "9999-99-99")
+            viewModel.repo.resolvedSeries("steps_est", "my-whoop", "0000-00-00", "9999-99-99",
+                strapDeviceId = viewModel.activeStrapId)
                 .values.associate { it.first to it.second }
         }.getOrDefault(emptyMap())
         stepsEstForDay = byDay[selectedDayKey]?.let { Math.round(it).toInt() }
@@ -697,7 +701,8 @@ fun TodayScreen(
     var restScoreForDay by remember { mutableStateOf<Double?>(null) }
     LaunchedEffect(days, selectedDayKey, selectedDayOffset) {
         val byDay = runCatching {
-            viewModel.repo.resolvedSeries("sleep_performance", "my-whoop", "0000-00-00", "9999-99-99")
+            viewModel.repo.resolvedSeries("sleep_performance", "my-whoop", "0000-00-00", "9999-99-99",
+                strapDeviceId = viewModel.activeStrapId)
                 .values.associate { it.first to it.second }
         }.getOrDefault(emptyMap())
         // #977: the tail-fallback (latest scored night) is now freshness-gated. A live 5.0 whose sleep never
@@ -719,7 +724,8 @@ fun TodayScreen(
     var restCompositeSpark by remember { mutableStateOf<List<Double>>(emptyList()) }
     LaunchedEffect(days, selectedDay) {
         val byDay = runCatching {
-            viewModel.repo.resolvedSeries("sleep_performance", "my-whoop", "0000-00-00", "9999-99-99")
+            viewModel.repo.resolvedSeries("sleep_performance", "my-whoop", "0000-00-00", "9999-99-99",
+                strapDeviceId = viewModel.activeStrapId)
                 .values.associate { it.first to it.second }
         }.getOrDefault(emptyMap())
         val cutoff = selectedDay.minusDays(13).toString()
@@ -742,7 +748,8 @@ fun TodayScreen(
         val resolved = mutableMapOf<String, String>()
         for (key in listOf("recovery", "sleep_performance")) {
             val win = runCatching {
-                viewModel.repo.resolvedSeries(key, "my-whoop", "0000-00-00", "9999-99-99")
+                viewModel.repo.resolvedSeries(key, "my-whoop", "0000-00-00", "9999-99-99",
+                    strapDeviceId = viewModel.activeStrapId)
                     .points.lastOrNull { it.day == selectedDayKey }?.source
             }.getOrNull()
             if (win != null) resolved[key] = win
@@ -864,11 +871,11 @@ fun TodayScreen(
     // day-level deviceId, so an imported metric on an otherwise-computed day reads honestly. Gated on the
     // ring having a value (a calibrating / empty ring shows no badge). Null → no badge. Mirrors the Swift
     // Today lane (per-ring SourceBadge from provenanceByMetric, gated by ringHasValue).
-    val chargeProvenance = remember(provenanceByMetric, displayMetric) {
-        if (displayMetric?.recovery != null) provenanceByMetric["recovery"]?.let { provenanceDisplayLabel(it) } else null
+    val chargeProvenance = remember(provenanceByMetric, displayMetric, viewModel.activeStrapId) {
+        if (displayMetric?.recovery != null) provenanceByMetric["recovery"]?.let { provenanceDisplayLabel(it, viewModel.activeStrapId) } else null
     }
-    val restProvenance = remember(provenanceByMetric, restScoreForDay) {
-        if (restScoreForDay != null) provenanceByMetric["sleep_performance"]?.let { provenanceDisplayLabel(it) } else null
+    val restProvenance = remember(provenanceByMetric, restScoreForDay, viewModel.activeStrapId) {
+        if (restScoreForDay != null) provenanceByMetric["sleep_performance"]?.let { provenanceDisplayLabel(it, viewModel.activeStrapId) } else null
     }
 
     // 14-day trailing calendar window ending on the phone's actual local day.
@@ -881,18 +888,27 @@ fun TodayScreen(
         // Health-Connect row across ALL history. A bare Today re-mount (tab-away + return, or an Apple-Health
         // import that recreates the screen) re-fires this LaunchedEffect with the screen's `remember` state
         // reset, so it re-ran the full pass for byte-identical data every time: the lag users see returning
-        // to Today after an import. `days` is a `data class` list, so its structural hashCode is a stable
-        // content signature; if we already loaded the footer for THIS signature, the data on screen is correct
-        // and we skip. The marker lives on the long-lived ViewModel, so it survives the re-mount that reset the
-        // screen state. A real data change bumps the signature and re-runs, so no real update is dropped.
-        val sig = days.hashCode()
-        if (viewModel.todayFooterLoadedSig == sig) return@LaunchedEffect
+        // to Today after an import. The signature is `days` (a `data class` list, so its structural
+        // hashCode is a stable content signature) PLUS the 14-day cross-source workout union: `days`
+        // alone missed workouts imported without touching the Whoop day summaries (e.g. a Health
+        // Connect session recorded today), so the "Last Workouts" feed stayed stale until the next
+        // Whoop cycle bumped `days`. The union is a cheap windowed SELECT; only the heavy strap-HR
+        // derivation and all-history counts below are skipped on a signature match. The marker lives
+        // on the long-lived ViewModel, so it survives the re-mount that reset the screen state. A real
+        // data change bumps the signature and re-runs, so no real update is dropped.
         val now = System.currentTimeMillis() / 1000
         val recentCutoff = LocalDate.now()
             .minusDays(13)
             .atStartOfDay(ZoneId.systemDefault())
             .toEpochSecond()
-        val whoopWorkouts = viewModel.repo.workouts("my-whoop", 0L, now)
+        val recentUnion = viewModel.repo.workoutsAllSources(viewModel.deviceId, recentCutoff, now)
+            .sortedByDescending { it.startTs }
+        val sig = 31 * days.hashCode() + recentUnion.hashCode()
+        if (viewModel.todayFooterLoadedSig == sig) return@LaunchedEffect
+        // Union of the active strap id + legacy "my-whoop" (#814), NOT the literal id alone: after a
+        // re-pair the fresh recordings live under "whoop-<id>", and a pinned read undercounted them
+        // in the Whoop pill exactly like the feed dropped them from "Latest Workouts".
+        val whoopWorkouts = viewModel.repo.workoutsUnion(viewModel.deviceId, 0L, now)
         // Apple Health and Health Connect are separate sources (since #34), keep them separate in the
         // provenance footer too, so Health Connect data isn't mislabelled under the "Apple Health" pill
         // (issue #53). The recent-workouts list below still unions all sources for a combined feed.
@@ -902,10 +918,7 @@ fun TodayScreen(
         val hcDaysCount = viewModel.repo.appleDaily("health-connect", "0000-01-01", "9999-12-31").size
         footer = TodayFooterState(
             // fillWorkoutHrFromStrap: imported sessions carry no HR, derive it from strap samples (#77).
-            recentWorkouts = viewModel.repo.fillWorkoutHrFromStrap(
-                viewModel.repo.workoutsAllSources(recentCutoff, now)
-                    .sortedByDescending { it.startTs }
-            ),
+            recentWorkouts = viewModel.repo.fillWorkoutHrFromStrap(recentUnion),
             whoopDays = days.size,
             whoopWorkouts = whoopWorkouts.size,
             appleDays = appleDaysCount,
@@ -4288,13 +4301,27 @@ private fun LiquidKeyTile(data: KeyTileData, modifier: Modifier = Modifier) {
 }
 
 // Workouts across every recorded + imported source over [from, to]. Recorded sessions live under
-// "my-whoop"; Apple Health and Health Connect imports are stored under their own device ids (since
-// #34/#53). Both the "Last Workouts" feed and the HR-graph sport glyphs need the SAME union, or
-// Health-Connect-imported sessions get no glyph on the Today trend, so they share this one seam.
-private suspend fun WhoopRepository.workoutsAllSources(from: Long, to: Long): List<WorkoutRow> =
-    workouts("my-whoop", from, to) +
-        workouts("apple-health", from, to) +
-        workouts("health-connect", from, to)
+// the ACTIVE strap id — "whoop-<id>" after a re-pair — unioned with the canonical legacy "my-whoop"
+// via [WhoopRepository.workoutsUnion] (#814): this read was pinned to the literal "my-whoop", which
+// stranded a re-paired strap's fresh recordings, so the "Latest Workouts" feed and the HR-graph
+// glyphs silently dropped the newest sessions while the Workouts screen (already on the union, #28)
+// still showed them. Apple Health and Health Connect imports are stored under their own device ids
+// (since #34/#53). Both the "Last Workouts" feed and the HR-graph sport glyphs need the SAME union,
+// or Health-Connect-imported sessions get no glyph on the Today trend, so they share this one seam.
+// Deduped here (not per-consumer) with the Workouts screen's #687 semantics: a live strap recording
+// and its thin Health Connect import collapse to the richer row, so neither the feed shows a
+// duplicate card nor the HR trend a doubled sport glyph. dropDetectedShadows/filterDismissed are
+// deliberately absent: `detected` rows live under `<deviceId>-noop`, which this union never queries.
+private suspend fun WhoopRepository.workoutsAllSources(
+    activeDeviceId: String,
+    from: Long,
+    to: Long,
+): List<WorkoutRow> =
+    WorkoutEditing.dedupCrossSource(
+        workoutsUnion(activeDeviceId, from, to) +
+            workouts("apple-health", from, to) +
+            workouts("health-connect", from, to)
+    )
 
 // MARK: - Heart-rate trend (today's continuous HR off the strap's own ~1Hz history)
 //
@@ -4411,7 +4438,7 @@ private fun HeartRateTrendCard(
         // "Last Workouts" feed below showed them (#34/#53). The glyph self-hides when no strap HR
         // overlaps, so an import with no matching strap curve simply draws nothing.
         workoutsToday = runCatching {
-            viewModel.repo.workoutsAllSources(start - 6 * 3600L, end)
+            viewModel.repo.workoutsAllSources(viewModel.deviceId, start - 6 * 3600L, end)
                 .filter { it.startTs <= end && it.endTs >= start }
         }.getOrDefault(emptyList())
     }
@@ -4489,6 +4516,13 @@ private fun HeartRateTrendCard(
     val visAvg = visBpm.average().roundToInt()
     val visMin = visBpm.min().roundToInt()
 
+    // Round wall-clock ticks for the RENDERED extent, shared by the gridlines (drawn inside
+    // OverviewHRChart) and the axis-label strip below so they align.
+    val timeTicks = remember(visBuckets) {
+        chartTimeTicks(visBuckets.first().bucket, visBuckets.last().bucket, ZoneId.systemDefault())
+    }
+    val visTimestamps = remember(visBuckets) { visBuckets.map { it.bucket } }
+
     SectionHeader("Heart Rate", overline = selectedLabel)
     NoopCard {
         Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
@@ -4538,52 +4572,43 @@ private fun HeartRateTrendCard(
                 // #829 - renders the zoom window's subset, with the pinch/pan/double-tap transform
                 // detector attached (keyed on the #985-windowed buckets so its captured bounds track
                 // both a reload and a window change — the pinch operates INSIDE the selected window).
-                OverviewHRChart(
-                    buckets = visBuckets,
-                    bpm = visBpm,
-                    sleep = sleepToday,
-                    workouts = workoutsToday,
-                    recovery = displayMetric?.recovery,
-                    strain = displayMetric?.strain,
-                    effortScale = effortScale,
-                    modifier = Modifier
-                        .weight(1f)
-                        .height(Metrics.chartHeight)
-                        .pointerInput(winBuckets) {
-                            hrChartTransformGestures(
-                                buckets = winBuckets,
-                                bounds = zoomBounds,
-                                window = { hrZoom },
-                                onWindow = { hrZoom = it },
-                            )
-                        },
-                )
-            }
-            // X-axis: start / midpoint / end of the loaded window. Each label is read from the
-            // ACTUAL bucket timestamp at that index, converted to the device-local wall clock,             // NOT idx*5 from midnight. hrBuckets only emits filled 5-min slots (gaps when the strap
-            // wasn't worn) and its bucket key is epoch-aligned, so idx*5 mislabelled every tick once
-            // the day had a gap and the labels drifted out of step with the time-positioned markers
-            // (an evening workout read as if it sat earlier in the day) (#544). The line/markers are
-            // already placed by real timestamp, so labelling by real timestamp makes the axis agree.
-            Row(modifier = Modifier.fillMaxWidth()) {
-                val zone = ZoneId.systemDefault()
-                val hhmm = DateTimeFormatter.ofPattern("HH:mm", Locale.US)
-                // #829 - the axis reads the RENDERED subset, so a zoomed window's ticks describe the
-                // visible curve; the "Now" end label only applies to the un-zoomed live day (a zoomed
-                // window's right edge is wherever the user panned it, so it gets its real timestamp).
-                val bucketToTime = { idx: Int ->
-                    val b = visBuckets.getOrNull(idx) ?: visBuckets.last()
-                    Instant.ofEpochSecond(b.bucket).atZone(zone).format(hhmm)
-                }
-                val xLabels = if (visBuckets.size >= 3) {
-                    listOf(
-                        bucketToTime(0),
-                        bucketToTime(visBuckets.size / 2),
-                        if (selectedDay == today && hrZoom == null) "Now" else bucketToTime(visBuckets.size - 1),
+                // The chart and its axis-label strip share this Column so both span exactly the
+                // plot width (not the card width, which includes the y-rail) — a label centred at
+                // a tick fraction lands under its gridline.
+                Column(
+                    modifier = Modifier.weight(1f),
+                    verticalArrangement = Arrangement.spacedBy(4.dp),
+                ) {
+                    OverviewHRChart(
+                        buckets = visBuckets,
+                        bpm = visBpm,
+                        sleep = sleepToday,
+                        workouts = workoutsToday,
+                        recovery = displayMetric?.recovery,
+                        strain = displayMetric?.strain,
+                        effortScale = effortScale,
+                        timeTicks = timeTicks,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(Metrics.chartHeight)
+                            .pointerInput(winBuckets) {
+                                hrChartTransformGestures(
+                                    buckets = winBuckets,
+                                    bounds = zoomBounds,
+                                    window = { hrZoom },
+                                    onWindow = { hrZoom = it },
+                                )
+                            },
                     )
-                } else listOf("Start", "", "Now")
-                xLabels.forEach { lbl ->
-                    Text(lbl, style = NoopType.footnote, color = Palette.textTertiary, modifier = Modifier.weight(1f))
+                    // X-axis: labels use the SAME timestamp interpolation as the line and markers,
+                    // so the axis agrees with the curve even when the day has gaps (#544). "Now"
+                    // only on the un-zoomed live day — a zoomed window's right edge is wherever
+                    // the user panned it (#829).
+                    HrTimeAxisLabels(
+                        ticks = timeTicks,
+                        timestamps = visTimestamps,
+                        showNow = selectedDay == today && hrZoom == null,
+                    )
                 }
             }
             Box(
@@ -4622,6 +4647,50 @@ private fun HeartRateTrendCard(
                             .clickable(onClickLabel = "Reset the heart rate zoom") { hrZoom = null }
                             .padding(horizontal = 6.dp, vertical = 2.dp),
                     )
+                }
+            }
+        }
+    }
+}
+
+// The Today HR x-axis label strip: one Text per round-time tick, centred under its gridline via
+// the SAME per-bucket timestamp interpolation the chart uses (timestampFraction, Charts.kt) and
+// clamped into the strip. "Now" keeps its right-edge slot; a tick label that would collide with
+// it (or with its left neighbour) is skipped rather than overlapped.
+@Composable
+private fun HrTimeAxisLabels(
+    ticks: List<Pair<Long, String>>,
+    timestamps: List<Long>,
+    showNow: Boolean,
+) {
+    Layout(
+        modifier = Modifier.fillMaxWidth(),
+        content = {
+            ticks.forEach { (_, label) ->
+                Text(label, style = NoopType.footnote, color = Palette.textTertiary, maxLines = 1)
+            }
+            if (showNow) {
+                Text("Now", style = NoopType.footnote, color = Palette.textTertiary, maxLines = 1)
+            }
+        },
+    ) { measurables, constraints ->
+        val loose = constraints.copy(minWidth = 0, minHeight = 0)
+        val placeables = measurables.map { it.measure(loose) }
+        val width = constraints.maxWidth
+        val height = placeables.maxOfOrNull { it.height } ?: 0
+        layout(width, height) {
+            val nowPlaceable = if (showNow) placeables.last() else null
+            val nowLeft = nowPlaceable?.let { width - it.width } ?: Int.MAX_VALUE
+            nowPlaceable?.place(width - nowPlaceable.width, 0)
+            var lastRight = Int.MIN_VALUE
+            ticks.forEachIndexed { i, (ts, _) ->
+                val p = placeables[i]
+                val frac = timestampFraction(timestamps, ts) ?: return@forEachIndexed
+                val x = (frac * width - p.width / 2f).roundToInt().coerceIn(0, (width - p.width).coerceAtLeast(0))
+                // Skip a label that would overlap its neighbour or the "Now" marker.
+                if (x > lastRight && x + p.width <= nowLeft - 8) {
+                    p.place(x, 0)
+                    lastRight = x + p.width + 8
                 }
             }
         }
@@ -4747,8 +4816,13 @@ private fun OverviewHRChart(
     strain: Double?,
     effortScale: EffortScale,
     modifier: Modifier,
+    // Round wall-clock (epochSec, "HH:mm") ticks, each drawn as a dotted gridline under the curve.
+    // The matching labels render OUTSIDE this plot-height composable (HrTimeAxisLabels), sharing
+    // the same tick list + timestamp mapping so they align. Empty = no gridlines.
+    timeTicks: List<Pair<Long, String>> = emptyList(),
 ) {
     // The line itself stays the existing shared component, unchanged, markers are a sibling overlay.
+    val bucketTimestamps = remember(buckets) { buckets.map { it.bucket } }
     val minV = bpm.min()
     val maxV = bpm.max()
     val span = (maxV - minV).takeIf { it > 0.0 } ?: 1.0
@@ -4836,6 +4910,23 @@ private fun OverviewHRChart(
         // puts it under the curve, exactly like iOS; the wake divider, Charge/Effort rules and glow end-cap
         // stay in the Canvas AFTER the line (iOS draws those marks after the LineMark too, so they read on
         // top). Only the fill moved; same geometry, same colours.
+        // Dotted round-time gridlines, FIRST so everything (band, curve, markers) reads over them.
+        if (plotW > 0f && plotH > 0f && timeTicks.isNotEmpty()) {
+            val gridDash = remember { PathEffect.dashPathEffect(floatArrayOf(4f, 6f), 0f) }
+            Canvas(modifier = Modifier.fillMaxSize()) {
+                timeTicks.forEach { (ts, _) ->
+                    val frac = timestampFraction(bucketTimestamps, ts) ?: return@forEach
+                    val x = frac * size.width
+                    drawLine(
+                        color = Palette.hairline,
+                        start = Offset(x, 0f),
+                        end = Offset(x, size.height),
+                        strokeWidth = 1f,
+                        pathEffect = gridDash,
+                    )
+                }
+            }
+        }
         if (plotW > 0f && plotH > 0f &&
             sleepStartX != null && sleepEndX != null && sleepEndX > sleepStartX) {
             Canvas(modifier = Modifier.fillMaxSize()) {
@@ -4855,6 +4946,10 @@ private fun OverviewHRChart(
             color = Palette.metricRose,
             fill = true,
             selectionEnabled = true,
+            // Scrub read-out: the timestamps prefix the sample's local clock time and the #463
+            // formatter carries the unit — "14:32 · 87 bpm" instead of a bare "87".
+            formatValue = { "${it.roundToInt()} bpm" },
+            timestamps = bucketTimestamps,
         )
 
         // 2) Wake divider + dashed rules + glow end-cap, drawn in one Canvas ON TOP of the line.
@@ -5049,30 +5144,36 @@ data class TodayFooterState(
     val hcWorkouts: Int? = null,
 )
 
+// The Today "Last Workouts" contract, pure and unit-locked (LastWorkoutsFeedTest): cross-source
+// dedup (#687), newest first, at most four. The seam already dedups, so the dedup here is an
+// idempotent guard that keeps the contract honest for any future caller feeding a raw union.
+internal fun lastWorkoutsFeed(rows: List<WorkoutRow>): List<WorkoutRow> =
+    WorkoutEditing.dedupCrossSource(rows)
+        .sortedByDescending { it.startTs }
+        .take(4)
+
 @Composable
 private fun TodayWorkoutsSection(workouts: List<WorkoutRow>) {
-    if (workouts.isEmpty()) return
+    // Single column, newest first: the 2x2 grid truncated durations on narrow phones and read as
+    // unrelated stat tiles rather than a chronological feed. Full-width tiles have room for the
+    // kcal chip, so the #332 compactDelta workaround is no longer needed here.
+    val feed = lastWorkoutsFeed(workouts)
+    if (feed.isEmpty()) return
 
-    SectionHeader("Last Workouts", overline = "Activity", trailing = "14 days")
+    // "Latest Workouts", not "Last": "Last" read as "final". Mirrored on iOS (TodayView). Lives in
+    // strings.xml (values + values-de) so the header is localizable like the nav labels.
+    SectionHeader(stringResource(R.string.today_latest_workouts), overline = "Activity", trailing = "14 days")
     Column(verticalArrangement = Arrangement.spacedBy(Metrics.gap)) {
-        workouts.take(4).chunked(2).forEach { rowWorkouts ->
-            Row(horizontalArrangement = Arrangement.spacedBy(Metrics.gap)) {
-                rowWorkouts.forEach { workout ->
-                    StatTile(
-                        modifier = Modifier.weight(1f),
-                        label = WorkoutEditing.displaySport(workout.sport),
-                        value = workoutDuration(workout),
-                        caption = workoutCaption(workout),
-                        accent = workout.strain?.let { Palette.effortTint(it / StrainScorer.maxStrain) } ?: Palette.textPrimary,
-                        delta = workout.energyKcal?.let { "${it.roundToInt()} kcal" },
-                        deltaColor = Palette.metricAmber,
-                        // Keep the duration value readable beside the kcal chip on narrow phones, the
-                        // chip yields width instead of starving the value down to "4…"/"2…" (#332).
-                        compactDelta = true,
-                    )
-                }
-                if (rowWorkouts.size == 1) Spacer(Modifier.weight(1f))
-            }
+        feed.forEach { workout ->
+            StatTile(
+                modifier = Modifier.fillMaxWidth(),
+                label = WorkoutEditing.displaySport(workout.sport),
+                value = workoutDuration(workout),
+                caption = workoutCaption(workout),
+                accent = workout.strain?.let { Palette.effortTint(it / StrainScorer.maxStrain) } ?: Palette.textPrimary,
+                delta = workout.energyKcal?.let { "${it.roundToInt()} kcal" },
+                deltaColor = Palette.metricAmber,
+            )
         }
     }
 }
@@ -5092,9 +5193,9 @@ private fun TodaySourcesSection(
     val applePresent = (footer.appleDays ?: 0) > 0 || (footer.appleWorkouts ?: 0) > 0
     val hcPresent = (footer.hcDays ?: 0) > 0 || (footer.hcWorkouts ?: 0) > 0
     if (!expanded) {
-        // Collapsed: one tappable "Synced from: ..." line. Health Connect folds under the "Apple Watch"
-        // bucket in the summary (both are the phone's health store to the audience); the expanded card
-        // still lists every source by name, so no provenance detail is lost.
+        // Collapsed: one tappable "Synced from: ..." line. Each source is named for what it is —
+        // Health Connect must NOT fold under "Apple Watch" (issue #176: Health-Connect-only users
+        // saw "Synced from: Apple Watch"); the expanded card lists every source by name too.
         val collapsedInteraction = remember { MutableInteractionSource() }
         NoopCard(
             modifier = Modifier
@@ -5109,7 +5210,7 @@ private fun TodaySourcesSection(
         ) {
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Text(
-                    syncedFromSummary(hasWhoop = whoopPresent, hasApple = applePresent || hcPresent, hasXiaomi = false),
+                    syncedFromSummary(hasWhoop = whoopPresent, hasApple = applePresent, hasHealthConnect = hcPresent, hasXiaomi = false),
                     style = NoopType.subhead,
                     color = Palette.textSecondary,
                     maxLines = 1,
@@ -5343,12 +5444,15 @@ internal fun readinessWord(level: ReadinessEngine.Level): String? = when (level)
 /**
  * S5: the collapsed Data Sources footer summary, "Synced from: WHOOP, Apple Watch", listing only sources
  * with data (Apple Health reads as "Apple Watch", the device the audience knows), or "No sources yet".
- * PURE + unit-tested. Byte-identical twin of the Swift TodayView.syncedFromSummary.
+ * PURE + unit-tested. Twin of the Swift TodayView.syncedFromSummary, plus the Android-only
+ * hasHealthConnect source — Health Connect is named for what it is, never folded under "Apple Watch"
+ * (issue #176).
  */
-internal fun syncedFromSummary(hasWhoop: Boolean, hasApple: Boolean, hasXiaomi: Boolean): String {
+internal fun syncedFromSummary(hasWhoop: Boolean, hasApple: Boolean, hasHealthConnect: Boolean = false, hasXiaomi: Boolean): String {
     val names = buildList {
         if (hasWhoop) add("WHOOP")
         if (hasApple) add("Apple Watch")
+        if (hasHealthConnect) add("Health Connect")
         if (hasXiaomi) add("Mi Band")
     }
     return if (names.isEmpty()) "No sources yet" else "Synced from: " + names.joinToString(", ")
