@@ -1,0 +1,46 @@
+import XCTest
+@testable import Strand
+
+final class OuraOAuthTests: XCTestCase {
+    private let creds = OuraCredentials(clientId: "cid", clientSecret: "sec",
+                                        redirectURI: "noop://oura/callback")
+
+    func testAuthorizeURLHasRequiredParams() throws {
+        let url = OuraOAuth.authorizeURL(credentials: creds, state: "xyz")
+        let comps = try XCTUnwrap(URLComponents(url: url, resolvingAgainstBaseURL: false))
+        XCTAssertEqual(comps.host, "cloud.ouraring.com")
+        XCTAssertEqual(comps.path, "/oauth/authorize")
+        let q = Dictionary(uniqueKeysWithValues: (comps.queryItems ?? []).map { ($0.name, $0.value) })
+        XCTAssertEqual(q["response_type"], "code")
+        XCTAssertEqual(q["client_id"], "cid")
+        XCTAssertEqual(q["redirect_uri"], "noop://oura/callback")
+        XCTAssertEqual(q["state"], "xyz")
+        XCTAssertEqual(q["scope"], OuraOAuth.scopes.joined(separator: " "))
+    }
+
+    func testTokenExchangeRequestIsFormPost() throws {
+        let req = OuraOAuth.tokenExchangeRequest(credentials: creds, code: "the-code")
+        XCTAssertEqual(req.url?.absoluteString, "https://api.ouraring.com/oauth/token")
+        XCTAssertEqual(req.httpMethod, "POST")
+        XCTAssertEqual(req.value(forHTTPHeaderField: "Content-Type"), "application/x-www-form-urlencoded")
+        let body = String(data: req.httpBody ?? Data(), encoding: .utf8) ?? ""
+        XCTAssertTrue(body.contains("grant_type=authorization_code"))
+        XCTAssertTrue(body.contains("code=the-code"))
+        XCTAssertTrue(body.contains("client_id=cid"))
+        XCTAssertTrue(body.contains("client_secret=sec"))
+    }
+
+    func testParseTokenResponseComputesExpiry() throws {
+        let now = Date(timeIntervalSince1970: 1_000_000)
+        let json = #"{"access_token":"acc","refresh_token":"ref","expires_in":86400}"#.data(using: .utf8)!
+        let tokens = try OuraOAuth.parseTokenResponse(json, now: now)
+        XCTAssertEqual(tokens.accessToken, "acc")
+        XCTAssertEqual(tokens.refreshToken, "ref")
+        XCTAssertEqual(tokens.expiresAt, now.addingTimeInterval(86400))
+    }
+
+    func testParseTokenResponseThrowsOnMissingAccessToken() {
+        let json = #"{"error":"invalid_grant"}"#.data(using: .utf8)!
+        XCTAssertThrowsError(try OuraOAuth.parseTokenResponse(json, now: Date()))
+    }
+}
