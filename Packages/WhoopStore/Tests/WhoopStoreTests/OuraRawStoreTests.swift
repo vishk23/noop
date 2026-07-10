@@ -25,4 +25,16 @@ final class OuraRawStoreTests: XCTestCase {
         let dailySleepCount = try await store.ouraRawCount(deviceId: "oura-api", endpoint: "daily_sleep")
         XCTAssertEqual(dailySleepCount, 0)
     }
+
+    func testDeleteOuraRawRemovesAllForDevice() async throws {
+        let store = try await WhoopStore.inMemory()
+        _ = try await store.upsertOuraRaw([
+            OuraRawRow(endpoint: "sleep", documentId: "a", day: "2026-01-01", payloadJSON: "{}", fetchedAt: 1),
+            OuraRawRow(endpoint: "workout", documentId: "b", day: "2026-01-01", payloadJSON: "{}", fetchedAt: 1),
+        ], deviceId: "oura-api")
+        let deleted = try await store.deleteOuraRaw(deviceId: "oura-api")
+        XCTAssertEqual(deleted, 2)
+        let remainingCount = try await store.ouraRawCount(deviceId: "oura-api", endpoint: "sleep")
+        XCTAssertEqual(remainingCount, 0)
+    }
 }

@@ -64,4 +64,14 @@ extension WhoopStore {
                 arguments: [deviceId, endpoint]) ?? 0
         }
     }
+
+    /// Remove every archived Oura payload for a device (used by Disconnect — `deleteAllData` does not
+    /// cover `ouraRaw`). Returns rows deleted.
+    @discardableResult
+    public func deleteOuraRaw(deviceId: String) async throws -> Int {
+        try syncWrite { db in
+            try db.execute(sql: "DELETE FROM ouraRaw WHERE deviceId = ?", arguments: [deviceId])
+            return db.changesCount
+        }
+    }
 }
