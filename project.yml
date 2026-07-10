@@ -76,6 +76,12 @@ targets:
           # The liquid Today is now cross-platform: its iOS-only chrome (topBarTrailing / navigationBarTitleDisplayMode
           # / presentationCompactAdaptation / two-param onChange / sensoryFeedback) is guarded, so the mac split-view
           # shell hosts LiquidTodayView too. All Liquid/* now compile into the mac target.
+    # Oura BYO-app OAuth credentials, sourced from the untracked Strand/Oura/OuraSecrets.xcconfig
+    # (gitignored; template at OuraSecrets.example.xcconfig). Resolves the $(OURA_*) references in
+    # the info.properties below.
+    configFiles:
+      Debug: Strand/Oura/OuraSecrets.xcconfig
+      Release: Strand/Oura/OuraSecrets.xcconfig
     info:
       path: Strand/Resources/Info.plist
       properties:
@@ -93,6 +99,15 @@ targets:
         # HTTPS endpoints are unaffected. No arbitrary-loads blanket exemption.
         NSAppTransportSecurity:
           NSAllowsLocalNetworking: true
+        # Oura BYO-app OAuth credentials (values come from configFiles above); read at runtime via
+        # OuraCredentials.fromBundle. Absent/blank values cleanly disable the Connect-Oura lane.
+        OURA_CLIENT_ID: $(OURA_CLIENT_ID)
+        OURA_CLIENT_SECRET: $(OURA_CLIENT_SECRET)
+        OURA_REDIRECT_URI: $(OURA_REDIRECT_URI)
+        # Registers the noop:// URL scheme so ASWebAuthenticationSession's OAuth redirect
+        # (noop://oura/callback) reaches OuraOAuthProvider instead of bouncing off the OS.
+        CFBundleURLTypes:
+          - CFBundleURLSchemes: [noop]
     entitlements:
       path: Strand/Resources/Strand.entitlements
       properties:
@@ -180,6 +195,10 @@ targets:
           - "Resources/Info.plist"
           - "Resources/NOOP.entitlements"
       - path: StrandiOSShared
+    # Same untracked xcconfig as the macOS target (Strand/Oura/ is shared, not per-platform).
+    configFiles:
+      Debug: Strand/Oura/OuraSecrets.xcconfig
+      Release: Strand/Oura/OuraSecrets.xcconfig
     info:
       path: StrandiOS/Resources/Info.plist
       properties:
@@ -242,6 +261,15 @@ targets:
         # Both keys are required for the folder to actually appear in Files.
         UIFileSharingEnabled: true
         LSSupportsOpeningDocumentsInPlace: true
+        # Oura BYO-app OAuth credentials (values come from configFiles above); read at runtime via
+        # OuraCredentials.fromBundle. Absent/blank values cleanly disable the Connect-Oura lane.
+        OURA_CLIENT_ID: $(OURA_CLIENT_ID)
+        OURA_CLIENT_SECRET: $(OURA_CLIENT_SECRET)
+        OURA_REDIRECT_URI: $(OURA_REDIRECT_URI)
+        # Registers the noop:// URL scheme so ASWebAuthenticationSession's OAuth redirect
+        # (noop://oura/callback) reaches OuraOAuthProvider instead of bouncing off the OS.
+        CFBundleURLTypes:
+          - CFBundleURLSchemes: [noop]
     entitlements:
       path: StrandiOS/Resources/NOOP.entitlements
       properties:

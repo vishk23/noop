@@ -69,6 +69,8 @@ android/app/release/
 # ── Misc / secrets (never commit) ───────────────────────────────
 *.log
 .env
+# Oura BYO-app OAuth credentials (never committed)
+Strand/Oura/OuraSecrets.xcconfig
 # Deployment credentials (PAT / signing / endpoints) — never commit. `.env` above
 # won't match `deploy.env`, so list it (and any `deploy.env.<stage>`) explicitly.
 deploy.env
