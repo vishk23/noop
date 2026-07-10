@@ -79,8 +79,7 @@ final class OuraSyncCoordinator {
         result.heartRate = OuraApiParser.parseHeartRate(docs(hrPages))
         // Raw-only endpoints (no parser).
         for endpoint in Self.rawOnlyEndpoints {
-            _ = try await fetchRaw(endpoint, dateParam: Self.rawOnlyEndpoints.contains(endpoint) &&
-                                   ["personal_info", "ring_configuration"].contains(endpoint) ? nil : "start_date")
+            _ = try await fetchRaw(endpoint, dateParam: ["personal_info", "ring_configuration"].contains(endpoint) ? nil : "start_date")
         }
 
         result.days = Array(byDay.values)

@@ -6,8 +6,10 @@ import WhoopStore
 /// A fetcher that serves canned page bodies per endpoint.
 private final class StubFetcher: OuraPageFetching {
     var pages: [String: [Data]] = [:]
+    var capturedQueries: [String: [String: String]] = [:]
     func fetchAllRaw(endpoint: String, query: [String: String]) async throws -> [Data] {
-        pages[endpoint] ?? []
+        capturedQueries[endpoint] = query
+        return pages[endpoint] ?? []
     }
 }
 
@@ -33,5 +35,22 @@ final class OuraSyncCoordinatorTests: XCTestCase {
         XCTAssertEqual(days.first?.restingHr, 50)
         XCTAssertEqual(days.first?.steps, 9000)
         XCTAssertEqual(days.first?.totalSleepMin, 400)
+    }
+
+    func testEndpointDateParamsAreWiredCorrectly() async throws {
+        let store = try await WhoopStore.inMemory()
+        let fetcher = StubFetcher()
+        let coord = OuraSyncCoordinator(fetcher: fetcher, store: store)
+        _ = try await coord.runFullImport(today: "2026-02-01")
+
+        XCTAssertNotNil(fetcher.capturedQueries["heartrate"]?["start_datetime"])
+        XCTAssertNotNil(fetcher.capturedQueries["heartrate"]?["end_datetime"])
+        XCTAssertNil(fetcher.capturedQueries["heartrate"]?["start_date"])
+
+        XCTAssertEqual(fetcher.capturedQueries["personal_info"], [:])
+        XCTAssertEqual(fetcher.capturedQueries["ring_configuration"], [:])
+
+        XCTAssertNotNil(fetcher.capturedQueries["daily_readiness"]?["start_date"])
+        XCTAssertNotNil(fetcher.capturedQueries["daily_readiness"]?["end_date"])
     }
 }
