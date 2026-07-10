@@ -1,6 +1,7 @@
 import Foundation
 import Combine
 import AuthenticationServices
+import WhoopStore
 
 /// Drives the Data Sources "Connect Oura" card: connect (OAuth) → one-time backfill → honest summary →
 /// disconnect. @MainActor so all @Published mutations are main-thread; the network/backfill hops off-main.
@@ -54,6 +55,13 @@ final class OuraConnectModel: ObservableObject {
                 do {
                     try await store.deleteAllData(deviceId: "oura-api")
                     try await store.deleteOuraRaw(deviceId: "oura-api")
+                    // M-1: `deleteAllData` intentionally leaves the `pairedDevice` registry row intact
+                    // (archiving/removing it is a separate op — DeviceRegistryStore.swift) so it doesn't
+                    // just purge data, else a data-less "Oura (cloud)" card lingers in DevicesView. Archive
+                    // it via the same off-actor raw-write pattern OuraSyncWriter.persist uses to register
+                    // the row on connect (`registryWriter` is `nonisolated`; `DeviceRegistryStore` is a
+                    // thin synchronous, Sendable wrapper — no separate actor hop needed).
+                    try DeviceRegistryStore(dbQueue: store.registryWriter).archive("oura-api")
                     statusText = "Disconnected."
                 } catch {
                     statusText = "Disconnected, but couldn't fully clear local Oura data: \(error.localizedDescription)"

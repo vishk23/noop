@@ -458,9 +458,10 @@ values, so any field Oura returns can be re-derived later without re-fetching.
 
 ### `ouraRaw` *(v24)*
 
-One row per archived Oura API document (`OuraRawStore.swift`, `struct OuraRawRow`).
-Natural key `(deviceId, endpoint, documentId)`. Written by the Oura sync coordinator in the
-app target (`Strand/Oura/`); migration `v24-oura-raw`
+One row per fetched PAGE of an Oura API endpoint response — not one row per Oura document; a
+single page's `data` array can carry many documents (`OuraRawStore.swift`, `struct OuraRawRow`).
+Written by `OuraSyncCoordinator.fetchRaw(_:dateParam:)` in the app target (`Strand/Oura/`).
+Natural key `(deviceId, endpoint, documentId)`. Migration `v24-oura-raw`
 (`Packages/WhoopStore/Sources/WhoopStore/Database.swift`) — additive only, a new table, no
 existing row touched.
 
@@ -468,14 +469,15 @@ existing row touched.
 | --- | --- | --- |
 | `deviceId` | TEXT NOT NULL | Part of PK. `"oura-api"` for the live cloud-import lane. |
 | `endpoint` | TEXT NOT NULL | Part of PK. Oura endpoint name, e.g. `"sleep"`, `"daily_readiness"`, `"heartrate"`. |
-| `documentId` | TEXT NOT NULL | Part of PK. Oura's own `id` for the document; heartrate pages synthesize a window key. |
-| `day` | TEXT | `YYYY-MM-DD`, nullable — set when the document is day-keyed. |
-| `payloadJSON` | TEXT NOT NULL | Verbatim Oura response object. |
+| `documentId` | TEXT NOT NULL | Part of PK. A SYNTHESIZED page key, `"<endpoint>-<startDate>-<pageIndex>"` (`startDate` is the backfill window's start date, `pageIndex` the fetched page's 0-based position) — never Oura's own document `id`, for any endpoint. |
+| `day` | TEXT | `YYYY-MM-DD`, nullable. Currently always NULL — the coordinator never sets it. Reserved for a future per-document (rather than per-page) keying scheme. |
+| `payloadJSON` | TEXT NOT NULL | Verbatim JSON body of the fetched page (the raw HTTP response, including its `data` array of documents) — losslessness holds at the page level, not the individual-document level. |
 | `fetchedAt` | INTEGER NOT NULL | Unix seconds. |
 
 **Primary key:** `(deviceId, endpoint, documentId)`. `upsertOuraRaw(...)` is idempotent on this
-key via `ON CONFLICT(...) DO UPDATE` — a re-pulled document overwrites its
-`day`/`payloadJSON`/`fetchedAt` rather than duplicating.
+key via `ON CONFLICT(...) DO UPDATE` — re-pulling the SAME window (same `startDate`, so the same
+`pageIndex` synthesizes the same `documentId`) overwrites that page's `day`/`payloadJSON`/
+`fetchedAt` in place rather than duplicating.
 
 **Index** — `idx_ouraRaw_device_endpoint_day` on `(deviceId, endpoint, day)`, so per-endpoint
 reads (`ouraRaw(deviceId:endpoint:)`) scan `(deviceId, endpoint)` and walk `day` in order
