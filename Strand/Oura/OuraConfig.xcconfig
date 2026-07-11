@@ -1,0 +1,5 @@
+// Tracked wrapper so a clean checkout (no local credentials) still generates and builds.
+// OuraSecrets.xcconfig is gitignored; when absent, the optional include is skipped, the
+// OURA_* build settings stay undefined, the Info.plist keys resolve to empty strings, and
+// OuraCredentials.fromBundle returns nil — the whole Oura Cloud lane is inert.
+#include? "OuraSecrets.xcconfig"
