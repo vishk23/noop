@@ -8,7 +8,12 @@ protocol OuraPageFetching {
 }
 extension OuraAPIClient: OuraPageFetching {}
 
-struct OuraSyncProgress: Equatable { let endpoint: String; let pages: Int }
+struct OuraSyncProgress: Equatable {
+    let endpoint: String
+    let pages: Int
+    /// Optional human detail (e.g. "window 4/17" for the chunked heartrate fetch).
+    var detail: String? = nil
+}
 
 /// One-time backfill across every Oura v2 endpoint → an assembled OuraSyncResult → OuraSyncWriter. Merges
 /// the per-day WearableDailyRows across endpoints (daily endpoints BEFORE sleep, so readiness RHR wins).
@@ -101,8 +106,12 @@ final class OuraSyncCoordinator {
             let floorDay = byDay.keys.min() ?? startDate
             var cursor = Self.dayFmt.date(from: floorDay) ?? Date(timeIntervalSince1970: 0)
             let endDate = (Self.dayFmt.date(from: today) ?? Date()).addingTimeInterval(86_400)
+            let totalWindows = max(1, Int(ceil(endDate.timeIntervalSince(cursor) / (30 * 86_400))))
+            var window = 0
             var hrDocs: [[String: Any]] = []
             while cursor < endDate {
+                window += 1
+                onProgress(OuraSyncProgress(endpoint: "heartrate", pages: 0, detail: "window \(window)/\(totalWindows)"))
                 let next = min(cursor.addingTimeInterval(30 * 86_400), endDate)
                 let pages = try await fetchRawQuery("heartrate", query: [
                     "start_datetime": Self.isoFmt.string(from: cursor),
@@ -121,6 +130,9 @@ final class OuraSyncCoordinator {
         }
 
         result.days = Array(byDay.values)
+        // The write phase can take a while on a first full import — surface it honestly instead of
+        // leaving the last endpoint's "Importing …" text on screen.
+        onProgress(OuraSyncProgress(endpoint: "saving", pages: 0))
         var summary = try await OuraSyncWriter.persist(result, into: store)
         summary.skippedEndpoints = skipped
         return summary

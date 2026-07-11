@@ -2,6 +2,9 @@ import Foundation
 import Combine
 import AuthenticationServices
 import WhoopStore
+#if os(iOS)
+import UIKit
+#endif
 
 /// Drives the Data Sources "Connect Oura" card: connect (OAuth) → one-time backfill → honest summary →
 /// disconnect. @MainActor so all @Published mutations are main-thread; the network/backfill hops off-main.
@@ -26,7 +29,7 @@ final class OuraConnectModel: ObservableObject {
         guard let creds = OuraCredentials.fromBundle else {
             statusText = "Add your Oura app's client_id/secret to OuraSecrets.xcconfig first."; return
         }
-        busy = true; statusText = "Connecting to Oura…"
+        setBusy(true); statusText = "Connecting to Oura…"
         Task {
             do {
                 let provider = OuraOAuthProvider(credentials: creds)
@@ -38,7 +41,10 @@ final class OuraConnectModel: ObservableObject {
                 let today = Self.dayFormatter.string(from: Date())
                 statusText = "Importing your Oura history…"
                 let s = try await coord.runFullImport(today: today) { [weak self] p in
-                    Task { @MainActor in self?.statusText = "Importing \(p.endpoint)…" }
+                    Task { @MainActor in
+                        if p.endpoint == "saving" { self?.statusText = "Saving to your database…" }
+                        else { self?.statusText = "Importing \(p.endpoint)\(p.detail.map { " (\($0))" } ?? "")…" }
+                    }
                 }
                 await repo.refresh()
                 var line = "Imported \(s.days) days · \(s.sleeps) sleeps · \(s.workouts) workouts · \(s.hrSamples) HR samples"
@@ -47,7 +53,7 @@ final class OuraConnectModel: ObservableObject {
                 }
                 statusText = line
             } catch { fail((error as? LocalizedError)?.errorDescription ?? error.localizedDescription) }
-            busy = false
+            setBusy(false)
         }
     }
 
@@ -78,7 +84,16 @@ final class OuraConnectModel: ObservableObject {
         }
     }
 
-    private func fail(_ m: String) { statusText = m; busy = false }
+    private func fail(_ m: String) { statusText = m; setBusy(false) }
+
+    /// Busy also pins the screen awake on iOS: the backfill is a foreground URLSession flow, and an
+    /// auto-lock mid-import suspends the app and freezes the run with no error. Always reset on exit.
+    private func setBusy(_ b: Bool) {
+        busy = b
+        #if os(iOS)
+        UIApplication.shared.isIdleTimerDisabled = b
+        #endif
+    }
     private static let dayFormatter: DateFormatter = {
         let f = DateFormatter(); f.calendar = Calendar(identifier: .gregorian)
         f.locale = Locale(identifier: "en_US_POSIX"); f.timeZone = TimeZone(identifier: "UTC")
