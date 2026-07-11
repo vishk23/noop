@@ -564,6 +564,18 @@ object NoopPrefs {
         of(context).edit().putBoolean(KEY_BATTERY_ALERTS, enabled).apply()
     }
 
+    /** Predictive "recharge tonight" warning at ~24h of estimated runtime left. Sub-gate under
+     *  KEY_BATTERY_ALERTS (both must be on). Default ON so pre-toggle behavior is unchanged.
+     *  iOS/macOS twin key: behavior.batteryPredictiveAlerts. */
+    const val KEY_BATTERY_PREDICTIVE_ALERTS = "noop.batteryPredictiveAlerts"
+
+    fun predictiveBatteryAlerts(context: Context): Boolean =
+        of(context).getBoolean(KEY_BATTERY_PREDICTIVE_ALERTS, true)
+
+    fun setPredictiveBatteryAlerts(context: Context, enabled: Boolean) {
+        of(context).edit().putBoolean(KEY_BATTERY_PREDICTIVE_ALERTS, enabled).apply()
+    }
+
     /** Persisted once-per-crossing flags behind BatteryAlertPolicy, they survive process death so a
      *  battery hovering near a threshold fires exactly once per cycle (low re-arms above 25%, full
      *  re-arms below 100%). */

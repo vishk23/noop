@@ -262,7 +262,8 @@ final class AppModel: ObservableObject {
             // alert above remains the safety net.
             BatteryNotifier.onRuntimeEstimate(remainingHours: self.live.batteryEstimate?.remainingHours,
                                               charging: self.live.charging,
-                                              enabled: self.behavior.batteryAlerts)
+                                              enabled: self.behavior.batteryAlerts
+                                                    && self.behavior.batteryPredictiveAlerts)
         }
         // HR-zone haptic coaching watches the smoothed bpm.
         $bpm.sink { [weak self] hr in self?.coachZone(hr) }.store(in: &hrCancellables)
