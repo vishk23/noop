@@ -11,7 +11,7 @@
 ## Global Constraints
 
 - **MCP SDK pinned to exactly `1.29.0`** (`"@modelcontextprotocol/sdk": "1.29.0"`, no `^`). Do NOT use the 2.0.0-beta line. Rationale: the 2026-07-28 stateless spec revision is still an RC; 1.29.x is the supported stable line.
-- **`better-sqlite3` pinned exact** (`"better-sqlite3": "11.10.0"`, no `^`) — native binding; a floating range risks an ABI mismatch on the Fly builder. `npm rebuild better-sqlite3` is the fix if the prebuilt binding mismatches Node 20.
+- **`better-sqlite3` pinned exact** (`"better-sqlite3": "12.11.1"`, no `^`) — native binding; a floating range risks an ABI mismatch on the Fly builder. Verified locally: 12.11.1 installs + loads on this machine's **Node 26 (ABI 147)**, and 12.x still ships a **Node-20 prebuilt** for the `node:20-slim` Docker image. `npm rebuild better-sqlite3` is the fix if a prebuilt binding ever mismatches the runtime Node.
 - **Stateless MCP transport**: every `/mcp` request constructs a fresh `McpServer` + `StreamableHTTPServerTransport({ sessionIdGenerator: undefined })`. No session store — a Fly autostop between requests must not break a session.
 - **The mirror is opened READ-ONLY always** (`new Database(path, { readonly: true, fileMustExist: true })`). Server code never writes to `mirror.sqlite`. Server-owned state lives only in `server.sqlite`.
 - **`deviceId` is a *source* discriminator, not a physical device.** The same calendar day legitimately has rows under multiple `deviceId`s. Source families for Phase 1: WHOOP = any id that is NOT `apple-health` and NOT `oura-api` (straps use ids like `my-whoop`, plus derived `<id>-noop`); Oura = `oura-api`; Apple = `apple-health`. Never assume one row per day.
@@ -65,7 +65,7 @@ Create `package.json`:
   "dependencies": {
     "@modelcontextprotocol/sdk": "1.29.0",
     "adm-zip": "0.5.16",
-    "better-sqlite3": "11.10.0",
+    "better-sqlite3": "12.11.1",
     "express": "^4.21.2",
     "zod": "^3.23.8"
   },
