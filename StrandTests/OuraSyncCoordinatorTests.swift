@@ -3,12 +3,14 @@ import WhoopStore
 @testable import StrandImport
 @testable import Strand
 
-/// A fetcher that serves canned page bodies per endpoint.
+/// A fetcher that serves canned page bodies per endpoint (and can fail chosen endpoints, like a scope 401).
 private final class StubFetcher: OuraPageFetching {
     var pages: [String: [Data]] = [:]
     var capturedQueries: [String: [String: String]] = [:]
+    var failEndpoints: Set<String> = []
     func fetchAllRaw(endpoint: String, query: [String: String]) async throws -> [Data] {
         capturedQueries[endpoint] = query
+        if failEndpoints.contains(endpoint) { throw OuraError.badResponse(401, "token is not authorized") }
         return pages[endpoint] ?? []
     }
 }
@@ -52,5 +54,16 @@ final class OuraSyncCoordinatorTests: XCTestCase {
 
         XCTAssertNotNil(fetcher.capturedQueries["daily_readiness"]?["start_date"])
         XCTAssertNotNil(fetcher.capturedQueries["daily_readiness"]?["end_date"])
+    }
+
+    func testFailingEndpointIsSkippedNotFatal() async throws {
+        let store = try await WhoopStore.inMemory()
+        let fetcher = StubFetcher()
+        fetcher.pages["daily_readiness"] = [#"{"data":[{"day":"2026-01-02","score":80,"contributors":{"resting_heart_rate":50}}],"next_token":null}"#.data(using: .utf8)!]
+        fetcher.failEndpoints = ["daily_spo2"]   // the live failure mode: scope 401 on one endpoint
+        let coord = OuraSyncCoordinator(fetcher: fetcher, store: store)
+        let summary = try await coord.runFullImport(today: "2026-02-01")
+        XCTAssertEqual(summary.days, 1)                              // the rest of the backfill still lands
+        XCTAssertEqual(summary.skippedEndpoints, ["daily_spo2"])     // and the skip is reported honestly
     }
 }

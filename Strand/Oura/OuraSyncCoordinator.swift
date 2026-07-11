@@ -62,27 +62,44 @@ final class OuraSyncCoordinator {
             }
         }
 
+        // One failing endpoint must not abort the whole backfill (spec §7 — honest partial). A fetch
+        // error (e.g. a scope 401 like the live spo2 naming mismatch) records the endpoint as skipped
+        // and the run continues; the UI surfaces the skips from the summary.
+        var skipped: [String] = []
+
         // Daily endpoints first (readiness RHR precedence), extras accumulate.
         for endpoint in Self.dailyEndpoints {
-            let pages = try await fetchRaw(endpoint, dateParam: "start_date")
-            let (days, extras) = OuraApiParser.parseDaily(docs(pages), endpoint: endpoint)
-            merge(days); result.extras.append(contentsOf: extras)
+            do {
+                let pages = try await fetchRaw(endpoint, dateParam: "start_date")
+                let (days, extras) = OuraApiParser.parseDaily(docs(pages), endpoint: endpoint)
+                merge(days); result.extras.append(contentsOf: extras)
+            } catch { skipped.append(endpoint) }
         }
         // Sleep last (its lowestHr fallback only fills days readiness didn't cover).
-        let sleepPages = try await fetchRaw("sleep", dateParam: "start_date")
-        let (periods, sleepDays) = OuraApiParser.parseSleep(docs(sleepPages))
-        result.sleepPeriods = periods; merge(sleepDays)
+        do {
+            let sleepPages = try await fetchRaw("sleep", dateParam: "start_date")
+            let (periods, sleepDays) = OuraApiParser.parseSleep(docs(sleepPages))
+            result.sleepPeriods = periods; merge(sleepDays)
+        } catch { skipped.append("sleep") }
         // Workouts + heart-rate.
-        let workoutPages = try await fetchRaw("workout", dateParam: "start_date")
-        result.workouts = OuraApiParser.parseWorkouts(docs(workoutPages))
-        let hrPages = try await fetchRaw("heartrate", dateParam: "start_datetime")
-        result.heartRate = OuraApiParser.parseHeartRate(docs(hrPages))
+        do {
+            let workoutPages = try await fetchRaw("workout", dateParam: "start_date")
+            result.workouts = OuraApiParser.parseWorkouts(docs(workoutPages))
+        } catch { skipped.append("workout") }
+        do {
+            let hrPages = try await fetchRaw("heartrate", dateParam: "start_datetime")
+            result.heartRate = OuraApiParser.parseHeartRate(docs(hrPages))
+        } catch { skipped.append("heartrate") }
         // Raw-only endpoints (no parser).
         for endpoint in Self.rawOnlyEndpoints {
-            _ = try await fetchRaw(endpoint, dateParam: ["personal_info", "ring_configuration"].contains(endpoint) ? nil : "start_date")
+            do {
+                _ = try await fetchRaw(endpoint, dateParam: ["personal_info", "ring_configuration"].contains(endpoint) ? nil : "start_date")
+            } catch { skipped.append(endpoint) }
         }
 
         result.days = Array(byDay.values)
-        return try await OuraSyncWriter.persist(result, into: store)
+        var summary = try await OuraSyncWriter.persist(result, into: store)
+        summary.skippedEndpoints = skipped
+        return summary
     }
 }

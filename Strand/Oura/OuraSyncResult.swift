@@ -21,7 +21,10 @@ struct OuraSyncResult {
     }
 }
 
-/// Counts written, for the honest import summary.
+/// Counts written, for the honest import summary. `skippedEndpoints` lists endpoints whose fetch failed
+/// (e.g. a scope 401) — the backfill continues past them (honest partial, spec §7) and the UI surfaces
+/// the skips so a partial import never silently looks complete.
 struct OuraSyncSummary: Equatable {
     var days = 0, sleeps = 0, workouts = 0, hrSamples = 0, metricPoints = 0, rawPages = 0
+    var skippedEndpoints: [String] = []
 }

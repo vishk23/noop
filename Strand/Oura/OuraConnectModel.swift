@@ -41,7 +41,11 @@ final class OuraConnectModel: ObservableObject {
                     Task { @MainActor in self?.statusText = "Importing \(p.endpoint)…" }
                 }
                 await repo.refresh()
-                statusText = "Imported \(s.days) days · \(s.sleeps) sleeps · \(s.workouts) workouts · \(s.hrSamples) HR samples"
+                var line = "Imported \(s.days) days · \(s.sleeps) sleeps · \(s.workouts) workouts · \(s.hrSamples) HR samples"
+                if !s.skippedEndpoints.isEmpty {
+                    line += " · skipped: \(s.skippedEndpoints.joined(separator: ", ")) — tap Sync again to retry"
+                }
+                statusText = line
             } catch { fail((error as? LocalizedError)?.errorDescription ?? error.localizedDescription) }
             busy = false
         }

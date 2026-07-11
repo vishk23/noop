@@ -6,7 +6,11 @@ import Foundation
 enum OuraOAuth {
     static let authorizeEndpoint = URL(string: "https://cloud.ouraring.com/oauth/authorize")!
     static let tokenEndpoint = URL(string: "https://api.ouraring.com/oauth/token")!
-    static let scopes = ["email", "personal", "daily", "heartrate", "workout", "tag", "session", "spo2Daily"]
+    // Oura's docs disagree on the SpO2 scope name: the OpenAPI spec says "spo2Daily", the auth page says
+    // "spo2", and live testing showed a token minted with only "spo2Daily" gets 401 on daily_spo2. Oura's
+    // authorize endpoint silently ignores scope names it doesn't recognize (verified: the "spo2Daily"-only
+    // request completed), so requesting BOTH spellings is safe and future-proof in either direction.
+    static let scopes = ["email", "personal", "daily", "heartrate", "workout", "tag", "session", "spo2", "spo2Daily"]
 
     /// The consent URL to open in ASWebAuthenticationSession. `state` is a caller-generated nonce echoed
     /// back on redirect and verified, to defeat CSRF / stray callbacks.
