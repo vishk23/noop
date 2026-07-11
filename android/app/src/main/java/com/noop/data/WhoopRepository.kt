@@ -1377,17 +1377,19 @@ class WhoopRepository(private val dao: WhoopDao) {
                 return seen.toList()
             }
             if (preferredSource == WHOOP_SOURCE || preferredSource == strapDeviceId) {
-                // Active strap first (live/measured wins per day), then the CANONICAL "my-whoop" import +
-                // its computed sibling so history banked under the canonical id BEFORE a re-add still
-                // resolves , the #814 union model the rest of the read spine already follows
-                // ([importedSourceIdsFor]); the resolver never got wired into it (#1008). uniqued()
-                // collapses these to one pair on a single-device install (active == canonical), so that
-                // path stays byte-identical. Apple is the final cross-source fallback. Mirrors Swift
-                // Repository.sourceCandidates.
+                // Active strap first (live/measured wins per day), then the CANONICAL "my-whoop" import,
+                // THEN the computed siblings, so history banked under the canonical id before a re-add
+                // still resolves (the #814/#1008 union model) AND imports outrank computed estimates — the
+                // documented `imported WHOOP > NOOP-computed` order. The computed sibling used to sit ahead
+                // of the canonical import, so after a device re-add (active != canonical) the new strap's
+                // computed estimates shadowed richer imported my-whoop history. uniqued() collapses these
+                // to one pair per source on a single-device install (active == canonical), so that path
+                // stays byte-identical. Apple is the final cross-source fallback. Mirrors Swift
+                // Repository.sourceCandidates (ryanbr/noop#241).
                 val candidates = mutableListOf(
                     MetricSourceCandidate(strapDeviceId, key),
-                    MetricSourceCandidate(computedSource, key),
                     MetricSourceCandidate(WHOOP_SOURCE, key),
+                    MetricSourceCandidate(computedSource, key),
                     MetricSourceCandidate("$WHOOP_SOURCE-noop", key),
                 )
                 appleCompatibleKey(key)?.let {
@@ -1703,14 +1705,44 @@ class WhoopRepository(private val dao: WhoopDao) {
                 val offsetSec = (java.util.TimeZone.getDefault().getOffset(s.endTs * 1000) / 1000).toLong()
                 return com.noop.analytics.AnalyticsEngine.dayString(s.endTs, offsetSec)
             }
-            // #715 — preserve EVERY session (a day with a main night + a nap must keep both); imported
-            // still wins per end-day. The old LinkedHashMap<String, SleepSession> overwrote on collision
-            // and silently dropped a second same-day session. Mirrors WhoopStore.SleepMerge (SleepMergeTests).
-            val importedDays = imported.mapTo(HashSet()) { endDay(it) }
+            return mergeSleepRichness(imported, computed, ::endDay).sortedBy { it.startTs }
+        }
+
+        /** Imported-wins-per-day sleep merge WITH the #241 richness exception, returned UNSORTED so callers
+         *  can apply their own sort/keyer. [mergeSleep] is this keyed by local wake-day + sorted by startTs;
+         *  the Sleep screen (SleepScreen) keys the same way but sorts by effectiveStartTs (#395), so it calls
+         *  this directly to get the SAME richness rule the browse/CSV path uses.
+         *
+         *  #715 — preserve EVERY session (a day with a main night + a nap must keep both). Richness exception
+         *  (ryanbr/noop#241): a sparse import (no stage data on ANY of its sessions that day) must NOT clobber
+         *  a computed day that HAS stage data — otherwise a stage-less WHOOP/Apple/HC re-import blanks the
+         *  stage breakdown for a night the strap fully staged. Days where the import carries stages, or where
+         *  neither side does, keep the imported-wins rule. Mirrors WhoopStore.SleepMerge (SleepMergeTests). */
+        internal fun mergeSleepRichness(
+            imported: List<SleepSession>,
+            computed: List<SleepSession>,
+            endDay: (SleepSession) -> String,
+        ): List<SleepSession> {
+            val importedByDay = imported.groupBy(endDay)
+            val computedByDay = computed.groupBy(endDay)
             val out = ArrayList<SleepSession>(imported.size + computed.size)
-            out.addAll(imported)
-            for (s in computed) if (endDay(s) !in importedDays) out.add(s)
-            return out.sortedBy { it.startTs }
+            for ((day, imp) in importedByDay) {
+                val comp = computedByDay[day]
+                if (comp != null && imp.none { hasStages(it) } && comp.any { hasStages(it) }) {
+                    out.addAll(comp)   // richer computed day survives a stage-less import
+                } else {
+                    out.addAll(imp)    // imported wins its day (unchanged rule)
+                }
+            }
+            for ((day, comp) in computedByDay) if (day !in importedByDay) out.addAll(comp)
+            return out
+        }
+
+        /** True when the session carries a non-empty stage payload; null, "", and "[]" carry none.
+         *  Twin of WhoopStore.SleepMerge.hasStages. */
+        private fun hasStages(s: SleepSession): Boolean {
+            val json = s.stagesJSON?.trim() ?: return false
+            return json.isNotEmpty() && json != "[]"
         }
     }
 }
