@@ -584,6 +584,18 @@ object NoopPrefs {
         of(context).edit().putBoolean(KEY_BATTERY_FULL_ALERTED, alerted).apply()
     }
 
+    /** Persisted once-per-discharge gate behind BatteryEstimator.runtimeAlert (the predictive
+     *  "~X left" alert; fires ≤24 h, re-arms ≥36 h). Same survive-process-death contract as the
+     *  SoC flags above. */
+    const val KEY_BATTERY_RUNTIME_ALERTED = "noop.batteryRuntimeAlerted"
+
+    fun batteryRuntimeAlerted(context: Context): Boolean =
+        of(context).getBoolean(KEY_BATTERY_RUNTIME_ALERTED, false)
+
+    fun setBatteryRuntimeAlerted(context: Context, alerted: Boolean) {
+        of(context).edit().putBoolean(KEY_BATTERY_RUNTIME_ALERTED, alerted).apply()
+    }
+
     /** Scheduled report notifications (#517), opt-in, default OFF, no AI. Two independent toggles:
      *  - [KEY_REPORT_MORNING]: a morning recap (Charge + Rest) posted once after a fresh night is
      *    processed. It is NOT alarm-precise, it lands when the next sync + analytics pass completes,
