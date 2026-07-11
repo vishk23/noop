@@ -76,12 +76,13 @@ targets:
           # The liquid Today is now cross-platform: its iOS-only chrome (topBarTrailing / navigationBarTitleDisplayMode
           # / presentationCompactAdaptation / two-param onChange / sensoryFeedback) is guarded, so the mac split-view
           # shell hosts LiquidTodayView too. All Liquid/* now compile into the mac target.
-    # Oura BYO-app OAuth credentials, sourced from the untracked Strand/Oura/OuraSecrets.xcconfig
-    # (gitignored; template at OuraSecrets.example.xcconfig). Resolves the $(OURA_*) references in
-    # the info.properties below.
+    # Oura BYO-app OAuth credentials. OuraConfig.xcconfig is a tracked wrapper that optionally
+    # includes the untracked, gitignored Strand/Oura/OuraSecrets.xcconfig (template at
+    # OuraSecrets.example.xcconfig) — absent secrets leave the $(OURA_*) references in the
+    # info.properties below empty, which disables the Oura Cloud lane at runtime.
     configFiles:
-      Debug: Strand/Oura/OuraSecrets.xcconfig
-      Release: Strand/Oura/OuraSecrets.xcconfig
+      Debug: Strand/Oura/OuraConfig.xcconfig
+      Release: Strand/Oura/OuraConfig.xcconfig
     info:
       path: Strand/Resources/Info.plist
       properties:
@@ -196,10 +197,10 @@ targets:
           - "Resources/Info.plist"
           - "Resources/NOOP.entitlements"
       - path: StrandiOSShared
-    # Same untracked xcconfig as the macOS target (Strand/Oura/ is shared, not per-platform).
+    # Same tracked wrapper as the macOS target (Strand/Oura/ is shared, not per-platform).
     configFiles:
-      Debug: Strand/Oura/OuraSecrets.xcconfig
-      Release: Strand/Oura/OuraSecrets.xcconfig
+      Debug: Strand/Oura/OuraConfig.xcconfig
+      Release: Strand/Oura/OuraConfig.xcconfig
     info:
       path: StrandiOS/Resources/Info.plist
       properties:
