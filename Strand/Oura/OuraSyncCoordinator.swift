@@ -1,5 +1,6 @@
 import Foundation
 import WhoopStore
+import WhoopProtocol
 import StrandImport
 
 /// Abstracts the page fetch so the coordinator is testable without a live network (OuraAPIClient conforms).
@@ -32,6 +33,7 @@ final class OuraSyncCoordinator {
 
     func runFullImport(startDate: String = "2013-01-01", today: String,
                        onProgress: @escaping (OuraSyncProgress) -> Void = { _ in }) async throws -> OuraSyncSummary {
+        let deviceId = "oura-api"
         var result = OuraSyncResult()
         var byDay: [String: WearableDailyRow] = [:]
 
@@ -92,36 +94,11 @@ final class OuraSyncCoordinator {
             let (periods, sleepDays) = OuraApiParser.parseSleep(docs(sleepPages))
             result.sleepPeriods = periods; merge(sleepDays)
         } catch { skipped.append("sleep") }
-        // Workouts + heart-rate.
+        // Workouts.
         do {
             let workoutPages = try await fetchRaw("workout", dateParam: "start_date")
             result.workouts = OuraApiParser.parseWorkouts(docs(workoutPages))
         } catch { skipped.append("workout") }
-        // Heart-rate is the one endpoint with a hard ≤30-day range cap (probe-verified: a wider span is
-        // HTTP 400 "Timerange ... has to be less than or equal to 30 days"). Chunk it into 30-day windows
-        // of full ISO 'Z' datetimes (an unencoded '+00:00' offset 422s — '+' decodes to a space in the
-        // query). The floor is the earliest day the dailies actually returned, so we never page a decade
-        // of empty pre-account windows; boundary-duplicate samples dedupe on hrSample's (deviceId, ts) PK.
-        do {
-            let floorDay = byDay.keys.min() ?? startDate
-            var cursor = Self.dayFmt.date(from: floorDay) ?? Date(timeIntervalSince1970: 0)
-            let endDate = (Self.dayFmt.date(from: today) ?? Date()).addingTimeInterval(86_400)
-            let totalWindows = max(1, Int(ceil(endDate.timeIntervalSince(cursor) / (30 * 86_400))))
-            var window = 0
-            var hrDocs: [[String: Any]] = []
-            while cursor < endDate {
-                window += 1
-                onProgress(OuraSyncProgress(endpoint: "heartrate", pages: 0, detail: "window \(window)/\(totalWindows)"))
-                let next = min(cursor.addingTimeInterval(30 * 86_400), endDate)
-                let pages = try await fetchRawQuery("heartrate", query: [
-                    "start_datetime": Self.isoFmt.string(from: cursor),
-                    "end_datetime": Self.isoFmt.string(from: next),
-                ])
-                hrDocs.append(contentsOf: docs(pages))
-                cursor = next
-            }
-            result.heartRate = OuraApiParser.parseHeartRate(hrDocs)
-        } catch { skipped.append("heartrate") }
         // Raw-only endpoints (no parser).
         for endpoint in Self.rawOnlyEndpoints {
             do {
@@ -129,11 +106,47 @@ final class OuraSyncCoordinator {
             } catch { skipped.append(endpoint) }
         }
 
+        // Persist the light data (days/sleeps/workouts/extras/raw + source registration) FIRST, as a
+        // durable checkpoint. It's small and fetched one call apiece; landing it in SQLite before the long
+        // heart-rate backfill means an interruption during HR can never cost it.
         result.days = Array(byDay.values)
-        // The write phase can take a while on a first full import — surface it honestly instead of
-        // leaving the last endpoint's "Importing …" text on screen.
         onProgress(OuraSyncProgress(endpoint: "saving", pages: 0))
-        var summary = try await OuraSyncWriter.persist(result, into: store)
+        var summary = try await OuraSyncWriter.persist(result, into: store, deviceId: deviceId)
+
+        // Whole-day heart-rate: the ONE endpoint with a hard ≤30-day range cap (probe-verified: a wider
+        // span is HTTP 400 "Timerange ... has to be less than or equal to 30 days"; an unencoded '+00:00'
+        // offset 422s since '+' decodes to a space). Fetched in 30-day windows of full ISO-'Z' datetimes,
+        // floored at the earliest day the dailies returned (never page years of empty pre-account time).
+        // CRITICAL: each window is PERSISTED before advancing, so a lock or interruption keeps every
+        // completed window instead of losing the whole series (the prior one-shot end-persist did exactly
+        // that). Re-runs re-fetch from the floor; hrSample dedupes on (deviceId, ts) and ouraRaw on
+        // (endpoint, documentId), so replaying an already-saved window is a harmless overwrite.
+        do {
+            let floorDay = byDay.keys.min() ?? startDate
+            var cursor = Self.dayFmt.date(from: floorDay) ?? Date(timeIntervalSince1970: 0)
+            let endDate = (Self.dayFmt.date(from: today) ?? Date()).addingTimeInterval(86_400)
+            let totalWindows = max(1, Int(ceil(endDate.timeIntervalSince(cursor) / (30 * 86_400))))
+            let fetchedAt = Int(Date().timeIntervalSince1970)
+            var window = 0
+            while cursor < endDate {
+                window += 1
+                onProgress(OuraSyncProgress(endpoint: "heartrate", pages: 0, detail: "window \(window)/\(totalWindows)"))
+                let next = min(cursor.addingTimeInterval(30 * 86_400), endDate)
+                let startISO = Self.isoFmt.string(from: cursor)
+                let pages = try await fetcher.fetchAllRaw(endpoint: "heartrate",
+                    query: ["start_datetime": startISO, "end_datetime": Self.isoFmt.string(from: next)])
+                // Persist THIS window before fetching the next — the durability guarantee.
+                let rawRows = pages.enumerated().map { idx, body in
+                    OuraRawRow(endpoint: "heartrate", documentId: "heartrate-\(startISO)-\(idx)", day: nil,
+                               payloadJSON: String(data: body, encoding: .utf8) ?? "", fetchedAt: fetchedAt)
+                }
+                if !rawRows.isEmpty { summary.rawPages += try await store.upsertOuraRaw(rawRows, deviceId: deviceId) }
+                let hr = OuraApiParser.parseHeartRate(docs(pages)).map { HRSample(ts: $0.ts, bpm: $0.bpm) }
+                if !hr.isEmpty { summary.hrSamples += try await store.insert(Streams(hr: hr), deviceId: deviceId).hr }
+                cursor = next
+            }
+        } catch { skipped.append("heartrate") }
+
         summary.skippedEndpoints = skipped
         return summary
     }

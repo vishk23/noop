@@ -9,10 +9,14 @@ private final class StubFetcher: OuraPageFetching {
     var capturedQueries: [String: [String: String]] = [:]
     var callCounts: [String: Int] = [:]
     var failEndpoints: Set<String> = []
+    var failAfterCall: [String: Int] = [:]   // endpoint → allow this many calls, then throw (mimics a mid-run suspend)
     func fetchAllRaw(endpoint: String, query: [String: String]) async throws -> [Data] {
         capturedQueries[endpoint] = query
         callCounts[endpoint, default: 0] += 1
         if failEndpoints.contains(endpoint) { throw OuraError.badResponse(401, "token is not authorized") }
+        if let limit = failAfterCall[endpoint], (callCounts[endpoint] ?? 0) > limit {
+            throw OuraError.badResponse(500, "simulated interruption")
+        }
         return pages[endpoint] ?? []
     }
 }
@@ -61,6 +65,27 @@ final class OuraSyncCoordinatorTests: XCTestCase {
 
         XCTAssertNotNil(fetcher.capturedQueries["daily_readiness"]?["start_date"])
         XCTAssertNotNil(fetcher.capturedQueries["daily_readiness"]?["end_date"])
+    }
+
+    func testHeartRateWindowPersistsBeforeAnInterruptionSoProgressSurvives() async throws {
+        let store = try await WhoopStore.inMemory()
+        let fetcher = StubFetcher()
+        // A daily day in early Jan floors the HR windows; today mid-March → several 30-day windows.
+        fetcher.pages["daily_readiness"] = [#"{"data":[{"day":"2026-01-02","score":80}],"next_token":null}"#.data(using: .utf8)!]
+        // Each heartrate window returns one sample, but the fetcher dies AFTER the first window —
+        // exactly the screen-lock/suspend failure that used to lose the entire series.
+        fetcher.pages["heartrate"] = [#"{"data":[{"bpm":58,"timestamp":"2026-01-05T12:00:00.000Z"}],"next_token":null}"#.data(using: .utf8)!]
+        fetcher.failAfterCall["heartrate"] = 1
+
+        let coord = OuraSyncCoordinator(fetcher: fetcher, store: store)
+        let summary = try await coord.runFullImport(today: "2026-03-15")
+
+        XCTAssertTrue(summary.skippedEndpoints.contains("heartrate"))   // interruption reported honestly
+        XCTAssertEqual(summary.days, 1)                                 // light data landed before HR began
+        XCTAssertGreaterThan(summary.hrSamples, 0)                      // window 1's HR was durably saved BEFORE the failure
+        // Ground truth in the store, not just the summary: the first window's sample is really persisted.
+        let hr = try await store.hrSamples(deviceId: "oura-api", from: 0, to: Int.max, limit: 1000)
+        XCTAssertFalse(hr.isEmpty)
     }
 
     func testFailingEndpointIsSkippedNotFatal() async throws {
