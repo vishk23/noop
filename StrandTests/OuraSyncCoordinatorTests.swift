@@ -7,9 +7,11 @@ import WhoopStore
 private final class StubFetcher: OuraPageFetching {
     var pages: [String: [Data]] = [:]
     var capturedQueries: [String: [String: String]] = [:]
+    var callCounts: [String: Int] = [:]
     var failEndpoints: Set<String> = []
     func fetchAllRaw(endpoint: String, query: [String: String]) async throws -> [Data] {
         capturedQueries[endpoint] = query
+        callCounts[endpoint, default: 0] += 1
         if failEndpoints.contains(endpoint) { throw OuraError.badResponse(401, "token is not authorized") }
         return pages[endpoint] ?? []
     }
@@ -42,11 +44,16 @@ final class OuraSyncCoordinatorTests: XCTestCase {
     func testEndpointDateParamsAreWiredCorrectly() async throws {
         let store = try await WhoopStore.inMemory()
         let fetcher = StubFetcher()
+        // A daily page sets the heartrate window floor (2026-01-02); today 2026-02-01 → exactly two
+        // 30-day windows. Heartrate has a hard ≤30-day range cap upstream, so windowing is load-bearing.
+        fetcher.pages["daily_readiness"] = [#"{"data":[{"day":"2026-01-02","score":80}],"next_token":null}"#.data(using: .utf8)!]
         let coord = OuraSyncCoordinator(fetcher: fetcher, store: store)
         _ = try await coord.runFullImport(today: "2026-02-01")
 
-        XCTAssertNotNil(fetcher.capturedQueries["heartrate"]?["start_datetime"])
-        XCTAssertNotNil(fetcher.capturedQueries["heartrate"]?["end_datetime"])
+        // Windowed, full ISO-'Z' datetimes (bare dates parse upstream but a +00:00 offset 422s), ≤30d each.
+        XCTAssertEqual(fetcher.callCounts["heartrate"], 2)
+        XCTAssertEqual(fetcher.capturedQueries["heartrate"]?["start_datetime"], "2026-02-01T00:00:00Z")
+        XCTAssertEqual(fetcher.capturedQueries["heartrate"]?["end_datetime"], "2026-02-02T00:00:00Z")
         XCTAssertNil(fetcher.capturedQueries["heartrate"]?["start_date"])
 
         XCTAssertEqual(fetcher.capturedQueries["personal_info"], [:])

@@ -30,19 +30,25 @@ final class OuraSyncCoordinator {
         var result = OuraSyncResult()
         var byDay: [String: WearableDailyRow] = [:]
 
-        func fetchRaw(_ endpoint: String, dateParam: String?) async throws -> [Data] {
-            var q: [String: String] = [:]
-            if let dateParam { q[dateParam] = startDate; q[dateParam == "start_datetime" ? "end_datetime" : "end_date"] = today }
-            let pages = try await fetcher.fetchAllRaw(endpoint: endpoint, query: q)
+        func fetchRawQuery(_ endpoint: String, query: [String: String]) async throws -> [Data] {
+            let pages = try await fetcher.fetchAllRaw(endpoint: endpoint, query: query)
+            // Window-scoped raw key so multi-window endpoints (heartrate) never collide, and a re-pull
+            // of the same window stays idempotent (same key → upsert overwrite).
+            let windowKey = query["start_datetime"] ?? query["start_date"] ?? startDate
             var idx = 0
             for body in pages {
-                result.rawPages.append(OuraRawRow(endpoint: endpoint, documentId: "\(endpoint)-\(startDate)-\(idx)",
+                result.rawPages.append(OuraRawRow(endpoint: endpoint, documentId: "\(endpoint)-\(windowKey)-\(idx)",
                                                   day: nil, payloadJSON: String(data: body, encoding: .utf8) ?? "",
                                                   fetchedAt: Int(Date().timeIntervalSince1970)))
                 idx += 1
             }
             onProgress(OuraSyncProgress(endpoint: endpoint, pages: pages.count))
             return pages
+        }
+        func fetchRaw(_ endpoint: String, dateParam: String?) async throws -> [Data] {
+            var q: [String: String] = [:]
+            if let dateParam { q[dateParam] = startDate; q[dateParam == "start_datetime" ? "end_datetime" : "end_date"] = today }
+            return try await fetchRawQuery(endpoint, query: q)
         }
 
         func docs(_ pages: [Data]) -> [[String: Any]] {
@@ -86,9 +92,26 @@ final class OuraSyncCoordinator {
             let workoutPages = try await fetchRaw("workout", dateParam: "start_date")
             result.workouts = OuraApiParser.parseWorkouts(docs(workoutPages))
         } catch { skipped.append("workout") }
+        // Heart-rate is the one endpoint with a hard ≤30-day range cap (probe-verified: a wider span is
+        // HTTP 400 "Timerange ... has to be less than or equal to 30 days"). Chunk it into 30-day windows
+        // of full ISO 'Z' datetimes (an unencoded '+00:00' offset 422s — '+' decodes to a space in the
+        // query). The floor is the earliest day the dailies actually returned, so we never page a decade
+        // of empty pre-account windows; boundary-duplicate samples dedupe on hrSample's (deviceId, ts) PK.
         do {
-            let hrPages = try await fetchRaw("heartrate", dateParam: "start_datetime")
-            result.heartRate = OuraApiParser.parseHeartRate(docs(hrPages))
+            let floorDay = byDay.keys.min() ?? startDate
+            var cursor = Self.dayFmt.date(from: floorDay) ?? Date(timeIntervalSince1970: 0)
+            let endDate = (Self.dayFmt.date(from: today) ?? Date()).addingTimeInterval(86_400)
+            var hrDocs: [[String: Any]] = []
+            while cursor < endDate {
+                let next = min(cursor.addingTimeInterval(30 * 86_400), endDate)
+                let pages = try await fetchRawQuery("heartrate", query: [
+                    "start_datetime": Self.isoFmt.string(from: cursor),
+                    "end_datetime": Self.isoFmt.string(from: next),
+                ])
+                hrDocs.append(contentsOf: docs(pages))
+                cursor = next
+            }
+            result.heartRate = OuraApiParser.parseHeartRate(hrDocs)
         } catch { skipped.append("heartrate") }
         // Raw-only endpoints (no parser).
         for endpoint in Self.rawOnlyEndpoints {
@@ -102,4 +125,16 @@ final class OuraSyncCoordinator {
         summary.skippedEndpoints = skipped
         return summary
     }
+
+    // UTC day / ISO-'Z' datetime formatters for the windowed heartrate fetch.
+    private static let dayFmt: DateFormatter = {
+        let f = DateFormatter(); f.calendar = Calendar(identifier: .gregorian)
+        f.locale = Locale(identifier: "en_US_POSIX"); f.timeZone = TimeZone(identifier: "UTC")
+        f.dateFormat = "yyyy-MM-dd"; return f
+    }()
+    private static let isoFmt: DateFormatter = {
+        let f = DateFormatter(); f.calendar = Calendar(identifier: .gregorian)
+        f.locale = Locale(identifier: "en_US_POSIX"); f.timeZone = TimeZone(identifier: "UTC")
+        f.dateFormat = "yyyy-MM-dd'T'HH:mm:ss'Z'"; return f
+    }()
 }
