@@ -92,6 +92,7 @@ object BatteryAlertNotifier {
     fun onRuntimeEstimate(context: Context, remainingHours: Double?, charging: Boolean?) {
         if (remainingHours == null) return
         if (!NoopPrefs.batteryAlerts(context)) return
+        if (!NoopPrefs.predictiveBatteryAlerts(context)) return
         runCatching {
             val decision = com.noop.analytics.BatteryEstimator.runtimeAlert(
                 remainingHours = remainingHours,
