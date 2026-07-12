@@ -394,7 +394,7 @@ import AdmZip from "adm-zip";
 import fs from "node:fs";
 
 const DAYS = ["2026-06-10", "2026-06-11", "2026-06-12", "2026-06-13"];
-const tsOf = (day: string, h = 3) => Math.floor(new Date(`${day}T0${h}:00:00Z`).getTime() / 1000);
+const tsOf = (day: string, h = 3) => Math.floor(new Date(`${day}T${String(h).padStart(2, "0")}:00:00Z`).getTime() / 1000);
 
 export function buildMirrorSqlite(target: string): void {
   if (fs.existsSync(target)) fs.rmSync(target);
@@ -1521,13 +1521,12 @@ primary_region = "iad"
   size = "shared-cpu-1x"
   memory = "512mb"
 
-[checks.health]
-  type = "http"
-  port = 8080
-  method = "get"
-  path = "/healthz"
-  interval = "30s"
-  timeout = "5s"
+  [[http_service.checks]]
+    grace_period = "10s"
+    interval = "30s"
+    method = "GET"
+    timeout = "5s"
+    path = "/healthz"
 ```
 
 - [ ] **Step 4: Write `README.md`** (self-host guide)
