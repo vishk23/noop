@@ -90,18 +90,29 @@ public struct DeviceRegistryStore: Sendable {
         // v25-oura-raw: the opt-in Oura cloud-import raw archive is deviceId-keyed too, so "delete this
         // device's data" must clear it — else an imported Oura source's payloads would survive deletion.
         "ouraRaw",
-        // v26-cloud-tombstone: cloud-edit tombstones are deviceId-keyed too, so "delete this device's
-        // data" must clear them — else a deleted device would leave orphaned edit-history metadata
-        // behind. A later full re-sync from the cloud journal replays deletes from scratch and
-        // re-creates any tombstones still needed.
-        "cloudTombstone",
     ]
+
+    /// deviceId-keyed tables deliberately EXCLUDED from `deviceScopedTables` — a normal "delete this
+    /// device's data" wipe must NOT touch them, even though they carry a `deviceId` column.
+    ///
+    /// - `cloudTombstone` (v26-cloud-tombstone) is the guard's memory of cloud-journal deletes (a
+    ///   workout / HR range / metric point the user removed on the cloud side). If a device-data wipe
+    ///   cleared it, the very next BLE backfill or cloud re-sync could silently resurrect data the user
+    ///   already deleted — tombstones must outlive per-device data wipes. A dedicated
+    ///   `CloudTombstoneStore.deleteCloudTombstones(deviceId:)` exists for sites that DO mean to forget
+    ///   a device's cloud-edit history (a full disconnect), never `deleteAllData`.
+    ///
+    /// `DeviceRegistryStoreTests.testDeviceScopedTablesCoversEveryDeviceIdKeyedTable` treats this list
+    /// as the only legitimate reason a deviceId-keyed table can be absent from `deviceScopedTables`;
+    /// any other uncovered table still fails that test.
+    static let deviceScopedTableExemptions = ["cloudTombstone"]
 
     /// Permanently delete every recorded sample/derived row belonging to one device, across all
     /// `deviceId`-keyed tables, in a single transaction (all-or-nothing). The `pairedDevice` registry
     /// row is left intact — the caller archives/removes that separately. Tables are deleted defensively
     /// with `DELETE FROM <table> WHERE deviceId = ?`; a missing table would throw, but every table here
-    /// is created unconditionally by the migrator, so the set is stable.
+    /// is created unconditionally by the migrator, so the set is stable. `cloudTombstone` is
+    /// deliberately NOT among these tables — see `deviceScopedTableExemptions`.
     public func deleteAllData(deviceId: String) throws {
         try dbQueue.write { db in
             for table in Self.deviceScopedTables {

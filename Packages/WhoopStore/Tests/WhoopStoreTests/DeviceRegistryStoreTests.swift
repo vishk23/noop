@@ -117,9 +117,11 @@ final class DeviceRegistryStoreTests: XCTestCase {
     }
 
     // Regression guard (audit finding): every table with a `deviceId` column MUST appear in
-    // `deviceScopedTables`, or `deleteAllData` silently leaves that device's rows behind — a privacy
-    // defect for a delete-means-gone app. Enumerate the live schema and fail if any deviceId-keyed table
-    // is uncovered, so a future migration that adds one can't reintroduce the gap.
+    // `deviceScopedTables` OR the explicit `deviceScopedTableExemptions` allowlist, or `deleteAllData`
+    // silently leaves that device's rows behind — a privacy defect for a delete-means-gone app.
+    // Enumerate the live schema and fail if any deviceId-keyed table is uncovered by either list, so a
+    // future migration that adds one can't reintroduce the gap (and can't silently opt out of the wipe
+    // either — a genuine exemption must be named in `deviceScopedTableExemptions` with a reason).
     func testDeviceScopedTablesCoversEveryDeviceIdKeyedTable() throws {
         let dbq = try makeDB()
         let uncovered = try dbq.read { db -> [String] in
@@ -131,14 +133,16 @@ final class DeviceRegistryStoreTests: XCTestCase {
             for table in tables {
                 let cols = try Row.fetchAll(db, sql: "PRAGMA table_info(\(table))")
                 let hasDeviceId = cols.contains { ($0["name"] as String?) == "deviceId" }
-                if hasDeviceId && !DeviceRegistryStore.deviceScopedTables.contains(table) {
+                let covered = DeviceRegistryStore.deviceScopedTables.contains(table)
+                    || DeviceRegistryStore.deviceScopedTableExemptions.contains(table)
+                if hasDeviceId && !covered {
                     missing.append(table)
                 }
             }
             return missing
         }
         XCTAssertTrue(uncovered.isEmpty,
-                      "deviceId-keyed tables missing from deviceScopedTables (deleteAllData would skip them): \(uncovered)")
+                      "deviceId-keyed tables missing from deviceScopedTables/deviceScopedTableExemptions (deleteAllData would skip them): \(uncovered)")
     }
 
     func testDayOwnershipUpsertAndRead() throws {

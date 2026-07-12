@@ -72,6 +72,17 @@ extension WhoopStore {
     public func metricPointTombstones(deviceId: String) async throws -> [(day: String, key: String)] {
         try syncRead { db in try WhoopStore.metricPointTombstoneRows(db, deviceId: deviceId) }
     }
+
+    /// Remove every cloud-edit tombstone for a device (used by a future full-disconnect flow —
+    /// `deleteAllData` deliberately does NOT cover `cloudTombstone`, see
+    /// `DeviceRegistryStore.deviceScopedTableExemptions`). Mirrors `deleteOuraRaw`. Returns rows deleted.
+    @discardableResult
+    public func deleteCloudTombstones(deviceId: String) async throws -> Int {
+        try syncWrite { db in
+            try db.execute(sql: "DELETE FROM cloudTombstone WHERE deviceId = ?", arguments: [deviceId])
+            return db.changesCount
+        }
+    }
 }
 
 /// Hashable natural key for the `upsertWorkouts` resurrection guard's pre-loaded tombstone Set.
