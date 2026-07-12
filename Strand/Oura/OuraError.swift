@@ -1,3 +1,7 @@
+// Compiled ONLY when the OURA_CLOUD_IMPORT compilation condition is set (by the untracked
+// OuraSecrets.xcconfig — see OuraConfig.xcconfig). A default build contains none of this code,
+// keeping "fully offline" a byte-level property of the shipped binary, not a runtime promise.
+#if OURA_CLOUD_IMPORT
 import Foundation
 
 /// User-facing failure reasons for the Oura cloud-import lane, mapped to clear, non-crashing messages.
@@ -31,3 +35,4 @@ enum OuraError: LocalizedError, Equatable {
         }
     }
 }
+#endif // OURA_CLOUD_IMPORT

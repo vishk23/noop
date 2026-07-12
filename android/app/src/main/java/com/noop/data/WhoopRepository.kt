@@ -1,6 +1,7 @@
 package com.noop.data
 
 import android.content.Context
+import com.noop.protocol.DroppedRtcEvent
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.combine
 import kotlin.math.roundToInt
@@ -39,6 +40,20 @@ data class StreamBatch(
      * visible in a shared log. Defaulted so every existing constructor/copy call site is unchanged.
      */
     val droppedImplausibleTs: Int = 0,
+    /**
+     * #324 diagnostic: the OLDEST / NEWEST own-timestamp (unix seconds, the strap's OWN dated value) among
+     * records dropped this batch for an implausible ts. Lets the Backfiller log the epoch SPAN of a bad-clock
+     * strap's poisoned range, so a whole-range-future strap can be told from one mixed with real data. Diag
+     * only (excluded from [isEmpty]); null when nothing dropped. Mirrors Swift `Streams.droppedImplausible*Ts`.
+     */
+    val droppedImplausibleOldestTs: Long? = null,
+    val droppedImplausibleNewestTs: Long? = null,
+    /**
+     * #324 diagnostic: strap RTC-STATE events (RTC_LOST / BOOT / SET_RTC) dropped for an implausible own-ts.
+     * The #547 gate discards them like any bad-ts record, but they are the GROUND TRUTH that the clock reset,
+     * so they are captured here for the strap log. Diag only; empty when none. Mirrors Swift `droppedRtcEvents`.
+     */
+    val droppedRtcEvents: List<DroppedRtcEvent> = emptyList(),
 ) {
     val isEmpty: Boolean
         get() = hr.isEmpty() && rr.isEmpty() && events.isEmpty() && battery.isEmpty() &&
@@ -862,6 +877,27 @@ class WhoopRepository(private val dao: WhoopDao) {
 
     /** All cached daily metrics for a device, oldest first. Feeds com.noop.analytics.IllnessWatch. */
     suspend fun days(deviceId: String): List<DailyMetric> = dao.days(deviceId)
+
+    /** Every distinct source id with at least one cached daily row. Feeds the Health Connect
+     *  backfill's strap-coverage gate (see HealthConnectImporter.isStrapNativeSourceId). */
+    suspend fun dailyMetricDeviceIds(): List<String> = dao.dailyMetricDeviceIds()
+
+    /**
+     * #112 follow-up heal: delete the Health-Connect-shaped "my-whoop" shadow rows an older import
+     * wrote over strap-covered days, back when the backfill's covered-days gate only knew the
+     * canonical "my-whoop"/"my-whoop-noop" pair and missed active-strap ("whoop-<mac>") ids.
+     *
+     *  - Sleep sessions: un-edited, signal-less windows (no efficiency/HR/HRV/motion — the HC shape)
+     *    that overlap ANY computed ("-noop") session.
+     *  - Daily rows: HC-shaped rows (no efficiency/stages/recovery/strain/steps) on a day a computed
+     *    source also covers.
+     *
+     * The discriminators never match a WHOOP CSV / wearable-export import (those carry efficiency /
+     * stage minutes) or user-edited rows, so real data survives. Idempotent — a re-run matches
+     * nothing. Returns the TOTAL rows deleted (for the heal log).
+     */
+    suspend fun purgeHcShadowedStrapDays(): Int =
+        dao.purgeHcShadowedSleepSessions() + dao.purgeHcShadowedDailyMetrics()
 
     /**
      * One-time #34 refile: move legacy Health Connect data out of the shared "apple-health" bucket into

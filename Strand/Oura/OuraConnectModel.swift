@@ -1,3 +1,7 @@
+// Compiled ONLY when the OURA_CLOUD_IMPORT compilation condition is set (by the untracked
+// OuraSecrets.xcconfig — see OuraConfig.xcconfig). A default build contains none of this code,
+// keeping "fully offline" a byte-level property of the shipped binary, not a runtime promise.
+#if OURA_CLOUD_IMPORT
 import Foundation
 import Combine
 import AuthenticationServices
@@ -100,3 +104,4 @@ final class OuraConnectModel: ObservableObject {
         f.dateFormat = "yyyy-MM-dd"; return f
     }()
 }
+#endif // OURA_CLOUD_IMPORT
