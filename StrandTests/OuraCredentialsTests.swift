@@ -1,3 +1,6 @@
+// Tests the OURA_CLOUD_IMPORT-gated Oura import lane; compiled only when the flag is set
+// (StrandTests shares the app's OuraConfig.xcconfig, so flag + creds arrive together).
+#if OURA_CLOUD_IMPORT
 import XCTest
 @testable import Strand
 
@@ -19,3 +22,4 @@ final class OuraCredentialsTests: XCTestCase {
         ]))  // blank id
     }
 }
+#endif // OURA_CLOUD_IMPORT

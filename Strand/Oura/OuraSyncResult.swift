@@ -1,3 +1,7 @@
+// Compiled ONLY when the OURA_CLOUD_IMPORT compilation condition is set (by the untracked
+// OuraSecrets.xcconfig — see OuraConfig.xcconfig). A default build contains none of this code,
+// keeping "fully offline" a byte-level property of the shipped binary, not a runtime promise.
+#if OURA_CLOUD_IMPORT
 import Foundation
 import StrandImport
 import WhoopStore   // OuraRawRow lives in WhoopStore (OuraRawStore.swift), not StrandImport
@@ -28,3 +32,4 @@ struct OuraSyncSummary: Equatable {
     var days = 0, sleeps = 0, workouts = 0, hrSamples = 0, metricPoints = 0, rawPages = 0
     var skippedEndpoints: [String] = []
 }
+#endif // OURA_CLOUD_IMPORT

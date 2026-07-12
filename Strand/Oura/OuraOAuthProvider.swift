@@ -1,3 +1,7 @@
+// Compiled ONLY when the OURA_CLOUD_IMPORT compilation condition is set (by the untracked
+// OuraSecrets.xcconfig — see OuraConfig.xcconfig). A default build contains none of this code,
+// keeping "fully offline" a byte-level property of the shipped binary, not a runtime promise.
+#if OURA_CLOUD_IMPORT
 import Foundation
 import AuthenticationServices
 
@@ -73,3 +77,4 @@ final class OuraOAuthProvider: NSObject, AuthProvider, ASWebAuthenticationPresen
         anchor ?? ASPresentationAnchor()
     }
 }
+#endif // OURA_CLOUD_IMPORT

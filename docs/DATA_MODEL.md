@@ -451,7 +451,7 @@ those reads index-only. Accessors: `upsertMetricSeries(...)`, `metricSeries(...)
 ## Oura raw-payload archive
 
 This section documents the one table added after this document's v9 baseline (see the
-schema-version note above): the lossless backstop behind the opt-in Oura cloud import
+schema-version note above): the lossless backstop behind the opt-in Oura history import
 (off by default; user-initiated OAuth backfill — `docs/PRIVACY_SECURITY.md` §1.1b). It is
 **not** a metric cache like the tables above — it stores verbatim API responses, not decoded
 values, so any field Oura returns can be re-derived later without re-fetching.

@@ -148,6 +148,11 @@ targets:
     deploymentTarget: "13.0"
     sources:
       - StrandTests
+    # Same wrapper as the app target, so the OURA_CLOUD_IMPORT-gated Oura tests compile exactly
+    # when the app's Oura lane does (flag + creds both come from the untracked OuraSecrets.xcconfig).
+    configFiles:
+      Debug: Strand/Oura/OuraConfig.xcconfig
+      Release: Strand/Oura/OuraConfig.xcconfig
     dependencies:
       - target: Strand
       - package: WhoopProtocol

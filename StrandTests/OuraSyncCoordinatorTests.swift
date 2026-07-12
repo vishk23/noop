@@ -1,3 +1,6 @@
+// Tests the OURA_CLOUD_IMPORT-gated Oura import lane; compiled only when the flag is set
+// (StrandTests shares the app's OuraConfig.xcconfig, so flag + creds arrive together).
+#if OURA_CLOUD_IMPORT
 import XCTest
 import WhoopStore
 @testable import StrandImport
@@ -99,3 +102,4 @@ final class OuraSyncCoordinatorTests: XCTestCase {
         XCTAssertEqual(summary.skippedEndpoints, ["daily_spo2"])     // and the skip is reported honestly
     }
 }
+#endif // OURA_CLOUD_IMPORT
