@@ -667,8 +667,8 @@ final class IntelligenceEngine: ObservableObject {
                 // shipped windowed avgHrv. Built here (loop 1) where `rr` is in scope, but EMITTED in the
                 // main-actor replay loop below (diagnosticSink is main-actor isolated), carried on `hrvDiag`.
                 // Byte-identical to the Kotlin line.
-                let sleepRr = rr.filter { r in res.cachedSleep.contains { r.ts >= $0.startTs && r.ts < $0.endTs } }
-                    .map { Double($0.rrMs) }
+                let sleepRrRows = rr.filter { r in res.cachedSleep.contains { r.ts >= $0.startTs && r.ts < $0.endTs } }
+                let sleepRr = sleepRrRows.map { Double($0.rrMs) }
                 let hrvDiag: String?
                 if sleepRr.isEmpty {
                     hrvDiag = nil
@@ -676,8 +676,14 @@ final class IntelligenceEngine: ObservableObject {
                     let h = HRVAnalyzer.analyze(rawRR: sleepRr)
                     func ms(_ v: Double?) -> String { v.map { String(format: "%.0f", $0) } ?? "nil" }
                     let rej = h.nInput > 0 ? String(format: "%.0f", 100 * (1 - Double(h.nClean) / Double(h.nInput))) : "0"
+                    // #257: coverage (sum of NN ÷ wall-clock span; > 1.0 is impossible without double-counted
+                    // R-R) + exact-duplicate beat count, so a "reads ~2x too high" report is self-diagnosing
+                    // from the always-on log instead of hand-computing beat density.
+                    let ts = sleepRrRows.map { $0.ts }
+                    let cov = String(format: "%.2f", HRVAnalyzer.rrCoverage(tsSec: ts, rrMs: sleepRr))
+                    let dup = HRVAnalyzer.duplicateBeatCount(tsSec: ts, rrMs: sleepRr)
                     hrvDiag = "hrv diag day=\(res.daily.day) rmssd=\(ms(h.rmssd))ms sdnn=\(ms(h.sdnn))ms "
-                        + "meanNN=\(ms(h.meanNN))ms rr=\(h.nInput)/\(h.nClean) rejected=\(rej)%"
+                        + "meanNN=\(ms(h.meanNN))ms rr=\(h.nInput)/\(h.nClean) rejected=\(rej)% coverage=\(cov) dupBeats=\(dup)"
                 }
                 // ── Steps test mode: 5/MG raw-counter trace ──────────────────────────────────────────────
                 // Only built when the Steps mode is on (the gate was read once before the loop). Recomputes
@@ -1417,7 +1423,14 @@ final class IntelligenceEngine: ObservableObject {
         var candidates: [DayOwnerResolver.Candidate] = []
         for d in liveDevices {
             let isImport = d.sourceKind == .cloudImport || d.sourceKind == .fileImport
-            let priority = d.id == activeId ? 0 : (isImport ? 2 : 1)
+            // #137: an activity-file ride ranks BELOW whole-day imports (priority 3 vs 2), so a full-day
+            // WHOOP CSV/cloud import keeps ownership of a day it has HR for; the ride only wins a day that
+            // nothing else covers (a strap-less day). Kotlin RegistryDayOwnerSource mirrors this ordering.
+            let priority: Int
+            if d.id == activeId { priority = 0 }
+            else if d.sourceKind == .activityFile { priority = 3 }
+            else if isImport { priority = 2 }
+            else { priority = 1 }
             // Cheap presence check: a single HR row for this device in the night window is enough to
             // mark it a candidate. (LIMIT 1 , not the full pull the caller does once an owner is chosen.)
             let hasData = !((try? await store.hrSamples(deviceId: d.id, from: from, to: to, limit: 1)) ?? []).isEmpty

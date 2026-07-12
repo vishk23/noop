@@ -78,7 +78,8 @@ private struct DevicesContent: View {
         guard live.connected else { return nil }
         let deviceClock = ConnectionReadout.clockCorrelatedDevice(logLines: live.log)
         guard deviceClock != nil || live.strapRange != nil || live.lastFrameAtUnix != nil else { return nil }
-        let latched = ConnectionReadout.clockLatchedLabel(deviceClockUnix: deviceClock)
+        let latched = ConnectionReadout.clockLatchedLabel(deviceClockUnix: deviceClock,
+                                                          strapNewestUnix: live.strapRange?.newestUnix)
         let frame = ConnectionReadout.lastFrameLabel(lastFrameUnix: live.lastFrameAtUnix,
                                                      nowUnix: Int(Date().timeIntervalSince1970))
         let warning = ConnectionReadout.rtcWarning(deviceClockUnix: deviceClock,
@@ -98,6 +99,16 @@ private struct DevicesContent: View {
                     device: device,
                     isActive: device.status == .active,
                     isLiveConnected: device.status == .active && live.connected,
+                    // #221: a WHOOP 5/MG can be BLE-connected yet have its ENCRYPTED bond refused (the
+                    // WHOOP app, or a stale iOS pairing, holds the single-app bond) — no HR/biometric data
+                    // flows even though the link is up, so "Active · Live" overstates it. pairingHint is
+                    // set only once that refusal is genuinely detected (#78), never during a normal
+                    // connect, so this can't false-alarm a working 4.0 (its pairingHint stays nil) or a
+                    // fresh 5/MG connect.
+                    bondRefused: device.status == .active && live.connected && live.pairingHint != nil,
+                    // The full #78 how-to-fix guidance, surfaced on the card itself when bondRefused so
+                    // the fix is self-service instead of buried in the strap log.
+                    pairingHint: device.status == .active ? live.pairingHint : nil,
                     // Reboot in flight + link currently down → "Reconnecting…" (#166).
                     isReconnecting: device.status == .active && live.rebootInProgress && !live.connected,
                     // The live battery belongs to whichever device is ACTIVE + connected (the WHOOP, a
@@ -112,7 +123,13 @@ private struct DevicesContent: View {
                     onMakeActive: { switchTarget = device },
                     onRename: { renameDraft = device.nickname ?? device.displayName; renameTarget = device },
                     onRemove: { removeTarget = device },
-                    onReboot: { rebootTarget = device },
+                    // Restart is offered only for a live-connected WHOOP that is NOT a 4.0: the strap-log
+                    // analysis on #275 showed no safe frame reboots a 4.0 (empty bodies are ignored; any
+                    // non-empty body just wedges the BLE link for ~7s, sensor stays on), so a 4.0 Restart
+                    // button could never work. 5.0/MG reboot on the production frame. nil otherwise.
+                    onReboot: (device.status == .active && live.connected
+                               && SourceCoordinator.isWhoop(device)
+                               && !model.ble.isWhoop4) ? { rebootTarget = device } : nil,
                     // 4.0 reboot probe: only offered when Test Centre → Connection is on AND the live
                     // strap is a WHOOP 4.0 (a 5.0 already reboots on the production frame). nil otherwise.
                     onRebootProbe: (device.status == .active && live.connected
@@ -181,7 +198,7 @@ private struct DevicesContent: View {
             Button("Cancel", role: .cancel) { rebootTarget = nil }
             Button("Restart") { model.rebootStrap(); rebootTarget = nil }
         } message: { device in
-            Text("Restart \(device.displayName)? It disconnects for about 30 seconds while it reboots, then reconnects on its own. Your recorded data is kept. Confirmed on WHOOP 5.0; on WHOOP 4.0 the reboot command isn't confirmed yet — if nothing happens, your strap log helps us pin it down.")
+            Text("Restart \(device.displayName)? It disconnects for about 30 seconds while it reboots, then reconnects on its own. Your recorded data is kept.")
         }
         // WHOOP 4.0 reboot probe (#235): only reachable with Test Centre → Connection on and a 4.0 connected.
         // Tries each candidate frame one at a time so the strap log shows which one actually reboots.
@@ -195,7 +212,7 @@ private struct DevicesContent: View {
             }
             Button("Cancel", role: .cancel) { probeTarget = nil }
         } message: { _ in
-            Text("The WHOOP 4.0 reboot frame isn't confirmed — a normal Restart is ignored (#235). Send each candidate and watch the strap log: “link dropped” means it worked; “no disconnect within 12s” means the strap ignored it. Non-destructive — your data is kept. Please share the log so we can pin the real frame.")
+            Text("The WHOOP 4.0 reboot frame isn't confirmed — a normal Restart is ignored (#235). Send each candidate and watch BOTH the strap log and the strap itself. “no disconnect within 12s” means the strap ignored the frame. A “link dropped” line means the frame reached the strap — but a dropped link alone isn't a reboot: a real reboot also switches the strap's sensor light off for a few seconds, so if the light stayed on it was just a dropped connection, not a reboot. Non-destructive — your data is kept. Please share the log so we can pin the real frame.")
         }
         // Second, strongly-worded delete-data confirm (reached from the Remove card's secondary control)
         .alert("Delete all of this device's data?",
@@ -309,6 +326,30 @@ private struct DevicesContent: View {
     }
 }
 
+// MARK: - Device card pill state (pure, testable)
+
+/// The device card's state-pill label/tone/pulsing, as a priority-ordered pure decision (#221): archived
+/// beats everything; on the active card, reconnecting > bond-refused > live > plain active; a non-active
+/// card is "Paired". Mirrors the Kotlin `devicePillState` in DevicesScreen.kt exactly (see
+/// `DevicePillStateTests` / the Kotlin `DevicePillStateTest`), so a future edit to either side can't
+/// silently reorder "Connected · not paired" vs "Active · Live" without a test catching it.
+struct DevicePillState: Equatable {
+    let label: String
+    let tone: StrandTone
+    var pulsing: Bool = false
+    var showsDot: Bool = true
+
+    static func resolve(isArchived: Bool, isActive: Bool, isReconnecting: Bool,
+                         bondRefused: Bool, isLiveConnected: Bool) -> DevicePillState {
+        if isArchived { return DevicePillState(label: "Removed", tone: .neutral, showsDot: false) }
+        guard isActive else { return DevicePillState(label: "Paired", tone: .neutral) }
+        if isReconnecting { return DevicePillState(label: "Reconnecting…", tone: .warning, pulsing: true) }
+        if bondRefused { return DevicePillState(label: "Connected · not paired", tone: .warning) }
+        if isLiveConnected { return DevicePillState(label: "Active · Live", tone: .positive, pulsing: true) }
+        return DevicePillState(label: "Active", tone: .positive)
+    }
+}
+
 // MARK: - Device card
 
 /// One paired device as a card: name, brand/model, capabilities line, a state pill, last-seen, and a
@@ -317,6 +358,14 @@ private struct DeviceCard: View {
     let device: PairedDevice
     let isActive: Bool
     let isLiveConnected: Bool
+    /// #221: the active+connected strap is BLE-linked but its encrypted bond was refused (#78 state) —
+    /// no HR/biometric data flows despite the link being up. Drives the "Connected · not paired" pill
+    /// (which takes priority over "Active · Live") and the honest subtitle/footnote. False for every
+    /// non-WHOOP source and for a normal connect.
+    var bondRefused: Bool = false
+    /// #221: the full #78 pairing-refusal guidance (bonded-elsewhere / pairing-mode / Forget This Device
+    /// steps), shown on the card when `bondRefused` so the fix is self-service. nil otherwise.
+    var pairingHint: String? = nil
     /// The active strap's link dropped for a user-initiated reboot and NOOP is auto-reconnecting (#166).
     /// Drives the transient "Reconnecting…" pill; false for every non-reboot state.
     var isReconnecting: Bool = false
@@ -397,6 +446,16 @@ private struct DeviceCard: View {
                         .font(StrandFont.footnote)
                         .foregroundStyle(StrandPalette.textTertiary)
                         .fixedSize(horizontal: false, vertical: true)
+                }
+
+                // #221: the full #78 pairing-refusal guidance, self-service right on the card instead of
+                // buried in the strap log — only when the bond was genuinely refused.
+                if bondRefused, let hint = pairingHint {
+                    Text(hint)
+                        .font(StrandFont.footnote)
+                        .foregroundStyle(StrandPalette.statusWarning)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .accessibilityLabel(hint)
                 }
 
                 // Live battery for the active+connected device, shown as a liquid tube that fills to the
@@ -517,24 +576,19 @@ private struct DeviceCard: View {
         pct < 15 ? StrandPalette.statusCritical : pct < 35 ? StrandPalette.statusWarning : StrandPalette.chargeColor
     }
 
+    /// The pure `DevicePillState.resolve` priority (#221): reboot's "Reconnecting…" beats a bond refusal's
+    /// "Connected · not paired", which beats "Active · Live" — pinned by `DevicePillStateTests` instead of
+    /// only verified visually.
+    private var pillState: DevicePillState {
+        DevicePillState.resolve(isArchived: device.status == .archived, isActive: isActive,
+                                 isReconnecting: isReconnecting, bondRefused: bondRefused,
+                                 isLiveConnected: isLiveConnected)
+    }
+
     private var statePill: some View {
-        Group {
-            if device.status == .archived {
-                StatePill("Removed", tone: .neutral, showsDot: false)
-            } else if isActive {
-                // Reboot window (#166): the user's Restart dropped the link and NOOP is auto-reconnecting.
-                // Show it as intentional rather than a silent drop to "Active"; clears to "Active · Live"
-                // the instant the link is back.
-                if isReconnecting {
-                    StatePill("Reconnecting…", tone: .warning, pulsing: true)
-                } else {
-                    StatePill(isLiveConnected ? "Active · Live" : "Active",
-                              tone: .positive, pulsing: isLiveConnected)
-                }
-            } else {
-                StatePill("Paired", tone: .neutral)
-            }
-        }
+        let state = pillState
+        return StatePill(LocalizedStringKey(state.label), tone: state.tone,
+                          showsDot: state.showsDot, pulsing: state.pulsing)
     }
 
     private var actionsMenu: some View {
@@ -614,6 +668,10 @@ private struct DeviceCard: View {
 
     private var lastSeenLine: String {
         if device.status == .archived { return String(localized: "Removed · data kept") }
+        // No "tap ⋯" pointer here (#221 review) — the full how-to-fix guidance is already inline on the
+        // card just below, so pointing at the menu would send the user looking for help that's already
+        // on screen.
+        if bondRefused { return String(localized: "Connected, but not paired") }
         if isLiveConnected { return String(localized: "Connected now") }
         return String(localized: "Last seen \(relativeAgo(TimeInterval(device.lastSeenAt)))")
     }
@@ -834,6 +892,15 @@ struct DeviceCardCatalog: View {
                                             Self.whoopCaps.union([.steps])),
                            isActive: false, isLiveConnected: false,
                            onMakeActive: {}, onRename: {}, onRemove: {})
+                // #221: a WHOOP 5/MG that's BLE-connected but whose encrypted bond was refused (#78) — no
+                // data flows despite the link being up. Renders the "Connected · not paired" pill + the
+                // self-service pairing guidance so this can be verified WITHOUT reproducing the bond
+                // refusal on real hardware.
+                DeviceCard(device: Self.dev("whoop-5-refused", "WHOOP", "5.0 MG",
+                                            Self.whoopCaps.union([.steps])),
+                           isActive: true, isLiveConnected: true, bondRefused: true,
+                           pairingHint: "NOOP can see your strap but it's refusing to pair - it's likely still bonded to the official WHOOP app, or your phone is holding an old pairing. To fix it: (1) fully close the WHOOP app, (2) on a 5.0/MG, tap the band repeatedly until the LEDs flash blue (pairing mode), (3) if your strap is listed under iPhone Settings → Bluetooth, tap it and choose Forget This Device, then reconnect in NOOP.",
+                           onMakeActive: {}, onRename: {}, onRemove: {})
                 DeviceCard(device: Self.dev("strap-d", "Polar", "H10", [.hr, .hrv]),
                            isActive: false, isLiveConnected: false,
                            onMakeActive: {}, onRename: {}, onRemove: {})
@@ -871,6 +938,25 @@ struct OuraDeviceDemoScreen: View {
                            isActive: false, isLiveConnected: false,
                            onMakeActive: {}, onRename: {}, onRemove: {})
             }
+        }
+    }
+}
+
+/// DEBUG-only: just the WHOOP 5/MG bond-refused card, so `--demo-screen bondrefused` can screenshot the
+/// "Connected · not paired" pill + the self-service #78 pairing guidance (#221) WITHOUT reproducing the
+/// bond refusal on real hardware. Same file as `DeviceCard` so it can reach it. Stripped from Release.
+struct BondRefusedDemoScreen: View {
+    var body: some View {
+        ScreenScaffold(title: "Devices",
+                       subtitle: "A WHOOP 5/MG whose encrypted bond was refused (#78).",
+                       topBackground: liquidScaffoldSky()) {
+            DeviceCard(device: PairedDevice(id: "whoop-5-refused-solo", brand: "WHOOP", model: "5.0 MG",
+                                            nickname: nil, peripheralId: nil, sourceKind: .liveBLE,
+                                            capabilities: [.hr, .hrv, .spo2, .skinTemp, .sleep, .strainLoad, .steps],
+                                            status: .active, addedAt: 0, lastSeenAt: 0),
+                       isActive: true, isLiveConnected: true, bondRefused: true,
+                       pairingHint: "NOOP can see your strap but it's refusing to pair - it's likely still bonded to the official WHOOP app, or your phone is holding an old pairing. To fix it: (1) fully close the WHOOP app, (2) on a 5.0/MG, tap the band repeatedly until the LEDs flash blue (pairing mode), (3) if your strap is listed under iPhone Settings → Bluetooth, tap it and choose Forget This Device, then reconnect in NOOP.",
+                       onMakeActive: {}, onRename: {}, onRemove: {})
         }
     }
 }

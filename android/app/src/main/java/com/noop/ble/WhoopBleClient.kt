@@ -1494,11 +1494,6 @@ class WhoopBleClient(
      *  kicks — the Android side of the Swift `BLEManager.lastBackfillAt`. */
     @Volatile private var lastBackfillAtMs: Long? = null
 
-    /** True while the strap's own RTC reads future-dated (#928/#1012): its offloads bank real rows but the
-     *  range is un-trustworthy, so [BackfillPolicy] SKIPS the automatic periodic/strap kicks (the per-connect
-     *  pass still re-checks). Refreshed from [isFutureDatedNewest] at each completed offload's continue
-     *  decision, so a clock that self-corrects clears it. Twin of the Swift `clockUntrusted` shouldRun arg. */
-    @Volatile private var clockUntrusted: Boolean = false
     private val backfillTimeoutRunnable = Runnable { onBackfillTimeout() }
 
     /** Live-stream keep-alive (port of BLEManager.keepAliveTimer): re-arms realtime, polls battery,
@@ -4674,10 +4669,16 @@ class WhoopBleClient(
      * AUTOMATIC periodic/strap kicks are floored, empty-streak-backed-off, and skipped on an untrusted
      * clock, while manual/connect/foreground run at the 90s event floor. Previously the fixed 900s timer
      * was the only coarse limit, so a not-banking strap was re-offloaded every 15 min forever.
+     *
+     * #266: clockUntrusted is recomputed HERE from the live [strapNewestTs] and wall clock on every call
+     * (never cached) — a strap that stays connected with a self-correcting RTC is re-evaluated on the very
+     * next sync attempt of any kind, not just at the next disconnect/reconnect. Twin of the Swift
+     * `BLEManager.requestSync`, which recomputes inline the same way.
      */
     private fun requestSync(trigger: BackfillTrigger) {
         val s = _state.value
         if (!canRequestSync(s.connected, s.bonded, backfilling)) return
+        val clockUntrusted = isFutureDatedNewest(strapNewestTs, System.currentTimeMillis() / 1000L)
         if (!BackfillPolicy.shouldRun(
                 trigger = trigger,
                 nowSeconds = System.currentTimeMillis() / 1000.0,
@@ -4707,6 +4708,17 @@ class WhoopBleClient(
      */
     fun syncNow() {
         handler.post { requestSync(BackfillTrigger.MANUAL) }
+    }
+
+    /**
+     * App-active entry point (#267): call when NOOP comes to the foreground so opening the app pulls a
+     * reasonably fresh sync instead of relying on the 900s periodic timer or an incidental reconnect.
+     * Forwards to the SAME gated [requestSync] every other trigger uses — floored at the 90s event floor
+     * and never empty-streak/clock-suppressed (see [BackfillPolicy.shouldRun]'s `.FOREGROUND` case) — so
+     * it's a safe, cheap no-op no matter how often the caller invokes it.
+     */
+    fun onForeground() {
+        handler.post { requestSync(BackfillTrigger.FOREGROUND) }
     }
 
     /** Periodic-timer callback: re-runs the type-47 offload (the primary metric sync). */
@@ -4995,9 +5007,10 @@ class WhoopBleClient(
         ioScope.launch {
             val frontier = runCatching { repository.latestHrSampleTs(deviceId) }.getOrNull()
             val wallNow = System.currentTimeMillis() / 1000L   // #928: real wall clock, at decision time
-            // Refresh the clock-trust state for BackfillPolicy: a future-dated newest (#1012) makes the
-            // AUTOMATIC periodic/strap kicks near-useless, so the policy skips them until it self-corrects.
-            clockUntrusted = isFutureDatedNewest(newest, wallNow)
+            // #266: local only — NOT cached on the instance. A future-dated newest (#1012) makes the
+            // AUTOMATIC periodic/strap kicks near-useless for THIS decision; [requestSync] recomputes its
+            // own verdict fresh from [strapNewestTs] on every call, so a stale value here can't leak forward.
+            val clockUntrusted = isFutureDatedNewest(newest, wallNow)
             val stillConnected = _state.value.connected && _state.value.bonded
             if (!shouldAutoContinue(
                     stillConnected = stillConnected,
@@ -5145,7 +5158,15 @@ class WhoopBleClient(
         // the handshake can compute the round-trip. Twin of macOS didDisconnectPeripheral.
         rebootRequestedAtMs?.let { t ->
             rebootWatchdog?.let { handler.removeCallbacks(it) }; rebootWatchdog = null
-            log("reboot: link dropped ${SystemClock.elapsedRealtime() - t}ms after send — reboot took effect; awaiting reconnect")
+            val ms = SystemClock.elapsedRealtime() - t
+            // #275: a dropped LINK only proves a reboot on WHOOP 5.0 (verified fw). On WHOOP 4.0 the frame
+            // is unconfirmed — opcode 29/payload01 was observed to drop the BLE link WITHOUT power-cycling
+            // the strap (the sensor stayed on) — so don't claim a reboot; report the drop honestly. Twin of
+            // Swift didDisconnectPeripheral.
+            log(if (connectedFamily == DeviceFamily.WHOOP5)
+                "reboot: link dropped ${ms}ms after send — reboot took effect; awaiting reconnect"
+            else
+                "reboot: link dropped ${ms}ms after send — but a WHOOP 4.0 reboot isn't confirmed; a dropped link alone isn't proof (a real reboot also switches the sensor light off). Awaiting reconnect")
         }
         // Connection test mode: capture whether THIS attempt ever reached STATE_CONNECTED before the
         // state copy below clears `connected`. Android delivers BOTH a post-connect involuntary drop AND a
@@ -5395,10 +5416,6 @@ class WhoopBleClient(
         backfillDraining = false
         backfillFrameQueue.clear()
         strapNewestTs = null
-        // clockUntrusted is DERIVED from strapNewestTs (set in maybeAutoContinueBackfill); clear it with its
-        // source so a torn-down connection can't carry a stale future-clock verdict into the next one and
-        // wrongly skip that connection's automatic periodic/strap kicks before its own offload refreshes it.
-        clockUntrusted = false
         offloadFramesThisSession = 0
         lastOffloadFrameAtMs = 0L   // #174: don't carry a stale cooldown reference into the next session
         historicalKickSent = false

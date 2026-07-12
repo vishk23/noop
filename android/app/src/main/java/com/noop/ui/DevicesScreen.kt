@@ -163,6 +163,15 @@ fun DevicesScreen(
                 device = device,
                 isActive = device.status == DeviceStatus.active.name,
                 isLiveConnected = device.status == DeviceStatus.active.name && live.connected,
+                // #221: a WHOOP 5/MG can be BLE-connected yet have its ENCRYPTED bond refused (the WHOOP
+                // app, or a stale pairing, holds the single-app bond) — no HR/biometric data flows even
+                // though the link is up, so "Active · Live" overstates it. pairingHint is set only once
+                // that refusal is genuinely detected (#78), never during a normal connect, so this can't
+                // false-alarm a working 4.0 (its pairingHint stays null) or a fresh 5/MG connect.
+                bondRefused = device.status == DeviceStatus.active.name && live.connected && live.pairingHint != null,
+                // The full #78 how-to-fix guidance, surfaced on the card itself when bondRefused so the
+                // fix is self-service instead of buried in the strap log.
+                pairingHint = if (device.status == DeviceStatus.active.name) live.pairingHint else null,
                 // Reboot in flight + link currently down → "Reconnecting…" (#166).
                 isReconnecting = device.status == DeviceStatus.active.name && live.rebootInProgress && !live.connected,
                 // The live battery belongs to whichever device is ACTIVE + connected (WHOOP, a generic
@@ -183,7 +192,13 @@ fun DevicesScreen(
                 onDisconnect = if (device.brand.equals("WHOOP", ignoreCase = true)) {
                     { Toast.makeText(context, "Disconnecting", Toast.LENGTH_SHORT).show(); viewModel.disconnect() }
                 } else null,
-                onReboot = { rebootTarget = device },
+                // Restart is offered only for a live-connected WHOOP that is NOT a 4.0: the strap-log
+                // analysis on #275 showed no safe frame reboots a 4.0 (empty bodies are ignored; any
+                // non-empty body just wedges the BLE link for ~7s, sensor stays on), so a 4.0 Restart
+                // button could never work. 5.0/MG reboot on the production frame. null otherwise.
+                onReboot = if (device.status == DeviceStatus.active.name && live.connected &&
+                    SourceCoordinator.isWhoop(device) && live.whoop5Detected
+                ) { { rebootTarget = device } } else null,
                 // 4.0 reboot probe: only offered when Test Centre → Connection is on AND the live strap is
                 // a WHOOP 4.0 (a 5.0 already reboots on the production frame). null otherwise.
                 onRebootProbe = if (device.status == DeviceStatus.active.name && live.connected &&
@@ -284,9 +299,7 @@ fun DevicesScreen(
         ConfirmDialog(
             title = "Restart this strap?",
             message = "Restart ${displayName(device)}? It disconnects for about 30 seconds while it " +
-                "reboots, then reconnects on its own. Your recorded data is kept. Confirmed on WHOOP 5.0; " +
-                "on WHOOP 4.0 the reboot command isn't confirmed yet — if nothing happens, your strap log " +
-                "helps us pin it down.",
+                "reboots, then reconnects on its own. Your recorded data is kept.",
             confirmLabel = "Restart",
             destructive = false,
             onConfirm = { viewModel.rebootStrap(); rebootTarget = null },
@@ -341,6 +354,14 @@ private fun DeviceCard(
     device: PairedDeviceRow,
     isActive: Boolean,
     isLiveConnected: Boolean,
+    /** #221: the active+connected strap is BLE-linked but its encrypted bond was refused (#78 state) — no
+     *  HR/biometric data flows despite the link being up. Drives the "Connected · not paired" pill (which
+     *  takes priority over "Active · Live") and the honest subtitle. False for every non-WHOOP source and
+     *  for a normal connect. */
+    bondRefused: Boolean = false,
+    /** #221: the full #78 pairing-refusal guidance (bonded-elsewhere / pairing-mode / forget-device
+     *  steps), shown on the card when [bondRefused] so the fix is self-service. null otherwise. */
+    pairingHint: String? = null,
     /** The active strap's link dropped for a user-initiated reboot and NOOP is auto-reconnecting (#166).
      *  Drives the transient "Reconnecting…" pill; false for every non-reboot state. */
     isReconnecting: Boolean = false,
@@ -408,7 +429,7 @@ private fun DeviceCard(
                     StatePill("Beta", tone = StrandTone.Warning, showsDot = false)
                     Spacer(Modifier.width(6.dp))
                 }
-                StatePill(device, isActive, isLiveConnected, isReconnecting)
+                StatePill(device, isActive, isLiveConnected, bondRefused, isReconnecting)
             }
 
             // Honest local-takeover state row for an adopted Oura ring that is paired but not the
@@ -432,6 +453,12 @@ private fun DeviceCard(
                 Text(profile.footnote, style = NoopType.footnote, color = Palette.textTertiary)
             }
 
+            // #221: the full #78 pairing-refusal guidance, self-service right on the card instead of
+            // buried in the strap log — only when the bond was genuinely refused.
+            if (bondRefused && pairingHint != null) {
+                Text(pairingHint, style = NoopType.footnote, color = Palette.statusWarning)
+            }
+
             // Live battery as a small liquid TUBE — the active+connected device's reported % (WHOOP, a
             // generic strap or an FTMS machine all funnel into live.batteryPct). A genuine single-value
             // progress bar, so a static (posed) LiquidTube is exactly right; it replaces the "· Battery x%"
@@ -442,7 +469,7 @@ private fun DeviceCard(
 
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Text(
-                    lastSeenLine(device, isLiveConnected) +
+                    lastSeenLine(device, isLiveConnected, bondRefused) +
                         (liveFirmware?.let { " · FW $it" } ?: ""),
                     style = NoopType.footnote,
                     color = Palette.textTertiary,
@@ -513,28 +540,55 @@ private fun BatteryTube(pct: Int) {
     }
 }
 
+/**
+ * The device card's state-pill label + tone, as a priority-ordered pure decision (#221): archived beats
+ * everything; on the active card, reconnecting > bond-refused > live > plain active; a non-active card is
+ * "Paired". Mirrors the Swift `DevicePillState.resolve` in DevicesView.swift exactly (see
+ * `DevicePillStateTest` / the Swift `DevicePillStateTests`), so a future edit to either side can't
+ * silently reorder "Connected · not paired" vs "Active · Live" without a test catching it.
+ */
+internal data class DevicePillState(
+    val label: String,
+    val tone: StrandTone,
+    val pulsing: Boolean = false,
+    val showsDot: Boolean = true,
+)
+
+internal fun devicePillState(
+    isArchived: Boolean,
+    isActive: Boolean,
+    isReconnecting: Boolean,
+    bondRefused: Boolean,
+    isLiveConnected: Boolean,
+): DevicePillState = when {
+    isArchived -> DevicePillState("Removed", StrandTone.Neutral, showsDot = false)
+    !isActive -> DevicePillState("Paired", StrandTone.Neutral)
+    // Reboot window (#166): the user's Restart dropped the link and NOOP is auto-reconnecting. Show it
+    // as intentional rather than a silent drop to "Active"; clears to "Active · Live" once the link is back.
+    isReconnecting -> DevicePillState("Reconnecting…", StrandTone.Warning, pulsing = true)
+    // #221: BLE-connected but the encrypted bond was refused — no data flows, so this must not read
+    // as "Active · Live".
+    bondRefused -> DevicePillState("Connected · not paired", StrandTone.Warning)
+    isLiveConnected -> DevicePillState("Active · Live", StrandTone.Positive, pulsing = true)
+    else -> DevicePillState("Active", StrandTone.Positive)
+}
+
 @Composable
 private fun StatePill(
     device: PairedDeviceRow,
     isActive: Boolean,
     isLiveConnected: Boolean,
+    bondRefused: Boolean = false,
     isReconnecting: Boolean = false,
 ) {
-    when {
-        device.status == DeviceStatus.archived.name ->
-            StatePill("Removed", tone = StrandTone.Neutral, showsDot = false)
-        // Reboot window (#166): the user's Restart dropped the link and NOOP is auto-reconnecting. Show it
-        // as intentional rather than a silent drop to "Active"; clears to "Active · Live" once the link is back.
-        isActive && isReconnecting ->
-            StatePill("Reconnecting…", tone = StrandTone.Warning, pulsing = true)
-        isActive ->
-            StatePill(
-                if (isLiveConnected) "Active · Live" else "Active",
-                tone = StrandTone.Positive,
-                pulsing = isLiveConnected,
-            )
-        else -> StatePill("Paired", tone = StrandTone.Neutral)
-    }
+    val state = devicePillState(
+        isArchived = device.status == DeviceStatus.archived.name,
+        isActive = isActive,
+        isReconnecting = isReconnecting,
+        bondRefused = bondRefused,
+        isLiveConnected = isLiveConnected,
+    )
+    StatePill(state.label, tone = state.tone, showsDot = state.showsDot, pulsing = state.pulsing)
 }
 
 @Composable
@@ -717,8 +771,11 @@ private fun RebootProbeDialog(
             Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
                 Text(
                     "The WHOOP 4.0 reboot frame isn't confirmed — a normal Restart is ignored (#235). " +
-                        "Send each candidate and watch the strap log: “link dropped” means it worked; " +
-                        "“no disconnect within 12s” means the strap ignored it. Non-destructive — your data " +
+                        "Send each candidate and watch BOTH the strap log and the strap itself. " +
+                        "“no disconnect within 12s” means the strap ignored the frame. A “link dropped” line " +
+                        "means the frame reached the strap — but a dropped link alone isn't a reboot: a real " +
+                        "reboot also switches the strap's sensor light off for a few seconds, so if the light " +
+                        "stayed on it was just a dropped connection, not a reboot. Non-destructive — your data " +
                         "is kept. Please share the log so we can pin the real frame.",
                     style = NoopType.subhead,
                     color = Palette.textSecondary,
@@ -1038,23 +1095,17 @@ private fun OuraLocalStateNote() {
     }
 }
 
-private fun lastSeenLine(device: PairedDeviceRow, isLiveConnected: Boolean): String = when {
+private fun lastSeenLine(device: PairedDeviceRow, isLiveConnected: Boolean, bondRefused: Boolean = false): String = when {
     device.status == DeviceStatus.archived.name -> "Removed · data kept"
+    // No "tap ⋯" pointer here (#221 review) — the full how-to-fix guidance is already inline on the card
+    // just below, so pointing at the menu would send the user looking for help that's already on screen.
+    bondRefused -> "Connected, but not paired"
     isLiveConnected -> "Connected now"
     else -> "Last seen ${relativeAgo(device.lastSeenAt)}"
 }
 
-/** Best-effort brand from the advertised name. Falls back to a neutral label. Mirrors Swift brandGuess. */
-internal fun brandGuess(name: String): String {
-    val lower = name.lowercase()
-    return when {
-        lower.contains("polar") -> "Polar"
-        lower.contains("wahoo") || lower.contains("tickr") -> "Wahoo"
-        lower.contains("coospo") -> "Coospo"
-        lower.contains("garmin") || lower.contains("hrm") -> "Garmin"
-        lower.contains("scosche") || lower.contains("rhythm") -> "Scosche"
-        lower.contains("magene") -> "Magene"
-        lower.contains("amazfit") || lower.contains("helio") || lower.contains("zepp") -> "Amazfit"
-        else -> "Heart-rate strap"
-    }
-}
+/** Best-effort brand from the advertised name. Falls back to a neutral label. Mirrors Swift brandGuess.
+ *  Delegates to the pure [com.noop.data.DeviceBrandCatalog] (single source of truth) so the token table
+ *  lives once. */
+internal fun brandGuess(name: String): String =
+    com.noop.data.DeviceBrandCatalog.specForAdvertisedName(name)?.brand ?: "Heart-rate strap"
