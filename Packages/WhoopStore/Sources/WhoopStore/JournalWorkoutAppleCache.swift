@@ -138,11 +138,18 @@ extension WhoopStore {
     }
 
     /// Upsert workouts. Natural key (deviceId, startTs, sport). Returns rows changed.
+    ///
+    /// Resurrection guard: a cloud-journal delete tombstones a workout's (startTs, sport) — see
+    /// `CloudTombstoneStore`. A row matching a tombstone is dropped BEFORE the insert, so a later
+    /// re-import (backfill replay, cloud re-pull) can't resurrect a workout the user deleted.
     @discardableResult
     public func upsertWorkouts(_ rows: [WorkoutRow], deviceId: String) async throws -> Int {
         try syncWrite { db in
+            let tombstoned = Set(try WhoopStore.workoutTombstoneRows(db, deviceId: deviceId)
+                .map { WorkoutTombstoneKey(startTs: $0.startTs, sport: $0.sport) })
             var n = 0
             for r in rows {
+                if tombstoned.contains(WorkoutTombstoneKey(startTs: r.startTs, sport: r.sport)) { continue }
                 try db.execute(sql: """
                     INSERT INTO workout
                         (deviceId, startTs, endTs, sport, source, durationS, energyKcal,

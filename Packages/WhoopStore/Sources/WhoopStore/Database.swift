@@ -500,6 +500,30 @@ extension WhoopStore {
             try db.create(index: "idx_ouraRaw_device_endpoint_day",
                           on: "ouraRaw", columns: ["deviceId", "endpoint", "day"])
         }
+
+        // v26: cloud edit tombstones (Phase 3 cloud journal apply). When a server-side journal edit
+        // deletes a workout / HR range / metric point, NOOP physically deletes the local row(s) AND
+        // records a tombstone here — otherwise the NEXT sync/backfill/live-BLE write would silently
+        // resurrect the same row from the strap or a re-pulled cloud page. `editSeq` is the cloud
+        // journal's own sequence number; the (kind, editSeq) unique key makes replaying the same
+        // journal entry idempotent (INSERT OR IGNORE, never a duplicate tombstone). Additive only —
+        // a NEW table, no existing row touched.
+        migrator.registerMigration("v26-cloud-tombstone") { db in
+            try db.create(table: "cloudTombstone") { t in
+                t.autoIncrementedPrimaryKey("id")
+                t.column("kind", .text).notNull()        // "workout" | "hrRange" | "metricPoint"
+                t.column("deviceId", .text).notNull()
+                t.column("startTs", .integer)             // workout: startTs; hrRange: fromTs
+                t.column("endTs", .integer)               // hrRange: toTs
+                t.column("sport", .text)                  // workout
+                t.column("day", .text)                    // metricPoint
+                t.column("key", .text)                    // metricPoint
+                t.column("editSeq", .integer).notNull()   // server journal seq (idempotency)
+                t.column("createdAt", .integer).notNull()
+                t.uniqueKey(["kind", "editSeq"])
+            }
+            try db.create(index: "idx_cloudTombstone_kind_device", on: "cloudTombstone", columns: ["kind", "deviceId"])
+        }
         return migrator
     }
 }

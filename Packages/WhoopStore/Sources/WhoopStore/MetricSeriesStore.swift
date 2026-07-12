@@ -27,11 +27,18 @@ extension WhoopStore {
     /// Upsert metric points. Natural key (deviceId, day, key). Returns rows changed.
     /// Idempotent: re-upserting the same (deviceId, day, key) updates `value` in place rather than
     /// creating a duplicate.
+    ///
+    /// Resurrection guard: a cloud-journal delete tombstones a metric point's (day, key) — see
+    /// `CloudTombstoneStore`. A row matching a tombstone is dropped BEFORE the insert, so a later
+    /// re-derive/re-upsert can't resurrect a point the user deleted.
     @discardableResult
     public func upsertMetricSeries(_ rows: [MetricPoint], deviceId: String) async throws -> Int {
         try syncWrite { db in
+            let tombstoned = Set(try WhoopStore.metricPointTombstoneRows(db, deviceId: deviceId)
+                .map { MetricPointTombstoneKey(day: $0.day, key: $0.key) })
             var n = 0
             for r in rows {
+                if tombstoned.contains(MetricPointTombstoneKey(day: r.day, key: r.key)) { continue }
                 try db.execute(sql: """
                     INSERT INTO metricSeries
                         (deviceId, day, key, value)

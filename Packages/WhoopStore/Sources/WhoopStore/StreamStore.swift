@@ -45,12 +45,27 @@ extension WhoopStore {
             // over potentially millions of historical rows). cachedStatement persists the compiled
             // statement on the connection across insert() calls too. Each loop is guarded so empty
             // streams (the common live case) compile nothing.
-            if !streams.hr.isEmpty {
+            //
+            // Resurrection guard: a cloud-journal delete tombstones an HR range — see
+            // `CloudTombstoneStore`. Samples inside a tombstoned range are dropped BEFORE the insert,
+            // so a re-sync (backfill replay, or the strap re-streaming an already-deleted window)
+            // can't resurrect them. This runs on the LIVE BLE path, so it's one SELECT per call
+            // (not per row), and only when there's HR data to filter.
+            var hrRows = streams.hr
+            if !hrRows.isEmpty {
+                let tombstones = try WhoopStore.hrTombstoneRangeRows(db, deviceId: deviceId)
+                if !tombstones.isEmpty {
+                    hrRows = hrRows.filter { s in
+                        !tombstones.contains { $0.fromTs <= s.ts && s.ts <= $0.toTs }
+                    }
+                }
+            }
+            if !hrRows.isEmpty {
                 let stmt = try db.cachedStatement(sql: """
                     INSERT INTO hrSample (deviceId, ts, bpm) VALUES (?, ?, ?)
                     ON CONFLICT(deviceId, ts) DO NOTHING
                     """)
-                for s in streams.hr {
+                for s in hrRows {
                     try stmt.execute(arguments: [deviceId, s.ts, s.bpm])
                     hr += db.changesCount
                 }

@@ -90,6 +90,11 @@ public struct DeviceRegistryStore: Sendable {
         // v25-oura-raw: the opt-in Oura cloud-import raw archive is deviceId-keyed too, so "delete this
         // device's data" must clear it — else an imported Oura source's payloads would survive deletion.
         "ouraRaw",
+        // v26-cloud-tombstone: cloud-edit tombstones are deviceId-keyed too, so "delete this device's
+        // data" must clear them — else a deleted device would leave orphaned edit-history metadata
+        // behind. A later full re-sync from the cloud journal replays deletes from scratch and
+        // re-creates any tombstones still needed.
+        "cloudTombstone",
     ]
 
     /// Permanently delete every recorded sample/derived row belonging to one device, across all
