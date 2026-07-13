@@ -506,21 +506,23 @@ extension WhoopStore {
         // but NOOP's own sleep pipeline (StrandAnalytics) stores that shared column as a 0-1 FRACTION
         // everywhere it computes it (asleep ÷ in-bed) — same column, two scales for oura-api rows written
         // before the importer fix. UPDATE-only, NO schema change: divides `efficiency` by 100 for every
-        // `deviceId = 'oura-api'` row where it's > 1.5 — a threshold no genuine fraction can exceed (max
-        // 1.0) and no genuine Oura percent can fall under (Oura's lowest real efficiency is well above
-        // 1.5%), so the predicate can't touch an already-correct row. Idempotent: a second run finds
-        // nothing left above the threshold. Scoped to deviceId so WHOOP-native and other-brand rows are
-        // never touched. No Android migration twin: this only heals data written by the Swift-only,
-        // OURA_CLOUD_IMPORT-gated cloud importer — android/ has no equivalent Oura REST/API import path
-        // (its `com.noop.oura` package is the BLE ring driver, unrelated).
-        migrator.registerMigration("v26-oura-efficiency-heal") { db in
+        // row where it's > 1.5 — a threshold no genuine fraction can exceed (the column's convention
+        // caps at 1.0: `AnalyticsEngine` writes actual-sleep ÷ in-bed) and no genuine percent-scale
+        // leftover can fall under (no real night is ≤1.5% efficient), so the predicate can't touch an
+        // already-correct row and a second run finds nothing left: idempotent. Deliberately NOT
+        // deviceId-scoped: both known percent writers are healed by the same predicate — the Oura API
+        // importer ('oura-api' rows) and the WHOOP CSV importer (rows under whatever strap deviceId the
+        // user imported into). No Android Room migration twin in this PR: the Kotlin CSV importer gets
+        // the same write-boundary fix, but healing Android's historical rows needs a Room migration a
+        // maintainer should own (schema-version bump + column-order pinning).
+        migrator.registerMigration("v26-efficiency-heal") { db in
             try db.execute(sql: """
                 UPDATE sleepSession SET efficiency = efficiency / 100.0
-                WHERE deviceId = 'oura-api' AND efficiency > 1.5
+                WHERE efficiency > 1.5
                 """)
             try db.execute(sql: """
                 UPDATE dailyMetric SET efficiency = efficiency / 100.0
-                WHERE deviceId = 'oura-api' AND efficiency > 1.5
+                WHERE efficiency > 1.5
                 """)
         }
         return migrator

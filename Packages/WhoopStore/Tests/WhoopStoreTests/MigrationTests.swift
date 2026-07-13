@@ -97,10 +97,11 @@ final class MigrationTests: XCTestCase {
         XCTAssertTrue(cols.contains("peripheralId"), "pairedDevice missing v16 peripheralId column")
     }
 
-    /// v26 heals `deviceId = 'oura-api'` rows written with Oura's native 0-100 `efficiency` (before the
-    /// OuraApiParser fix) back to NOOP's 0-1 fraction convention. UPDATE-only: seed rows at the v25
-    /// schema (i.e. BEFORE v26 has run), then apply the rest of the migrator and confirm the heal.
-    func testV26HealsOuraEfficiencyPercentToFraction() async throws {
+    /// v26 heals `efficiency` values stored on the 0-100 percent scale (written by the pre-fix Oura API
+    /// importer AND the pre-fix WHOOP CSV importer, under any deviceId) back to NOOP's 0-1 fraction
+    /// convention. UPDATE-only: seed rows at the v25 schema (i.e. BEFORE v26 has run), then apply the
+    /// rest of the migrator and confirm the heal.
+    func testV26HealsEfficiencyPercentToFraction() async throws {
         let dbQueue = try DatabaseQueue()
         try WhoopStore.makeMigrator().migrate(dbQueue, upTo: "v25-oura-raw")
         try await dbQueue.write { db in
@@ -118,9 +119,14 @@ final class MigrationTests: XCTestCase {
             try db.execute(sql: """
                 INSERT INTO dailyMetric (deviceId, day, efficiency) VALUES ('oura-api', '2026-01-02', 0.9)
                 """)
-            // A non-Oura row above the threshold must be left alone — the heal is deviceId-scoped.
+            // A WHOOP-CSV-imported percent row (arbitrary strap deviceId) must ALSO be healed — the
+            // pre-fix WhoopImporter wrote "Sleep efficiency %" straight through, same bug class.
             try db.execute(sql: """
                 INSERT INTO sleepSession (deviceId, startTs, endTs, efficiency) VALUES ('my-whoop', 500, 600, 90)
+                """)
+            // A native fraction row under a strap deviceId must be left unchanged.
+            try db.execute(sql: """
+                INSERT INTO sleepSession (deviceId, startTs, endTs, efficiency) VALUES ('my-whoop', 700, 800, 0.66)
                 """)
         }
 
@@ -130,8 +136,10 @@ final class MigrationTests: XCTestCase {
         try await dbQueue.read { db in
             XCTAssertEqual(try Double.fetchOne(db, sql: "SELECT efficiency FROM sleepSession WHERE startTs = 100"), 0.9)
             XCTAssertEqual(try Double.fetchOne(db, sql: "SELECT efficiency FROM sleepSession WHERE startTs = 300"), 0.9)
-            XCTAssertEqual(try Double.fetchOne(db, sql: "SELECT efficiency FROM sleepSession WHERE startTs = 500"), 90,
-                           "a non-oura-api row must not be touched by the deviceId-scoped heal")
+            XCTAssertEqual(try Double.fetchOne(db, sql: "SELECT efficiency FROM sleepSession WHERE startTs = 500"), 0.9,
+                           "a CSV-imported percent row must be healed regardless of deviceId")
+            XCTAssertEqual(try Double.fetchOne(db, sql: "SELECT efficiency FROM sleepSession WHERE startTs = 700"), 0.66,
+                           "a native fraction row must never be touched")
             XCTAssertEqual(try Double.fetchOne(db, sql: "SELECT efficiency FROM dailyMetric WHERE day = '2026-01-01'"), 0.9)
             XCTAssertEqual(try Double.fetchOne(db, sql: "SELECT efficiency FROM dailyMetric WHERE day = '2026-01-02'"), 0.9)
         }
