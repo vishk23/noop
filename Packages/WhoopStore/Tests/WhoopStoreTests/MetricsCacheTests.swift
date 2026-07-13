@@ -364,6 +364,24 @@ final class MetricsCacheTests: XCTestCase {
         XCTAssertEqual(rows.map { $0.day }, ["2026-05-20"])
     }
 
+    // MARK: - empty-store guard (incident: an empty test-host DB must never look "has data")
+
+    func testHasAnyDailyMetricsFalseWhenEmptyTrueAfterUpsert() async throws {
+        let store = try await WhoopStore.inMemory()
+        // A freshly-created store (no BLE pairing, no import ever run) — the exact shape of the
+        // production incident's empty macOS test-host database — must read false.
+        let beforeAnyData = try await store.hasAnyDailyMetrics()
+        XCTAssertFalse(beforeAnyData)
+
+        try await store.upsertDailyMetrics([
+            DailyMetric(day: "2026-05-23", totalSleepMin: nil, efficiency: nil, deepMin: nil, remMin: nil,
+                        lightMin: nil, disturbances: nil, restingHr: nil, avgHrv: nil, recovery: nil,
+                        strain: nil, exerciseCount: nil),
+        ], deviceId: "devA")
+        let afterUpsert = try await store.hasAnyDailyMetrics()
+        XCTAssertTrue(afterUpsert)
+    }
+
     // MARK: - windowed computed-daily delete (#277 local-day re-bucketing migration)
 
     func testDeleteDailyMetricsInRangeKeepsImportedAndOutOfRange() async throws {

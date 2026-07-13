@@ -225,6 +225,24 @@ final class CloudSyncModel: ObservableObject {
         now - lastRun >= intervalS
     }
 
+    /// True when this process is running inside an XCTest test runner. Guards `autoSyncIfDue` against
+    /// the incident where the macOS TEST HOST — `StrandTests` runs inside the full `Staging.app` via
+    /// `TEST_HOST`, not a bare test bundle — executed `RootView`'s launch `.task` for real during a
+    /// test run. Bundle credentials were present, so `CloudSyncModel().autoSyncIfDue(...)` fired and
+    /// auto-uploaded the Mac's (empty) test database, replacing the production mirror. Two checks,
+    /// either sufficient on its own: `XCTestConfigurationFilePath` is set by Xcode/`xcodebuild test`
+    /// for the process actually running the tests; `NSClassFromString("XCTestCase") != nil` is
+    /// belt-and-suspenders for the TEST_HOST shape, where XCTest is merely linked into the process.
+    /// Only checked in `autoSyncIfDue` — a manual "Sync now" tap (`syncNow`) stays allowed under test,
+    /// same as in production, because a human (or an explicit UI-driven test) triggered it on purpose.
+    /// `nonisolated`, same reason as `isAutoSyncDue`: `CloudSyncModel` is `@MainActor`, and that
+    /// isolation applies to `static` members by default — without this a plain synchronous XCTest
+    /// method couldn't call it directly.
+    nonisolated static var isRunningUnderXCTest: Bool {
+        ProcessInfo.processInfo.environment["XCTestConfigurationFilePath"] != nil
+            || NSClassFromString("XCTestCase") != nil
+    }
+
     /// On-launch daily catch-up (Phase 3.5: zero-touch): silently no-ops when the lane isn't configured
     /// — `CloudSyncSettings.isConfigured` already covers both a bundle-injected build and a manual
     /// Keychain save — otherwise runs the same gated sync as `syncNow` when it's been >20h since the
@@ -235,6 +253,7 @@ final class CloudSyncModel: ObservableObject {
     /// waiting on the network. Deliberately does NOT call `syncNow(repo:)` — see `runGatedSync`'s doc
     /// comment for why that would self-deadlock the gate.
     func autoSyncIfDue(repo: Repository) {
+        guard !Self.isRunningUnderXCTest else { return }
         guard CloudSyncSettings.isConfigured else { return }
         let last = UserDefaults.standard.double(forKey: Self.lastAutoSyncKey)
         guard Self.isAutoSyncDue(lastRun: last, now: Date().timeIntervalSince1970) else { return }

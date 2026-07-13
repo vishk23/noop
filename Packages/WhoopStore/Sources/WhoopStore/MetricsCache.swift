@@ -476,4 +476,20 @@ extension WhoopStore {
                 }
         }
     }
+
+    /// Cheap existence check across EVERY device/source (no `deviceId` filter, unlike the reads
+    /// above): does the store have any cached daily-metric row at all? Every ingest path that puts
+    /// real data into this store — `WhoopImporter`, `OuraSyncWriter`, `AppleHealthImport`,
+    /// `XiaomiImporter`, `ShortcutHealthImport`, `HealthKitBridge`, and the on-device
+    /// `IntelligenceEngine` recompute that runs after a live BLE offload — upserts into `dailyMetric`
+    /// as part of that ingest. So a genuinely fresh/never-populated store (no BLE pairing, no import
+    /// ever run — the shape of the empty macOS test-host database that got auto-uploaded and replaced
+    /// the production mirror) has zero rows here. Used by `CloudSyncUploader.upload` to refuse
+    /// exporting such a store. `SELECT 1 … LIMIT 1` rather than `COUNT(*)`: this only needs existence,
+    /// so SQLite can stop at the first matching row instead of scanning/counting the whole table.
+    public func hasAnyDailyMetrics() async throws -> Bool {
+        try syncRead { db in
+            try Int.fetchOne(db, sql: "SELECT 1 FROM dailyMetric LIMIT 1") != nil
+        }
+    }
 }

@@ -5,6 +5,18 @@ import XCTest
 import WhoopStore
 @testable import Strand
 
+/// A spy conforming to `CloudIngesting` that records how many times `ingest` was invoked — used by
+/// the empty-store guard test to assert the network is never reached, without needing a real
+/// `CloudSyncClient`/`OuraURLProtocolStub` at all (mirrors `StubCloudEditFetcher` in
+/// `CloudSyncCoordinatorTests.swift`).
+private final class SpyCloudIngester: CloudIngesting {
+    private(set) var ingestCallCount = 0
+    func ingest(fileURL: URL) async throws -> (bytes: Int, latestDay: String?) {
+        ingestCallCount += 1
+        return (0, nil)
+    }
+}
+
 final class CloudSyncUploaderTests: XCTestCase {
     override func setUp() { super.setUp(); OuraURLProtocolStub.reset() }
 
@@ -28,12 +40,26 @@ final class CloudSyncUploaderTests: XCTestCase {
         }
     }
 
+    /// An in-memory store seeded with one `dailyMetric` row, so it clears the empty-store guard added
+    /// to `CloudSyncUploader.upload` (see the "Empty store guard" section below, which tests that guard
+    /// directly against an UNSEEDED store) and these pre-existing tests keep exercising what they
+    /// actually test — network/export behavior beyond that guard — instead of being short-circuited by it.
+    private func nonEmptyStore() async throws -> WhoopStore {
+        let store = try await WhoopStore.inMemory()
+        try await store.upsertDailyMetrics([
+            DailyMetric(day: "2026-07-11", totalSleepMin: nil, efficiency: nil, deepMin: nil, remMin: nil,
+                        lightMin: nil, disturbances: nil, restingHr: nil, avgHrv: nil, recovery: nil,
+                        strain: nil, exerciseCount: nil),
+        ], deviceId: "devA")
+        return store
+    }
+
     // MARK: - Happy path
 
     func testUploadHappyPathSendsBearerAndOctetStreamAndParsesResponse() async throws {
         OuraURLProtocolStub.queue = [.init(status: 200,
             body: #"{"ok":true,"bytes":12345,"latestDay":"2026-07-11"}"#.data(using: .utf8)!)]
-        let store = try await WhoopStore.inMemory()
+        let store = try await nonEmptyStore()
         let client = makeClient()
         var capturedDest: URL?
 
@@ -60,7 +86,7 @@ final class CloudSyncUploaderTests: XCTestCase {
 
     func testUploadNon2xxThrowsBadResponse() async throws {
         OuraURLProtocolStub.queue = [.init(status: 401, body: "nope".data(using: .utf8)!)]
-        let store = try await WhoopStore.inMemory()
+        let store = try await nonEmptyStore()
         let client = makeClient()
 
         do {
@@ -73,7 +99,7 @@ final class CloudSyncUploaderTests: XCTestCase {
 
     func testUploadCleansUpTempFileEvenOnNetworkFailure() async throws {
         OuraURLProtocolStub.queue = [.init(status: 500, body: Data())]
-        let store = try await WhoopStore.inMemory()
+        let store = try await nonEmptyStore()
         let client = makeClient()
         var capturedDest: URL?
 
@@ -91,7 +117,7 @@ final class CloudSyncUploaderTests: XCTestCase {
     // MARK: - Export failure (never reaches the network)
 
     func testUploadExportFailurePropagatesAsTypedErrorAndNeverPosts() async throws {
-        let store = try await WhoopStore.inMemory()
+        let store = try await nonEmptyStore()
         let client = makeClient()
         let failingExporter: CloudSyncUploader.Exporter = { _, _ in .failure("disk full") }
 
@@ -102,6 +128,43 @@ final class CloudSyncUploaderTests: XCTestCase {
             XCTAssertEqual(error as? CloudSyncUploadError, CloudSyncUploadError.exportFailed("disk full"))
         }
         XCTAssertTrue(OuraURLProtocolStub.requestedRequests.isEmpty)   // never reached the network
+    }
+
+    // MARK: - Empty store guard (incident: a test-host's empty DB must never upload)
+
+    /// Reproduces the production incident: an empty store (a fresh `WhoopStore.inMemory()` has zero
+    /// `dailyMetric` rows, same shape as the macOS TEST HOST's never-populated database) must be
+    /// refused BEFORE export, BEFORE the network — proven here with no real `CloudSyncClient` at all,
+    /// just a `SpyCloudIngester` that would record a call if `upload` ever reached it.
+    func testUploadRefusesEmptyStoreAndNeverExportsOrIngests() async throws {
+        let store = try await WhoopStore.inMemory()
+        let ingester = SpyCloudIngester()
+        var exporterCallCount = 0
+        let countingExporter: CloudSyncUploader.Exporter = { _, dest in
+            exporterCallCount += 1
+            return .exported(dest)
+        }
+
+        do {
+            _ = try await CloudSyncUploader.upload(store: store, client: ingester, exporter: countingExporter)
+            XCTFail("expected emptyStore to be thrown")
+        } catch {
+            XCTAssertEqual(error as? CloudSyncUploadError, CloudSyncUploadError.emptyStore)
+        }
+        XCTAssertEqual(exporterCallCount, 0, "the export step must never run for an empty store")
+        XCTAssertEqual(ingester.ingestCallCount, 0, "ingest must never be called for an empty store")
+    }
+
+    /// The mirror-image case: once the store has at least one `dailyMetric` row, upload proceeds
+    /// exactly as before (happy-path regression guard for the new empty-store check).
+    func testUploadProceedsWhenStoreHasData() async throws {
+        OuraURLProtocolStub.queue = [.init(status: 200,
+            body: #"{"ok":true,"bytes":99,"latestDay":"2026-07-11"}"#.data(using: .utf8)!)]
+        let store = try await nonEmptyStore()
+        let client = makeClient()
+
+        let result = try await CloudSyncUploader.upload(store: store, client: client, exporter: fakeExporter())
+        XCTAssertEqual(result.bytes, 99)
     }
 }
 
@@ -118,6 +181,16 @@ final class CloudSyncModelAutoSyncGateTests: XCTestCase {
         XCTAssertFalse(CloudSyncModel.isAutoSyncDue(lastRun: now - 19 * 3600, now: now))  // too soon
         XCTAssertTrue(CloudSyncModel.isAutoSyncDue(lastRun: now - 20 * 3600, now: now))   // exactly due (>=)
         XCTAssertTrue(CloudSyncModel.isAutoSyncDue(lastRun: now - 21 * 3600, now: now))   // overdue
+    }
+
+    /// Incident guard: `autoSyncIfDue` must never fire inside an XCTest runner (the macOS TEST HOST
+    /// runs `StrandTests` inside the full `Staging.app` via `TEST_HOST`, so `RootView`'s launch `.task`
+    /// executes for real — see `CloudSyncModel.isRunningUnderXCTest`'s doc comment). This is
+    /// inherently env-dependent and can only be pinned from the TRUE side: every `StrandTests` run,
+    /// including this one, IS an XCTest run, so the helper reading true here is exactly what "detects
+    /// the test runner" means. There is no way to assert the false branch from inside XCTest itself.
+    func testIsRunningUnderXCTestIsTrueInThisTestRunner() {
+        XCTAssertTrue(CloudSyncModel.isRunningUnderXCTest)
     }
 }
 #endif // CLOUD_SYNC

@@ -17,11 +17,21 @@ extension CloudSyncClient: CloudIngesting {}
 /// having bytes to send".
 enum CloudSyncUploadError: LocalizedError, Equatable {
     case exportFailed(String)
+    /// The store has no real data yet — refused BEFORE export ever runs. Distinct from
+    /// `exportFailed`: nothing went wrong, there was simply nothing to upload. Guards against the
+    /// incident where the macOS TEST HOST (`StrandTests` running inside the full `Staging.app` via
+    /// `TEST_HOST`) executed the launch-time auto-sync `.task` with bundle credentials present, and
+    /// auto-uploaded the Mac's empty database, replacing the production mirror. This check protects
+    /// EVERY upload path — fresh installs, a never-paired Mac container, and any future race — not
+    /// just the test-host case (see `CloudSyncModel.isRunningUnderXCTest` for that separate guard).
+    case emptyStore
 
     var errorDescription: String? {
         switch self {
         case .exportFailed(let detail):
             return "Couldn't prepare the backup to upload. \(detail)"
+        case .emptyStore:
+            return "Nothing to upload yet — the local database is empty."
         }
     }
 }
@@ -56,6 +66,13 @@ enum CloudSyncUploader {
     /// `URLSession.upload(for:fromFile:)` rather than loading it into memory.
     static func upload(store: WhoopStore, client: any CloudIngesting,
                         exporter: Exporter = defaultExporter) async throws -> (bytes: Int, latestDay: String?) {
+        // Refuse an empty/trivial store BEFORE touching export or the network at all — see
+        // `CloudSyncUploadError.emptyStore`'s doc comment for the incident this guards against.
+        // `dailyMetric` is written by every ingest path (BLE-derived recompute, WHOOP/Apple
+        // Health/Oura/Xiaomi imports), so a genuinely fresh/never-populated store has zero rows here.
+        guard try await store.hasAnyDailyMetrics() else {
+            throw CloudSyncUploadError.emptyStore
+        }
         let cachesDir = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
         let tempURL = cachesDir.appendingPathComponent("cloudsync-upload-\(UUID().uuidString).noopbak")
         defer { try? FileManager.default.removeItem(at: tempURL) }
