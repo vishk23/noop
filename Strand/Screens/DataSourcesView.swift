@@ -42,6 +42,16 @@ struct DataSourcesView: View {
     // `@StateObject` construction time would either fail to compile or crash at runtime.
     @StateObject private var oura = OuraConnectModel()
     #endif
+    #if CLOUD_SYNC
+    // Cloud Sync (compiled in ONLY with CLOUD_SYNC): pulls edits confirmed on the user's own
+    // noop-cloud server and applies them locally, re-exporting into Apple Health on iOS. Same
+    // call-time-`repo:` shape as `OuraConnectModel` above, for the same environment-object-timing
+    // reason. The URL/token fields are local drafts — `CloudSyncModel` only holds the SAVED values
+    // (in the Keychain via `CloudSyncSettings`), never the in-progress text.
+    @StateObject private var cloudSync = CloudSyncModel()
+    @State private var cloudSyncURLDraft = CloudSyncSettings.serverURL ?? ""
+    @State private var cloudSyncTokenDraft = ""
+    #endif
     // "Remove Apple Health imported data" (ah-delete #616): a destructive escape hatch that purges every
     // row stored under the "apple-health" source via DeviceRegistryStore.deleteAllData. Two-step (a
     // confirmation alert) since it can't be undone. Local to this screen; no live strap data is touched.
@@ -99,8 +109,11 @@ struct DataSourcesView: View {
                 #if OURA_CLOUD_IMPORT
                 ouraCloudCard.staggeredAppear(index: 7)
                 #endif
-                broadcastHrCard.staggeredAppear(index: 8)
-                liveCard.staggeredAppear(index: 9)
+                #if CLOUD_SYNC
+                cloudSyncCard.staggeredAppear(index: 8)
+                #endif
+                broadcastHrCard.staggeredAppear(index: 9)
+                liveCard.staggeredAppear(index: 10)
             }
         }
         .onAppear {
@@ -327,6 +340,74 @@ struct DataSourcesView: View {
         }
     }
     #endif // OURA_CLOUD_IMPORT
+
+    #if CLOUD_SYNC
+    /// Cloud Sync: pulls edit-journal rows YOU confirmed on your own noop-cloud server (a personal-fork
+    /// companion, not a shipped/supported service) and applies them to the local store, re-exporting
+    /// into Apple Health on iOS when the pull touched sleep/workouts/HR. `cloudSync.saveSettings(url:
+    /// token:)`/`pullNow(repo:)` take `repo` at call time — see the `@StateObject` declaration's note.
+    private var cloudSyncCard: some View {
+        card(title: String(localized: "Cloud Sync"), icon: "arrow.triangle.2.circlepath.circle",
+             tint: StrandPalette.metricRose,
+             subtitle: String(localized: "Pull edits you confirmed on your own noop-cloud server and apply them here. A personal-fork lane — off unless you've set up your own server.")) {
+            VStack(alignment: .leading, spacing: NoopMetrics.space3) {
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("Server URL").strandOverline()
+                    TextField("https://your-server.example.com", text: $cloudSyncURLDraft)
+                        .textFieldStyle(.plain)
+                        .font(StrandFont.body)
+                        .foregroundStyle(StrandPalette.textPrimary)
+                        .padding(.horizontal, 12)
+                        .padding(.vertical, 9)
+                        .background(StrandPalette.surfaceInset, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+                        .overlay(RoundedRectangle(cornerRadius: 10, style: .continuous)
+                            .strokeBorder(StrandPalette.hairline, lineWidth: 1))
+                        .disableAutocorrection(true)
+                        #if os(iOS)
+                        .textInputAutocapitalization(.never)
+                        .keyboardType(.URL)
+                        #endif
+                        .accessibilityLabel("noop-cloud server URL")
+                }
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("Token").strandOverline()
+                    SecureField("Paste your server's read-write token", text: $cloudSyncTokenDraft)
+                        .textFieldStyle(.plain)
+                        .font(StrandFont.body)
+                        .foregroundStyle(StrandPalette.textPrimary)
+                        .padding(.horizontal, 12)
+                        .padding(.vertical, 9)
+                        .background(StrandPalette.surfaceInset, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+                        .overlay(RoundedRectangle(cornerRadius: 10, style: .continuous)
+                            .strokeBorder(StrandPalette.hairline, lineWidth: 1))
+                        .accessibilityLabel("noop-cloud token")
+                }
+                HStack(spacing: NoopMetrics.space3) {
+                    Button {
+                        cloudSync.saveSettings(url: cloudSyncURLDraft, token: cloudSyncTokenDraft)
+                    } label: {
+                        Label("Save", systemImage: "checkmark.circle")
+                    }
+                    .buttonStyle(NoopButtonStyle(.secondary))
+                    .disabled(cloudSyncURLDraft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                              || cloudSyncTokenDraft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+
+                    Button {
+                        cloudSync.pullNow(repo: repo)
+                    } label: {
+                        Label(cloudSync.busy ? "Pulling…" : "Pull edits now", systemImage: "arrow.down.circle")
+                    }
+                    .buttonStyle(NoopButtonStyle(.primary))
+                    .disabled(!cloudSync.isConfigured || cloudSync.busy)
+                    if cloudSync.busy { ProgressView().controlSize(.small) }
+                }
+                if let s = cloudSync.statusText {
+                    Text(s).font(StrandFont.subhead).foregroundStyle(StrandPalette.textSecondary)
+                }
+            }
+        }
+    }
+    #endif // CLOUD_SYNC
 
     private func presentImporter(_ target: ImportTarget) {
         importTarget = target

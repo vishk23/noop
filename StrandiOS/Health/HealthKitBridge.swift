@@ -442,6 +442,18 @@ final class HealthKitBridge: ObservableObject {
 
     // MARK: - Write back (NOOP → Health)
 
+    /// Public re-entry point for the merged write-back, for callers OTHER than `sync(days:)` — namely
+    /// `CloudSyncModel.pullNow` (Strand/CloudSync/CloudSyncModel.swift), which needs to re-export
+    /// Apple Health after a cloud edit touches sleep/workouts/HR without also re-running the read-side
+    /// HealthKit pull `sync` does. A thin, otherwise-unchanged wrapper around the private `writeBack`
+    /// below — same auth guard, same dedup semantics per feature (see `writeBack`'s doc comment).
+    /// Guarded the same way `writeBack` itself is (`auth == .authorized`); a caller built on a fresh
+    /// `HealthKitBridge` instance should call `refreshAuthIfPreviouslyGranted()` first so a previously
+    /// granted user's re-export doesn't silently no-op against a default `.unknown` auth state.
+    func rerunWriteBack(whoopStore: WhoopStore, days: Int) async throws {
+        try await writeBack(whoopStore: whoopStore, days: days)
+    }
+
     /// Write NOOP's strap-derived data into Apple Health: sleep sessions with full stage segments,
     /// the continuous 1-minute heart-rate stream, strap/manual workouts, and the nightly vitals
     /// (resting HR, HRV, SpO₂, respiratory rate) stamped at that day's wake time.
