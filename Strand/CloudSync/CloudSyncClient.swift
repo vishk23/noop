@@ -68,6 +68,37 @@ final class CloudSyncClient {
         return decoded.acked
     }
 
+    // MARK: - Ingest (Phase 3.5: upload this device's own .noopbak)
+
+    /// POST /ingest, Bearer-authed, with the file at `fileURL` streamed straight from disk as a raw
+    /// `application/octet-stream` body via `URLSession.upload(for:fromFile:)` — the whole-DB `.noopbak`
+    /// can be 100-300MB, so it must never be loaded into memory as `Data` the way `send(_:)`'s
+    /// `session.data(for:)` would. Parses `{ok,bytes,latestDay}`; only `bytes`/`latestDay` are modelled
+    /// (Decodable ignores the unmodelled `ok` key — it's redundant with the 2xx status check anyway).
+    func ingest(fileURL: URL) async throws -> (bytes: Int, latestDay: String?) {
+        var req = URLRequest(url: url(path: "ingest"))
+        req.httpMethod = "POST"
+        req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        req.setValue("application/octet-stream", forHTTPHeaderField: "Content-Type")
+        let (data, status) = try await sendUpload(req, fromFile: fileURL)
+        guard (200..<300).contains(status) else {
+            throw CloudSyncError.badResponse(status, bodyPrefix(data))
+        }
+        guard let decoded = try? JSONDecoder().decode(IngestResponse.self, from: data) else {
+            throw CloudSyncError.decode
+        }
+        return (decoded.bytes, decoded.latestDay)
+    }
+
+    private func sendUpload(_ req: URLRequest, fromFile fileURL: URL) async throws -> (Data, Int) {
+        do {
+            let (data, resp) = try await session.upload(for: req, fromFile: fileURL)
+            return (data, (resp as? HTTPURLResponse)?.statusCode ?? 0)
+        } catch {
+            throw CloudSyncError.network(error.localizedDescription)
+        }
+    }
+
     private func url(path: String, query: [String: String] = [:]) -> URL {
         var comps = URLComponents(string: "\(baseURL.absoluteString)/\(path)")!
         if !query.isEmpty {
@@ -99,5 +130,10 @@ private struct AckRequest: Encodable {
 
 private struct AckResponse: Decodable {
     let acked: Int
+}
+
+private struct IngestResponse: Decodable {
+    let bytes: Int
+    let latestDay: String?
 }
 #endif // CLOUD_SYNC

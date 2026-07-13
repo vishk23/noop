@@ -151,5 +151,57 @@ final class CloudSyncSettingsTests: XCTestCase {
         CloudSyncSettings.serverURL = "   "
         XCTAssertNil(CloudSyncSettings.serverURL)
     }
+
+    // MARK: - Bundle fallback (Phase 3.5: zero-touch — bundle-injected CLOUDSYNC_URL/CLOUDSYNC_TOKEN)
+
+    /// Pure precedence logic, driven with synthetic dicts — mirrors how `OuraCredentialsTests` tests
+    /// `OuraCredentials.from(_:)` directly rather than `fromBundle` (which reads the real
+    /// `Bundle.main.infoDictionary` and can't be redirected in a unit test).
+    func testEffectiveValuePrefersKeychainOverBundle() {
+        let v = CloudSyncSettings.effectiveValue(keychain: "from-keychain", infoKey: "CLOUDSYNC_URL",
+                                                  info: ["CLOUDSYNC_URL": "from-bundle"])
+        XCTAssertEqual(v, "from-keychain")
+    }
+
+    func testEffectiveValueFallsBackToBundleWhenKeychainNil() {
+        let v = CloudSyncSettings.effectiveValue(keychain: nil, infoKey: "CLOUDSYNC_URL",
+                                                  info: ["CLOUDSYNC_URL": "from-bundle"])
+        XCTAssertEqual(v, "from-bundle")
+    }
+
+    func testEffectiveValueTrimsBundleValueAndTreatsBlankAsAbsent() {
+        XCTAssertNil(CloudSyncSettings.effectiveValue(keychain: nil, infoKey: "CLOUDSYNC_URL",
+                                                        info: ["CLOUDSYNC_URL": "   "]))
+        XCTAssertEqual(CloudSyncSettings.effectiveValue(keychain: nil, infoKey: "CLOUDSYNC_URL",
+                                                          info: ["CLOUDSYNC_URL": "  https://x  "]), "https://x")
+    }
+
+    func testEffectiveValueNilWhenNeitherKeychainNorBundlePresent() {
+        XCTAssertNil(CloudSyncSettings.effectiveValue(keychain: nil, infoKey: "CLOUDSYNC_URL", info: [:]))
+    }
+
+    func testEffectiveURLAndTokenReturnKeychainValuesWhenSet() {
+        CloudSyncSettings.serverURL = "https://from-keychain.example.com"
+        CloudSyncSettings.token = "keychain-token"
+        XCTAssertEqual(CloudSyncSettings.effectiveURL, "https://from-keychain.example.com")
+        XCTAssertEqual(CloudSyncSettings.effectiveToken, "keychain-token")
+        XCTAssertTrue(CloudSyncSettings.isConfigured)
+    }
+
+    /// No Keychain override present: `isBundleConfigured` must be false regardless of whatever the
+    /// test runner's own bundle happens to carry for CLOUDSYNC_URL/CLOUDSYNC_TOKEN (never set in the
+    /// StrandTests bundle in practice), because a real Keychain override always wins the UI's
+    /// collapsed-vs-manual-fields decision.
+    func testIsBundleConfiguredFalseWhenKeychainOverridePresent() {
+        CloudSyncSettings.serverURL = "https://from-keychain.example.com"
+        CloudSyncSettings.token = "keychain-token"
+        XCTAssertFalse(CloudSyncSettings.isBundleConfigured)
+    }
+
+    func testIsBundleConfiguredFalseWithNoKeychainAndNoBundleCreds() {
+        // Fresh state (clear()'d in setUp): no Keychain values, and the StrandTests bundle carries no
+        // CLOUDSYNC_* Info.plist keys, so this must read false, not silently true.
+        XCTAssertFalse(CloudSyncSettings.isBundleConfigured)
+    }
 }
 #endif // CLOUD_SYNC

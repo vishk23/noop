@@ -105,6 +105,11 @@ targets:
         OURA_CLIENT_ID: $(OURA_CLIENT_ID)
         OURA_CLIENT_SECRET: $(OURA_CLIENT_SECRET)
         OURA_REDIRECT_URI: $(OURA_REDIRECT_URI)
+        # Cloud Sync bundle credentials (Phase 3.5 zero-touch), same untracked-xcconfig chain as the
+        # OURA_* keys above; read at runtime via CloudSyncSettings.effectiveURL/effectiveToken. Absent/
+        # blank values leave the lane on manual Keychain configuration only.
+        CLOUDSYNC_URL: $(CLOUDSYNC_URL)
+        CLOUDSYNC_TOKEN: $(CLOUDSYNC_TOKEN)
         # Registers the noop:// URL scheme so ASWebAuthenticationSession's OAuth redirect
         # (noop://oura/callback) reaches OuraOAuthProvider instead of bouncing off the OS.
         CFBundleURLTypes:
@@ -273,6 +278,11 @@ targets:
         OURA_CLIENT_ID: $(OURA_CLIENT_ID)
         OURA_CLIENT_SECRET: $(OURA_CLIENT_SECRET)
         OURA_REDIRECT_URI: $(OURA_REDIRECT_URI)
+        # Cloud Sync bundle credentials (Phase 3.5 zero-touch), same untracked-xcconfig chain as the
+        # OURA_* keys above; read at runtime via CloudSyncSettings.effectiveURL/effectiveToken. Absent/
+        # blank values leave the lane on manual Keychain configuration only.
+        CLOUDSYNC_URL: $(CLOUDSYNC_URL)
+        CLOUDSYNC_TOKEN: $(CLOUDSYNC_TOKEN)
         # Registers the noop:// URL scheme so ASWebAuthenticationSession's OAuth redirect
         # (noop://oura/callback) reaches OuraOAuthProvider instead of bouncing off the OS.
         CFBundleURLTypes:

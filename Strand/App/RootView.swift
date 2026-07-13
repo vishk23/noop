@@ -301,6 +301,16 @@ struct RootView: View {
             Task.detached(priority: .utility) {
                 await FolderBackup.catchUpIfDue(checkpoint: { await backupRepo.checkpointForBackup() })
             }
+            #if CLOUD_SYNC
+            // Cloud Sync: zero-touch on-launch catch-up (Phase 3.5) — bundle-injected build credentials
+            // (or a manual Keychain save) need no further setup; `CloudSyncSettings.isConfigured` gates
+            // silently otherwise. `autoSyncIfDue` is a plain MainActor call that spawns its own `Task`
+            // internally (mirrors `pullNow`/`syncNow`'s own shape), so — unlike `FolderBackup` above,
+            // whose async functions the CALLER wraps in `Task.detached` — this needs no detached wrapper
+            // of its own to stay off the launch-critical path. The 20h gate lives in
+            // `CloudSyncModel.isAutoSyncDue`.
+            CloudSyncModel().autoSyncIfDue(repo: repo)
+            #endif
         }
         // Honour a cross-screen request to open a top-level destination (e.g. Live's "Manage devices"),
         // then clear it so the same tap can fire again later. Devices maps to the `.devices` sidebar item.

@@ -48,6 +48,10 @@
 	</array>
 	<key>CFBundleVersion</key>
 	<string>$(CURRENT_PROJECT_VERSION)</string>
+	<key>CLOUDSYNC_TOKEN</key>
+	<string>$(CLOUDSYNC_TOKEN)</string>
+	<key>CLOUDSYNC_URL</key>
+	<string>$(CLOUDSYNC_URL)</string>
 	<key>LSApplicationCategoryType</key>
 	<string>public.app-category.healthcare-fitness</string>
 	<key>LSSupportsOpeningDocumentsInPlace</key>

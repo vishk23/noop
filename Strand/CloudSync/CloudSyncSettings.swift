@@ -34,13 +34,60 @@ enum CloudSyncSettings {
         set { save(newValue, account: tokenAccount) }
     }
 
-    /// True once both a server URL and a token are stored.
-    static var isConfigured: Bool { serverURL != nil && token != nil }
+    /// True once both an EFFECTIVE server URL and token are available — a Keychain value, a
+    /// bundle-injected one, or a mix of both. Phase 3.5 (zero-touch): a bundle-only install counts as
+    /// configured with no Keychain write ever happening.
+    static var isConfigured: Bool { effectiveURL != nil && effectiveToken != nil }
 
     /// Remove both stored values.
     static func clear() {
         SecItemDelete(baseQuery(account: serverURLAccount) as CFDictionary)
         SecItemDelete(baseQuery(account: tokenAccount) as CFDictionary)
+    }
+
+    // MARK: - Bundle fallback (Phase 3.5: zero-touch)
+    //
+    // Mirrors Strand/Oura/OuraCredentials.swift's shape: a pure, dict-driven function that's directly
+    // unit-testable (`effectiveValue`), plus a thin `Bundle.main`-reading wrapper (`effectiveURL`/
+    // `effectiveToken`) that can't be redirected in a test but has no logic of its own to get wrong.
+
+    /// Read `key` from an Info-dictionary-shaped map, trimmed; blank/absent both read as nil so a
+    /// build without injected credentials cleanly falls through to "unconfigured" rather than saving a
+    /// whitespace server URL.
+    private static func bundleValue(_ key: String, from info: [String: Any]) -> String? {
+        guard let s = (info[key] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !s.isEmpty else { return nil }
+        return s
+    }
+
+    /// Keychain-wins-over-bundle precedence, as a pure function of its inputs — the seam that makes
+    /// the precedence rule unit-testable without a real Info.plist (see `CloudSyncSettingsTests`).
+    static func effectiveValue(keychain: String?, infoKey: String, info: [String: Any]) -> String? {
+        keychain ?? bundleValue(infoKey, from: info)
+    }
+
+    /// The noop-cloud server URL a manual Save in the Data Sources card wrote to the Keychain, or the
+    /// build-injected `CLOUDSYNC_URL` (from the untracked `OuraSecrets.xcconfig` → project.yml →
+    /// Info.plist chain — see `OuraCredentials.swift`'s doc comment for the identical pattern) when no
+    /// Keychain override exists. nil disables the whole cloud-sync lane.
+    static var effectiveURL: String? {
+        effectiveValue(keychain: serverURL, infoKey: "CLOUDSYNC_URL", info: Bundle.main.infoDictionary ?? [:])
+    }
+
+    /// The read-write token, same Keychain-wins-over-bundle precedence as `effectiveURL`.
+    static var effectiveToken: String? {
+        effectiveValue(keychain: token, infoKey: "CLOUDSYNC_TOKEN", info: Bundle.main.infoDictionary ?? [:])
+    }
+
+    /// True when the lane is configured ENTIRELY from the bundle-injected build credentials, with no
+    /// Keychain override at all. Drives the Data Sources card: bundle-configured shows a one-line
+    /// "Configured from build" note instead of the URL/token fields; any Keychain value (even a
+    /// partial one) falls through to the manual fields so a user's own in-progress edit is never
+    /// silently hidden behind the collapsed summary.
+    static var isBundleConfigured: Bool {
+        guard serverURL == nil, token == nil else { return false }
+        let info = Bundle.main.infoDictionary ?? [:]
+        return bundleValue("CLOUDSYNC_URL", from: info) != nil && bundleValue("CLOUDSYNC_TOKEN", from: info) != nil
     }
 
     /// Store (or replace) `value` for `account`. Empty/whitespace input clears the item instead

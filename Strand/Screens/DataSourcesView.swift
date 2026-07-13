@@ -43,14 +43,18 @@ struct DataSourcesView: View {
     @StateObject private var oura = OuraConnectModel()
     #endif
     #if CLOUD_SYNC
-    // Cloud Sync (compiled in ONLY with CLOUD_SYNC): pulls edits confirmed on the user's own
-    // noop-cloud server and applies them locally, re-exporting into Apple Health on iOS. Same
-    // call-time-`repo:` shape as `OuraConnectModel` above, for the same environment-object-timing
-    // reason. The URL/token fields are local drafts — `CloudSyncModel` only holds the SAVED values
-    // (in the Keychain via `CloudSyncSettings`), never the in-progress text.
+    // Cloud Sync (compiled in ONLY with CLOUD_SYNC): uploads this device's own backup and pulls edits
+    // confirmed on the user's own noop-cloud server, applying them locally and re-exporting into Apple
+    // Health on iOS. Same call-time-`repo:` shape as `OuraConnectModel` above, for the same
+    // environment-object-timing reason. The URL/token fields are local drafts — `CloudSyncModel` only
+    // holds the SAVED values (in the Keychain via `CloudSyncSettings`), never the in-progress text.
     @StateObject private var cloudSync = CloudSyncModel()
     @State private var cloudSyncURLDraft = CloudSyncSettings.serverURL ?? ""
     @State private var cloudSyncTokenDraft = ""
+    // Phase 3.5 (zero-touch): a build carrying bundle-injected CLOUDSYNC_URL/CLOUDSYNC_TOKEN collapses
+    // the card to a one-line summary by default; this reveals the manual fields for a per-device
+    // override. Starts false even on a bundle-configured build — there is nothing to override yet.
+    @State private var cloudSyncShowOverride = false
     #endif
     // "Remove Apple Health imported data" (ah-delete #616): a destructive escape hatch that purges every
     // row stored under the "apple-health" source via DeviceRegistryStore.deleteAllData. Two-step (a
@@ -342,68 +346,116 @@ struct DataSourcesView: View {
     #endif // OURA_CLOUD_IMPORT
 
     #if CLOUD_SYNC
-    /// Cloud Sync: pulls edit-journal rows YOU confirmed on your own noop-cloud server (a personal-fork
-    /// companion, not a shipped/supported service) and applies them to the local store, re-exporting
-    /// into Apple Health on iOS when the pull touched sleep/workouts/HR. `cloudSync.saveSettings(url:
-    /// token:)`/`pullNow(repo:)` take `repo` at call time — see the `@StateObject` declaration's note.
+    /// Cloud Sync: uploads this device's own `.noopbak` and pulls + applies edit-journal rows YOU
+    /// confirmed on your own noop-cloud server (a personal-fork companion, not a shipped/supported
+    /// service), re-exporting into Apple Health on iOS when the pull touched sleep/workouts/HR.
+    /// `cloudSync.syncNow(repo:)`/`saveSettings(url:token:)` take `repo`/args at call time — see the
+    /// `@StateObject` declaration's note. Phase 3.5 (zero-touch): a build carrying bundle-injected
+    /// `CLOUDSYNC_URL`/`CLOUDSYNC_TOKEN` with no Keychain override collapses to a one-line "Configured
+    /// from build" summary instead of the URL/token fields; "Override…" reveals them for a manual,
+    /// per-device server.
     private var cloudSyncCard: some View {
         card(title: String(localized: "Cloud Sync"), icon: "arrow.triangle.2.circlepath.circle",
              tint: StrandPalette.metricRose,
-             subtitle: String(localized: "Pull edits you confirmed on your own noop-cloud server and apply them here. A personal-fork lane — off unless you've set up your own server.")) {
-            VStack(alignment: .leading, spacing: NoopMetrics.space3) {
-                VStack(alignment: .leading, spacing: 6) {
-                    Text("Server URL").strandOverline()
-                    TextField("https://your-server.example.com", text: $cloudSyncURLDraft)
-                        .textFieldStyle(.plain)
-                        .font(StrandFont.body)
-                        .foregroundStyle(StrandPalette.textPrimary)
-                        .padding(.horizontal, 12)
-                        .padding(.vertical, 9)
-                        .background(StrandPalette.surfaceInset, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
-                        .overlay(RoundedRectangle(cornerRadius: 10, style: .continuous)
-                            .strokeBorder(StrandPalette.hairline, lineWidth: 1))
-                        .disableAutocorrection(true)
-                        #if os(iOS)
-                        .textInputAutocapitalization(.never)
-                        .keyboardType(.URL)
-                        #endif
-                        .accessibilityLabel("noop-cloud server URL")
-                }
-                VStack(alignment: .leading, spacing: 6) {
-                    Text("Token").strandOverline()
-                    SecureField("Paste your server's read-write token", text: $cloudSyncTokenDraft)
-                        .textFieldStyle(.plain)
-                        .font(StrandFont.body)
-                        .foregroundStyle(StrandPalette.textPrimary)
-                        .padding(.horizontal, 12)
-                        .padding(.vertical, 9)
-                        .background(StrandPalette.surfaceInset, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
-                        .overlay(RoundedRectangle(cornerRadius: 10, style: .continuous)
-                            .strokeBorder(StrandPalette.hairline, lineWidth: 1))
-                        .accessibilityLabel("noop-cloud token")
-                }
-                HStack(spacing: NoopMetrics.space3) {
-                    Button {
-                        cloudSync.saveSettings(url: cloudSyncURLDraft, token: cloudSyncTokenDraft)
-                    } label: {
-                        Label("Save", systemImage: "checkmark.circle")
-                    }
-                    .buttonStyle(NoopButtonStyle(.secondary))
-                    .disabled(cloudSyncURLDraft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-                              || cloudSyncTokenDraft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+             subtitle: String(localized: "Upload this device's data to your own noop-cloud server and pull back edits you confirmed elsewhere. A personal-fork lane — off unless you've set up your own server.")) {
+            if CloudSyncSettings.isBundleConfigured && !cloudSyncShowOverride {
+                bundleConfiguredCloudSync
+            } else {
+                manualCloudSyncFields
+            }
+        }
+    }
 
-                    Button {
-                        cloudSync.pullNow(repo: repo)
-                    } label: {
-                        Label(cloudSync.busy ? "Pulling…" : "Pull edits now", systemImage: "arrow.down.circle")
-                    }
-                    .buttonStyle(NoopButtonStyle(.primary))
-                    .disabled(!cloudSync.isConfigured || cloudSync.busy)
-                    if cloudSync.busy { ProgressView().controlSize(.small) }
+    /// Collapsed state for a build with bundle-injected credentials and no Keychain override: nothing
+    /// to fill in, just a confirmation + the primary action. "Override…" reveals `manualCloudSyncFields`
+    /// for a rare per-device custom server — the Keychain value it saves takes over on every future
+    /// launch (`CloudSyncSettings.effectiveURL` prefers the Keychain), and `isBundleConfigured` reads
+    /// false as soon as it exists, so the card never falls back to this collapsed view on its own
+    /// after that.
+    private var bundleConfiguredCloudSync: some View {
+        VStack(alignment: .leading, spacing: NoopMetrics.space3) {
+            HStack(spacing: 6) {
+                Image(systemName: "checkmark.circle.fill").foregroundStyle(StrandPalette.statusPositive)
+                Text("Configured from build").font(StrandFont.subhead).foregroundStyle(StrandPalette.textSecondary)
+            }
+            cloudSyncSyncRow
+            Button("Override…") { cloudSyncShowOverride = true }
+                .buttonStyle(.plain)
+                .font(StrandFont.caption)
+                .foregroundStyle(StrandPalette.textSecondary)
+        }
+    }
+
+    /// Manual entry — the Server URL / Token fields + Save, also reachable via "Override…" on a
+    /// bundle-configured build.
+    private var manualCloudSyncFields: some View {
+        VStack(alignment: .leading, spacing: NoopMetrics.space3) {
+            VStack(alignment: .leading, spacing: 6) {
+                Text("Server URL").strandOverline()
+                TextField("https://your-server.example.com", text: $cloudSyncURLDraft)
+                    .textFieldStyle(.plain)
+                    .font(StrandFont.body)
+                    .foregroundStyle(StrandPalette.textPrimary)
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 9)
+                    .background(StrandPalette.surfaceInset, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+                    .overlay(RoundedRectangle(cornerRadius: 10, style: .continuous)
+                        .strokeBorder(StrandPalette.hairline, lineWidth: 1))
+                    .disableAutocorrection(true)
+                    #if os(iOS)
+                    .textInputAutocapitalization(.never)
+                    .keyboardType(.URL)
+                    #endif
+                    .accessibilityLabel("noop-cloud server URL")
+            }
+            VStack(alignment: .leading, spacing: 6) {
+                Text("Token").strandOverline()
+                SecureField("Paste your server's read-write token", text: $cloudSyncTokenDraft)
+                    .textFieldStyle(.plain)
+                    .font(StrandFont.body)
+                    .foregroundStyle(StrandPalette.textPrimary)
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 9)
+                    .background(StrandPalette.surfaceInset, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+                    .overlay(RoundedRectangle(cornerRadius: 10, style: .continuous)
+                        .strokeBorder(StrandPalette.hairline, lineWidth: 1))
+                    .accessibilityLabel("noop-cloud token")
+            }
+            Button {
+                cloudSync.saveSettings(url: cloudSyncURLDraft, token: cloudSyncTokenDraft)
+            } label: {
+                Label("Save", systemImage: "checkmark.circle")
+            }
+            .buttonStyle(NoopButtonStyle(.secondary))
+            .disabled(cloudSyncURLDraft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                      || cloudSyncTokenDraft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+            cloudSyncSyncRow
+            if CloudSyncSettings.isBundleConfigured {
+                Button("Use build configuration instead") { cloudSyncShowOverride = false }
+                    .buttonStyle(.plain)
+                    .font(StrandFont.caption)
+                    .foregroundStyle(StrandPalette.textSecondary)
+            }
+        }
+    }
+
+    /// The "Sync now" button (+ busy spinner) and status line — identical whichever fields are
+    /// showing. Its own `VStack` (not a bare `Group`) so it's always a full, independent sibling in
+    /// whichever outer `VStack` hosts it, never flattened sideways into a parent `HStack`.
+    private var cloudSyncSyncRow: some View {
+        VStack(alignment: .leading, spacing: NoopMetrics.space3) {
+            HStack(spacing: NoopMetrics.space3) {
+                Button {
+                    cloudSync.syncNow(repo: repo)
+                } label: {
+                    Label(cloudSync.busy ? "Syncing…" : "Sync now", systemImage: "arrow.triangle.2.circlepath")
                 }
-                if let s = cloudSync.statusText {
-                    Text(s).font(StrandFont.subhead).foregroundStyle(StrandPalette.textSecondary)
-                }
+                .buttonStyle(NoopButtonStyle(.primary))
+                .disabled(!cloudSync.isConfigured || cloudSync.busy)
+                if cloudSync.busy { ProgressView().controlSize(.small) }
+            }
+            if let s = cloudSync.statusText {
+                Text(s).font(StrandFont.subhead).foregroundStyle(StrandPalette.textSecondary)
             }
         }
     }

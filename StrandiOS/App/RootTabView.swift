@@ -119,6 +119,11 @@ struct RootTabView: View {
             Task.detached(priority: .utility) {
                 await FolderBackup.catchUpIfDue(checkpoint: { await backupRepo.checkpointForBackup() })
             }
+            #if CLOUD_SYNC
+            // Cloud Sync: zero-touch on-launch catch-up (see RootView's identical wiring). No detached
+            // wrapper needed — `autoSyncIfDue` spawns its own `Task` internally and returns immediately.
+            CloudSyncModel().autoSyncIfDue(repo: repo)
+            #endif
         }
         // Quick-action sheet presents with the calm easing (~0.42s) per the README sheet spec —
         // the easing is applied where `quickAction` is set (see `presentQuickAction`), keeping the
