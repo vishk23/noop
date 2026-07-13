@@ -42,6 +42,28 @@ final class OuraApiParserSleepTests: XCTestCase {
         XCTAssertTrue(periods.isEmpty)
     }
 
+    func testSkipsDeletedPeriodEntirely() throws {
+        // A user-removed night (`type == "deleted"`) must neither become a session nor compete for
+        // the day's rollup — same rule as OuraExportParser's CSV side (#862). The deleted doc here
+        // would otherwise WIN the day on duration.
+        let docs: [[String: Any]] = [
+            ["id": "dead", "day": "2026-01-02", "type": "deleted",
+             "bedtime_start": "2026-01-01T22:00:00+00:00",
+             "bedtime_end": "2026-01-02T07:00:00+00:00",
+             "total_sleep_duration": 30000, "lowest_heart_rate": 44, "efficiency": 95],
+            ["id": "real", "day": "2026-01-02", "type": "long_sleep",
+             "bedtime_start": "2026-01-02T00:00:00+00:00",
+             "bedtime_end": "2026-01-02T06:00:00+00:00",
+             "total_sleep_duration": 19800, "lowest_heart_rate": 50, "efficiency": 90],
+        ]
+        let (periods, days) = OuraApiParser.parseSleep(docs)
+        XCTAssertEqual(periods.count, 1)
+        XCTAssertEqual(try XCTUnwrap(periods.first).session.lowestHr, 50)
+        XCTAssertEqual(days.count, 1)
+        XCTAssertEqual(days.first?.totalSleepMin, 330)             // 19800s ÷ 60, from the real night
+        XCTAssertEqual(days.first?.restingHr, 50)
+    }
+
     func testSampleSeriesSkipsFiniteButHugeValuesWithoutCrashing() throws {
         // Both `ts` and `bpm` in sampleSeries are Double->Int casts; a finite-but-huge value for EITHER
         // (a crafted `interval` or a crafted `items` element) must be skipped, never trap Int(...).

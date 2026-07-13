@@ -24,6 +24,11 @@ public enum OuraApiParser {
                   let end = WhoopTime.parseISOWithOffset(WearableJSON.str(s, "bedtime_end")),
                   end > start else { continue }
 
+            // A `deleted` sleep period (Oura's `type` enum) is a night the user removed in the Oura
+            // app — skip it entirely so it neither becomes a session nor competes for the day's
+            // rollup, matching OuraExportParser's CSV-side rule (#862).
+            if WearableJSON.str(s, "type")?.lowercased() == "deleted" { continue }
+
             // Durations are SECONDS in the API → minutes.
             func minutes(_ k: String) -> Double? { WearableJSON.posDbl(s, k).map { $0 / 60.0 } }
 
