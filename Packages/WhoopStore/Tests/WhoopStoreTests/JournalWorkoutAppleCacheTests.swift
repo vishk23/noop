@@ -259,6 +259,29 @@ final class JournalWorkoutAppleCacheTests: XCTestCase {
         XCTAssertEqual(other.count, 1, "other device untouched")
     }
 
+    func testWorkoutExists() async throws {
+        let store = try await WhoopStore.inMemory()
+        let w = WorkoutRow(startTs: 100, endTs: 700, sport: "running", source: "whoop", durationS: 600,
+                           energyKcal: nil, avgHr: nil, maxHr: nil, strain: nil, distanceM: nil,
+                           zonesJSON: nil, notes: nil)
+        try await store.upsertWorkouts([w], deviceId: "devA")
+
+        let exists = try await store.workoutExists(deviceId: "devA", startTs: 100, sport: "running")
+        XCTAssertTrue(exists)
+
+        // A mismatch on any single key column must miss.
+        let wrongSport = try await store.workoutExists(deviceId: "devA", startTs: 100, sport: "cycling")
+        XCTAssertFalse(wrongSport)
+        let wrongStart = try await store.workoutExists(deviceId: "devA", startTs: 200, sport: "running")
+        XCTAssertFalse(wrongStart)
+        let wrongDevice = try await store.workoutExists(deviceId: "devB", startTs: 100, sport: "running")
+        XCTAssertFalse(wrongDevice)
+
+        _ = try await store.deleteWorkouts(deviceId: "devA", sport: "running", from: 100, to: 100)
+        let afterDelete = try await store.workoutExists(deviceId: "devA", startTs: 100, sport: "running")
+        XCTAssertFalse(afterDelete, "a deleted workout must no longer report as existing")
+    }
+
     // MARK: - appleDaily
 
     func testAppleDailyUpsertReadAndIdempotency() async throws {

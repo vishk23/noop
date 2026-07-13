@@ -4,6 +4,7 @@
 #if CLOUD_SYNC
 import Foundation
 import WhoopStore
+import StrandAnalytics
 
 /// Outcome of applying one batch of `CloudEdit` journal rows to the local store.
 ///
@@ -103,10 +104,19 @@ enum CloudEditApplier {
                 summary.needsAttention += 1   // session absent — nothing to adjust
                 return
             }
+            // #940 belt-and-braces, mirrored from Repository.editSleepTimes: never persist a future-
+            // ending or inverted window, whatever the server payload says. A malicious/buggy server
+            // mirror or a stale queued edit must not be able to write a phantom night the display
+            // merge can't render — refuse (needsAttention) rather than clamp-and-apply silently.
+            guard let window = SleepEditGuard.clampedEditWindow(
+                start: p.newStartTs ?? current.effectiveStartTs, end: p.newEndTs ?? current.endTs,
+                now: Int(Date().timeIntervalSince1970)) else {
+                summary.needsAttention += 1
+                return
+            }
             _ = try await store.applySleepEdit(
                 deviceId: p.deviceId, detectedStartTs: p.startTs,
-                newStartTs: p.newStartTs ?? current.effectiveStartTs,
-                newEndTs: p.newEndTs ?? current.endTs)
+                newStartTs: window.start, newEndTs: window.end)
             summary.applied += 1
             summary.touchedSleep = true
         } catch {
@@ -167,11 +177,19 @@ enum CloudEditApplier {
             }
             // updateSleepStages only touches userEdited=1 rows; promote first (CURRENT bounds,
             // stages left untouched by this call) so an un-edited night can still receive a stage
-            // correction — see the brief's explicit two-step note.
+            // correction — see the brief's explicit two-step note. This promotion also calls
+            // applySleepEdit with a bounds pair, so it gets the same #940 guard as adjust_sleep_bounds
+            // above: a stored row with corrupt (inverted/future) bounds — e.g. a bad import that never
+            // went through the guard — must not be silently promoted into a userEdited phantom night.
             if !current.userEdited {
+                guard let window = SleepEditGuard.clampedEditWindow(
+                    start: current.effectiveStartTs, end: current.endTs,
+                    now: Int(Date().timeIntervalSince1970)) else {
+                    summary.needsAttention += 1
+                    return
+                }
                 _ = try await store.applySleepEdit(deviceId: p.deviceId, detectedStartTs: p.startTs,
-                                                    newStartTs: current.effectiveStartTs,
-                                                    newEndTs: current.endTs)
+                                                    newStartTs: window.start, newEndTs: window.end)
             }
             _ = try await store.updateSleepStages(deviceId: p.deviceId, detectedStartTs: p.startTs,
                                                    stagesJSON: stagesJSON)
@@ -197,9 +215,15 @@ enum CloudEditApplier {
             return
         }
         do {
-            _ = try await store.deleteWorkouts(deviceId: p.deviceId, sport: p.sport, from: p.startTs, to: p.startTs)
+            // Destructive step LAST: tombstone before the physical delete, so a mid-chain throw
+            // degrades to "the row is still visible but future re-imports/backfills are blocked" —
+            // never to "the delete happened but nothing recorded it, so a later re-import silently
+            // resurrects the workout the user just deleted." A crash between these two calls is the
+            // worst case this ordering must survive, and it does: re-processing the same journal row
+            // (addTombstone is idempotent by (kind, editSeq)) simply finishes the delete.
             try await store.addTombstone(kind: "workout", deviceId: p.deviceId, startTs: p.startTs, endTs: nil,
                                           sport: p.sport, day: nil, key: nil, editSeq: seq)
+            _ = try await store.deleteWorkouts(deviceId: p.deviceId, sport: p.sport, from: p.startTs, to: p.startTs)
             summary.applied += 1
             summary.touchedWorkouts = true
         } catch {
@@ -253,7 +277,27 @@ enum CloudEditApplier {
             return
         }
         do {
-            _ = try await store.deleteWorkouts(deviceId: p.deviceId, sport: p.sport, from: p.startTs, to: p.startTs)
+            // Same-batch race guard: a delete_workout for this exact key can sort BEFORE this row
+            // (lower seq) in the SAME batch and have already removed the original. Without this check
+            // the upsert below would resurrect it under noop-cloud, silently undoing a delete the user
+            // just made.
+            guard try await store.workoutExists(deviceId: p.deviceId, startTs: p.startTs, sport: p.sport) else {
+                let alreadyDeleted = try await store.workoutTombstones(deviceId: p.deviceId)
+                    .contains { $0.startTs == p.startTs && $0.sport == p.sport }
+                if alreadyDeleted {
+                    summary.skipped += 1        // an earlier/same-batch delete already won — nothing to fix
+                } else {
+                    summary.needsAttention += 1 // gone with no tombstone — stale server mirror
+                }
+                return
+            }
+
+            // Destructive step LAST: tombstone the original, write the corrected copy, THEN delete the
+            // original — so a mid-chain throw degrades to "an extra/duplicate row is visible", never to
+            // "the original is gone and no correction exists" (see the ordering rationale on
+            // applyDeleteWorkout above). The tombstone keys the ORIGINAL deviceId, so it can never
+            // block the noop-cloud upsert below (upsertWorkouts' resurrection guard only checks
+            // tombstones for the deviceId it is writing INTO).
             try await store.addTombstone(kind: "workout", deviceId: p.deviceId, startTs: p.startTs, endTs: nil,
                                           sport: p.sport, day: nil, key: nil, editSeq: seq)
 
@@ -264,6 +308,8 @@ enum CloudEditApplier {
                 energyKcal: p.patch.energyKcal ?? before.energyKcal, avgHr: nil, maxHr: nil, strain: nil,
                 distanceM: p.patch.distanceM ?? before.distanceM, zonesJSON: nil, notes: nil)
             _ = try await store.upsertWorkouts([corrected], deviceId: cloudDeviceId)
+
+            _ = try await store.deleteWorkouts(deviceId: p.deviceId, sport: p.sport, from: p.startTs, to: p.startTs)
 
             summary.applied += 1
             summary.touchedWorkouts = true
@@ -318,9 +364,10 @@ enum CloudEditApplier {
             return
         }
         do {
-            _ = try await store.deleteHrRange(deviceId: p.deviceId, fromTs: p.fromTs, toTs: p.toTs)
+            // Destructive step LAST — see the ordering rationale on applyDeleteWorkout above.
             try await store.addTombstone(kind: "hrRange", deviceId: p.deviceId, startTs: p.fromTs, endTs: p.toTs,
                                           sport: nil, day: nil, key: nil, editSeq: seq)
+            _ = try await store.deleteHrRange(deviceId: p.deviceId, fromTs: p.fromTs, toTs: p.toTs)
             summary.applied += 1
             summary.touchedHr = true
         } catch {
@@ -343,9 +390,10 @@ enum CloudEditApplier {
             return
         }
         do {
-            _ = try await store.deleteMetricPoint(deviceId: p.deviceId, day: p.day, key: p.key)
+            // Destructive step LAST — see the ordering rationale on applyDeleteWorkout above.
             try await store.addTombstone(kind: "metricPoint", deviceId: p.deviceId, startTs: nil, endTs: nil,
                                           sport: nil, day: p.day, key: p.key, editSeq: seq)
+            _ = try await store.deleteMetricPoint(deviceId: p.deviceId, day: p.day, key: p.key)
             summary.applied += 1
             // No sleep/workouts/hr flag applies to a generic metric point.
         } catch {

@@ -256,6 +256,17 @@ extension WhoopStore {
         }
     }
 
+    /// True when a workout exists at the exact natural key (deviceId, startTs, sport). A cheap
+    /// existence check for a resurrection/staleness guard (`CloudEditApplier`'s `fix_workout`
+    /// handler) that only needs a boolean, not a fully decoded `WorkoutRow`.
+    public func workoutExists(deviceId: String, startTs: Int, sport: String) async throws -> Bool {
+        try syncRead { db in
+            try Row.fetchOne(db, sql: """
+                SELECT 1 FROM workout WHERE deviceId = ? AND startTs = ? AND sport = ? LIMIT 1
+                """, arguments: [deviceId, startTs, sport]) != nil
+        }
+    }
+
     /// Apple-Health daily aggregates for days in [from, to] (lexicographic compare), oldest first.
     public func appleDaily(deviceId: String, from: String, to: String) async throws -> [AppleDaily] {
         try syncRead { db in

@@ -62,6 +62,28 @@ final class CloudEditApplierTests: XCTestCase {
         XCTAssertEqual(summary.appliedSeqs, [5])
     }
 
+    func testAdjustSleepBoundsRejectsInvertedWindow() async throws {
+        let store = try await WhoopStore.inMemory()
+        _ = try await store.upsertSleepSessions([
+            CachedSleepSession(startTs: 1000, endTs: 29000, efficiency: 90, restingHr: 50, avgHrv: 60, stagesJSON: nil),
+        ], deviceId: "my-whoop")
+
+        // newEndTs (500) is BEFORE the session's own startTs (1000) — an inverted window that
+        // SleepEditGuard.clampedEditWindow (#940 belt-and-braces) must refuse outright, exactly as
+        // Repository.editSleepTimes refuses one from a misbehaving client UI.
+        let e = edit(seq: 17, kind: "adjust_sleep_bounds",
+                     payload: ["deviceId": "my-whoop", "startTs": 1000, "newEndTs": 500])
+        let summary = await CloudEditApplier.apply([e], store: store)
+
+        XCTAssertEqual(summary.applied, 0)
+        XCTAssertEqual(summary.needsAttention, 1, "an inverted window must be refused, not silently clamped")
+        XCTAssertEqual(summary.appliedSeqs, [17])
+
+        let untouched = try await store.sleepSessions(deviceId: "my-whoop", from: 1000, to: 1000, limit: 1).first
+        XCTAssertEqual(untouched?.endTs, 29000, "a rejected edit must leave the stored bounds unchanged")
+        XCTAssertFalse(untouched?.userEdited ?? true, "a rejected edit must not set userEdited")
+    }
+
     // MARK: - edit_sleep_stages
 
     func testEditSleepStagesPromotesUnEditedRowAndMapsStageVocabulary() async throws {
@@ -104,6 +126,30 @@ final class CloudEditApplierTests: XCTestCase {
         let summary = await CloudEditApplier.apply([e], store: store)
         XCTAssertEqual(summary.needsAttention, 1)
         XCTAssertEqual(summary.applied, 0)
+    }
+
+    func testEditSleepStagesPromotionRejectsInvertedCurrentBounds() async throws {
+        let store = try await WhoopStore.inMemory()
+        // Seed a corrupted (inverted) session directly via upsertSleepSessions, which does NOT route
+        // through SleepEditGuard (only applySleepEdit does) — simulates a bad import/server mirror
+        // reaching the store with bounds no on-device edit path could ever produce.
+        _ = try await store.upsertSleepSessions([
+            CachedSleepSession(startTs: 5000, endTs: 4000, efficiency: 90, restingHr: 50, avgHrv: 60, stagesJSON: nil),
+        ], deviceId: "my-whoop")
+        let before = try await store.sleepSessions(deviceId: "my-whoop", from: 5000, to: 5000, limit: 1).first
+        XCTAssertFalse(before?.userEdited ?? true, "fixture must start un-edited to exercise the promotion path")
+
+        let stages: [[String: Any]] = [["start": 4000, "end": 5000, "stage": "light"]]
+        let e = edit(seq: 18, kind: "edit_sleep_stages",
+                     payload: ["deviceId": "my-whoop", "startTs": 5000, "stages": stages])
+        let summary = await CloudEditApplier.apply([e], store: store)
+
+        XCTAssertEqual(summary.needsAttention, 1, "promoting an inverted stored window must be refused")
+        XCTAssertEqual(summary.applied, 0)
+
+        let untouched = try await store.sleepSessions(deviceId: "my-whoop", from: 5000, to: 5000, limit: 1).first
+        XCTAssertEqual(untouched?.endTs, 4000, "rejected promotion must leave stored bounds unchanged")
+        XCTAssertFalse(untouched?.userEdited ?? true, "rejected promotion must not set userEdited")
     }
 
     // MARK: - delete_workout
@@ -175,6 +221,73 @@ final class CloudEditApplierTests: XCTestCase {
         let summary = await CloudEditApplier.apply([e], store: store)
         XCTAssertEqual(summary.needsAttention, 1)
         XCTAssertEqual(summary.applied, 0)
+    }
+
+    func testFixWorkoutNeedsAttentionWhenNoUsableEndTs() async throws {
+        // beforeJSON IS present (unlike testFixWorkoutNeedsAttentionWhenBeforeJSONMissing above) but
+        // carries no endTs, and the patch doesn't supply one either — the previously-untested branch
+        // of the `finalEndTs` guard.
+        let store = try await WhoopStore.inMemory()
+        let beforeJSON = json(["deviceId": "my-whoop", "startTs": 100, "sport": "running", "source": "whoop"])
+        let e = edit(seq: 15, kind: "fix_workout",
+                     payload: ["deviceId": "my-whoop", "startTs": 100, "sport": "running",
+                               "patch": ["energyKcal": 450]],
+                     beforeJSON: beforeJSON)
+        let summary = await CloudEditApplier.apply([e], store: store)
+        XCTAssertEqual(summary.needsAttention, 1)
+        XCTAssertEqual(summary.applied, 0)
+        XCTAssertEqual(summary.skipped, 0)
+    }
+
+    func testFixWorkoutSkippedWhenSameBatchDeleteAlreadyWon() async throws {
+        // delete_workout(seq1) then fix_workout(seq2) targeting the SAME (deviceId, startTs, sport) in
+        // one batch: the delete must win outright — the fix must not resurrect a noop-cloud copy of a
+        // workout the same batch just deleted.
+        let store = try await WhoopStore.inMemory()
+        let workout = WorkoutRow(startTs: 100, endTs: 700, sport: "running", source: "whoop", durationS: 600,
+                                  energyKcal: 400, avgHr: nil, maxHr: nil, strain: nil, distanceM: nil,
+                                  zonesJSON: nil, notes: nil)
+        _ = try await store.upsertWorkouts([workout], deviceId: "my-whoop")
+
+        let beforeJSON = json(["deviceId": "my-whoop", "startTs": 100, "endTs": 700, "sport": "running",
+                                "source": "whoop", "durationS": 600, "energyKcal": 400, "distanceM": 5000])
+        let edits = [
+            edit(seq: 1, kind: "delete_workout", payload: ["deviceId": "my-whoop", "startTs": 100, "sport": "running"]),
+            edit(seq: 2, kind: "fix_workout",
+                 payload: ["deviceId": "my-whoop", "startTs": 100, "sport": "running", "patch": ["energyKcal": 450]],
+                 beforeJSON: beforeJSON),
+        ]
+        let summary = await CloudEditApplier.apply(edits, store: store)
+
+        XCTAssertEqual(summary.applied, 1, "only the delete applies")
+        XCTAssertEqual(summary.skipped, 1, "the same-batch fix must be skipped, not applied")
+        XCTAssertEqual(summary.needsAttention, 0)
+        XCTAssertEqual(summary.appliedSeqs, [1, 2])
+
+        let copies = try await store.workouts(deviceId: "noop-cloud", from: 0, to: 1000, limit: 10)
+        XCTAssertEqual(copies.count, 0, "the delete already won — fix must not resurrect a noop-cloud copy")
+        let originalGone = try await store.workouts(deviceId: "my-whoop", from: 0, to: 1000, limit: 10)
+        XCTAssertEqual(originalGone.count, 0)
+    }
+
+    func testFixWorkoutNeedsAttentionWhenOriginalAbsentWithNoTombstone() async throws {
+        // The original is gone but there is no tombstone for it (no same-batch delete either) — a
+        // stale server mirror, not a resolved delete. This must surface for a human look, not silently
+        // fabricate a noop-cloud copy of a workout the store never actually held.
+        let store = try await WhoopStore.inMemory()
+        let beforeJSON = json(["deviceId": "my-whoop", "startTs": 100, "endTs": 700, "sport": "running",
+                                "source": "whoop", "durationS": 600, "energyKcal": 400, "distanceM": 5000])
+        let e = edit(seq: 16, kind: "fix_workout",
+                     payload: ["deviceId": "my-whoop", "startTs": 100, "sport": "running",
+                               "patch": ["energyKcal": 450]],
+                     beforeJSON: beforeJSON)
+        let summary = await CloudEditApplier.apply([e], store: store)
+
+        XCTAssertEqual(summary.needsAttention, 1)
+        XCTAssertEqual(summary.applied, 0)
+        XCTAssertEqual(summary.skipped, 0)
+        let copies = try await store.workouts(deviceId: "noop-cloud", from: 0, to: 1000, limit: 10)
+        XCTAssertEqual(copies.count, 0, "no noop-cloud copy must be created for a stale server mirror")
     }
 
     // MARK: - add_workout
