@@ -70,11 +70,11 @@ struct StrandiOSApp: App {
         // model is never nil by the time a delegate callback could possibly fire.
         CloudSyncAppDelegate.model = model
         // APNs registration itself: request only when the lane is actually configured — an unconfigured
-        // device has no server to hand a token to. `NOOP.entitlements` doesn't carry `aps-environment`
-        // in this branch yet, so this will call `didFailToRegisterForRemoteNotificationsWithError` on
-        // every launch until the integrator adds it (see `CloudSyncAppDelegate`'s doc comment) — that's
-        // expected, not a bug.
-        if CloudSyncSettings.isConfigured {
+        // device has no server to hand a token to. Gate on the EFFECTIVE credentials (Keychain OR the
+        // Phase-3.5 bundle injection), NOT `isConfigured`: `isConfigured` is Keychain-only, so a
+        // zero-touch bundle-credentialed device (the normal personal setup) would never register —
+        // found live: devices stayed 0 after the entitlement landed because this gate never opened.
+        if CloudSyncSettings.effectiveURL != nil, CloudSyncSettings.effectiveToken != nil {
             UIApplication.shared.registerForRemoteNotifications()
         }
         #endif
