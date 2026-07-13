@@ -51,6 +51,14 @@ struct StrandiOSApp: App {
         // before the first scene so any early-fired notification is presented.
         UNUserNotificationCenter.current().delegate = NotificationPresenter.shared
         let model = AppModel()
+        #if CLOUD_SYNC
+        // Cloud Sync v2: register the background-refresh BGTask handler BEFORE launch finishes — same
+        // constraint as ScheduledDebugExport.register() above, and for the same reason (iOS only
+        // delivers a background task whose identifier was registered at launch AND listed in
+        // BGTaskSchedulerPermittedIdentifiers). `schedule()` itself is NOT called here — only when the
+        // app backgrounds (below) — so this alone doesn't consume the earliest-begin-date window.
+        CloudSyncBackgroundRefresh.register(model: model)
+        #endif
         _model = StateObject(wrappedValue: model)
         _health = StateObject(wrappedValue: HealthKitBridge(
             repo: model.repo,
@@ -206,6 +214,12 @@ struct StrandiOSApp: App {
                 // into Apple Health. Gated inside writeIfEnabled on the opt-in default (OFF) — a
                 // no-op until the user turns on Shortcuts Export.
                 Task { await ShortcutHealthExport.writeIfEnabled(repo: model.repo) }
+                #if CLOUD_SYNC
+                // Cloud Sync v2: submit the next background-refresh request on the way OUT, not at
+                // launch — see `CloudSyncBackgroundRefresh.schedule()`'s doc comment for why launch-time
+                // scheduling would waste the earliest-begin-date window on a long foreground session.
+                CloudSyncBackgroundRefresh.schedule()
+                #endif
             }
         }
     }

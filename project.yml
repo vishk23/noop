@@ -251,13 +251,17 @@ targets:
           # backgrounded app near the user's chosen time to write the overnight strap-log drop. BGAppRefresh
           # needs the "fetch" background mode; the task id below must also be permitted (and registered at
           # launch in StrandiOSApp.init) or the submit fails gracefully and only the foreground/"Run now"
-          # paths run.
+          # paths run. Cloud Sync v2's own BGAppRefreshTaskRequest (CloudSyncBackgroundRefresh) shares this
+          # SAME "fetch" mode — one background mode covers every BGAppRefreshTask identifier in the app.
           - fetch
         # #510: permit the scheduled debug auto-export's BGAppRefreshTask identifier. MUST match
         # ScheduledDebugExport.bgTaskIdentifier EXACTLY and be registered at launch (StrandiOSApp.init);
         # otherwise iOS refuses to schedule or deliver the background drop.
+        # Cloud Sync v2 adds its own identifier alongside it — MUST match
+        # CloudSyncBackgroundRefresh.bgTaskIdentifier EXACTLY, same registration constraint.
         BGTaskSchedulerPermittedIdentifiers:
           - com.noopapp.noop.debugexport
+          - com.noopapp.noop.cloudsync.refresh
         NSBluetoothAlwaysUsageDescription: "NOOP connects directly to your WHOOP strap over Bluetooth to read heart rate, R-R intervals, battery, and sensor data locally on your iPhone. Nothing leaves your device."
         NSLocationWhenInUseUsageDescription: "NOOP records your route during an outdoor workout to show distance, pace, and a map, and keeps recording while the screen is off. The route stays on your device. Nothing leaves it."
         NSHealthShareUsageDescription: "NOOP reads your own Apple Health data on-device to compute recovery, strain, and sleep. Nothing leaves your device."

@@ -339,6 +339,44 @@ final class CloudSyncModel: ObservableObject {
         Task { await runGatedSync(repo: repo, url: url, token: token) }
     }
 
+    #if os(iOS)
+    /// Staleness gate for the BACKGROUND refresh path (`backgroundSyncIfDue`, below) — SHORTER than
+    /// `isAutoSyncDue`'s 20h default because a background wake (BGAppRefreshTask or a silent push) is
+    /// opportunistic and comparatively cheap: iOS decides IF and WHEN it actually runs at all, and
+    /// skip-unchanged upload (see `performSync`'s doc comment) means most invocations that DO run ship
+    /// no bytes. There's no reason to make a user wait as long as the guaranteed on-launch catch-up does.
+    static let backgroundSyncIntervalS: TimeInterval = 4 * 3600
+
+    /// Background-refresh entry point — called from the `BGAppRefreshTask` handler
+    /// (`CloudSyncBackgroundRefresh`) and the silent-push handler (`CloudSyncAppDelegate`), both iOS
+    /// only. Unlike `autoSyncIfDue` (fire-and-forget: spawns its own `Task` and returns immediately so
+    /// it never blocks the launch-critical path), this AWAITS the sync to completion — both callers
+    /// need to know when it's done before they report back to iOS (`task.setTaskCompleted`, or the
+    /// push handler's `fetchCompletionHandler`). Returns `true` when a sync was actually ATTEMPTED
+    /// (whatever its outcome), `false` when a guard sent it home early (not configured, not due, bad
+    /// URL, or running under XCTest) — the push handler maps this straight to `.newData`/`.noData`.
+    ///
+    /// Reuses `runGatedSync`, the SAME `CloudSyncGate` every other entry point shares, so a background
+    /// wake that overlaps a foreground "Sync now" (or another background wake — a redelivered push, a
+    /// BGAppRefreshTask firing moments after a push already ran one) can't start a second sync; it just
+    /// sees the gate held and returns. Shares `Self.lastAutoSyncKey` with `autoSyncIfDue` too — a
+    /// successful background sync resets the SAME clock the 20h on-launch gate reads, so a launch right
+    /// after a successful background sync doesn't immediately re-fire (mirrors `syncNow`'s doc comment
+    /// on the identical interaction).
+    @discardableResult
+    func backgroundSyncIfDue(repo: Repository) async -> Bool {
+        guard !Self.isRunningUnderXCTest else { return false }
+        guard CloudSyncSettings.isConfigured else { return false }
+        let last = UserDefaults.standard.double(forKey: Self.lastAutoSyncKey)
+        guard Self.isAutoSyncDue(lastRun: last, now: Date().timeIntervalSince1970,
+                                  intervalS: Self.backgroundSyncIntervalS) else { return false }
+        guard let urlString = CloudSyncSettings.effectiveURL, let token = CloudSyncSettings.effectiveToken,
+              let url = URL(string: urlString) else { return false }
+        await runGatedSync(repo: repo, url: url, token: token)
+        return true
+    }
+    #endif
+
     #if os(iOS) && canImport(HealthKit)
     /// Re-export into Apple Health when a pulled batch touched sleep/workouts/HR — shared by `pullNow`
     /// and `syncNow` so both surface the same "Apple Health re-export failed" note. Only re-exports
