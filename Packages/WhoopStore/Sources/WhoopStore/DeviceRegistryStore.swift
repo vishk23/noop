@@ -90,6 +90,10 @@ public struct DeviceRegistryStore: Sendable {
         // v25-oura-raw: the opt-in Oura cloud-import raw archive is deviceId-keyed too, so "delete this
         // device's data" must clear it — else an imported Oura source's payloads would survive deletion.
         "ouraRaw",
+        // v27-apple-step-hour: per-hour Apple Health step counts are deviceId-keyed (apple-health) and
+        // are real per-device recordings like appleDaily/stepSample, not tombstone-class bookkeeping —
+        // a device-data wipe / "Remove Apple Health data" must clear them too.
+        "appleStepHour",
     ]
 
     /// deviceId-keyed tables deliberately EXCLUDED from `deviceScopedTables` — a normal "delete this

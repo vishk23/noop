@@ -524,6 +524,26 @@ extension WhoopStore {
             }
             try db.create(index: "idx_cloudTombstone_kind_device", on: "cloudTombstone", columns: ["kind", "deviceId"])
         }
+
+        // v27: hourly Apple Health step counts. The daily `collect(.stepCount, …)` path in
+        // HealthKitBridge flattens a whole day to one `appleDaily.steps` total, so a dead/absent phone
+        // for part of a day (e.g. the phone died mid-hike) is invisible — steps just read low for the
+        // WHOLE day instead of showing exactly which hours had no recording. HealthKit retains hourly
+        // statistics historically, so this table lets a one-time backfill answer PAST days
+        // retroactively, not just from the day this migration ships. `ts` is the hour-BUCKET START
+        // (unix seconds), aligned to local-clock hour boundaries by the `HKStatisticsCollectionQuery`
+        // anchored at local midnight (see HealthKitBridge); `steps` is the cumulative sum within that
+        // hour. PK (deviceId, ts) mirrors every other per-sample table (hrSample, stepSample, …) and
+        // makes the hourly upsert idempotent. Additive only — a NEW table, no existing row touched, old
+        // readers unaffected.
+        migrator.registerMigration("v27-apple-step-hour") { db in
+            try db.create(table: "appleStepHour") { t in
+                t.column("deviceId", .text).notNull()   // "apple-health"
+                t.column("ts", .integer).notNull()      // hour-start unix seconds (local-hour aligned by HK)
+                t.column("steps", .integer).notNull()
+                t.primaryKey(["deviceId", "ts"])
+            }
+        }
         return migrator
     }
 }
