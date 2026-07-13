@@ -119,8 +119,14 @@ final class CloudSyncSettingsTests: XCTestCase {
     override func setUp() { super.setUp(); CloudSyncSettings.clear() }
     override func tearDown() { CloudSyncSettings.clear(); super.tearDown() }
 
+    /// Uses `isConfigured(info:)` — the pure, dict-driven seam — with an explicit EMPTY info dict
+    /// rather than the live, no-arg `isConfigured` (which falls back to `Bundle.main`). This machine's
+    /// `OuraSecrets.xcconfig` carries real CLOUDSYNC_URL/CLOUDSYNC_TOKEN values, so the live property
+    /// would read true even with the Keychain cleared, defeating the "Keychain-only" round trip this
+    /// test is actually checking. `serverURL`/`token`/`clear()` (the Keychain side) don't need a seam
+    /// — they're already fully controllable in a test.
     func testSaveLoadClearRoundTrip() {
-        XCTAssertFalse(CloudSyncSettings.isConfigured)
+        XCTAssertFalse(CloudSyncSettings.isConfigured(info: [:]))
         XCTAssertNil(CloudSyncSettings.serverURL)
         XCTAssertNil(CloudSyncSettings.token)
 
@@ -128,20 +134,22 @@ final class CloudSyncSettingsTests: XCTestCase {
         CloudSyncSettings.token = "rw-secret"
         XCTAssertEqual(CloudSyncSettings.serverURL, "https://vk-noop-cloud.fly.dev")
         XCTAssertEqual(CloudSyncSettings.token, "rw-secret")
-        XCTAssertTrue(CloudSyncSettings.isConfigured)
+        XCTAssertTrue(CloudSyncSettings.isConfigured(info: [:]))
 
         CloudSyncSettings.clear()
         XCTAssertNil(CloudSyncSettings.serverURL)
         XCTAssertNil(CloudSyncSettings.token)
-        XCTAssertFalse(CloudSyncSettings.isConfigured)
+        XCTAssertFalse(CloudSyncSettings.isConfigured(info: [:]))
     }
 
+    /// Same pure-seam reasoning as `testSaveLoadClearRoundTrip` above: `info: [:]` so a real bundle
+    /// CLOUDSYNC_TOKEN on this machine can't make the URL-only state read as already-configured.
     func testIsConfiguredRequiresBothValues() {
         CloudSyncSettings.serverURL = "https://vk-noop-cloud.fly.dev"
-        XCTAssertFalse(CloudSyncSettings.isConfigured)
+        XCTAssertFalse(CloudSyncSettings.isConfigured(info: [:]))
 
         CloudSyncSettings.token = "rw-secret"
-        XCTAssertTrue(CloudSyncSettings.isConfigured)
+        XCTAssertTrue(CloudSyncSettings.isConfigured(info: [:]))
     }
 
     func testEmptyStringClearsValue() {
@@ -198,10 +206,43 @@ final class CloudSyncSettingsTests: XCTestCase {
         XCTAssertFalse(CloudSyncSettings.isBundleConfigured)
     }
 
+    /// Uses `isBundleConfigured(info:)` with an explicit EMPTY info dict — the pure seam — rather than
+    /// the live, no-arg `isBundleConfigured`. This machine's `OuraSecrets.xcconfig` carries real
+    /// CLOUDSYNC_URL/CLOUDSYNC_TOKEN values, which reach `Bundle.main.infoDictionary` at test-run
+    /// time, so the live property now genuinely reads true here — asserting against it directly would
+    /// make this test fail specifically BECAUSE the zero-touch bundle credentials are configured
+    /// correctly. `info: [:]` tests the "no bundle creds" branch deterministically instead.
     func testIsBundleConfiguredFalseWithNoKeychainAndNoBundleCreds() {
-        // Fresh state (clear()'d in setUp): no Keychain values, and the StrandTests bundle carries no
-        // CLOUDSYNC_* Info.plist keys, so this must read false, not silently true.
-        XCTAssertFalse(CloudSyncSettings.isBundleConfigured)
+        // Fresh state (clear()'d in setUp): no Keychain values, and a synthetic empty info dict, so
+        // this must read false, not silently true.
+        XCTAssertFalse(CloudSyncSettings.isBundleConfigured(info: [:]))
+    }
+
+    // MARK: - Bundle URL validation (fold-in: a malformed CLOUDSYNC_URL is treated as absent)
+
+    /// Pure, no `Bundle`/Keychain dependency — the same shape check `CloudSyncModel.saveSettings`
+    /// runs before a manually-entered URL is ever written to the Keychain.
+    func testIsValidServerURLAcceptsAbsoluteURLWithSchemeAndHost() {
+        XCTAssertTrue(CloudSyncSettings.isValidServerURL("https://vk-noop-cloud.fly.dev"))
+        XCTAssertTrue(CloudSyncSettings.isValidServerURL("http://localhost:8080"))
+    }
+
+    func testIsValidServerURLRejectsMissingSchemeOrHost() {
+        XCTAssertFalse(CloudSyncSettings.isValidServerURL("not a url"))
+        XCTAssertFalse(CloudSyncSettings.isValidServerURL(""))
+        XCTAssertFalse(CloudSyncSettings.isValidServerURL("justapath"))
+        XCTAssertFalse(CloudSyncSettings.isValidServerURL("vk-noop-cloud.fly.dev"))   // no scheme
+        XCTAssertFalse(CloudSyncSettings.isValidServerURL("https://"))                // no host
+    }
+
+    /// A malformed bundle URL must be treated as absent by BOTH `effectiveURL` and `isConfigured` —
+    /// not just the former. `isConfigured(info:)` derives its URL half from the same `effectiveValue`
+    /// call as `effectiveURL`, so this pins the two together: a build never ends up with the "Sync
+    /// now" button enabled (`isConfigured` true) while `effectiveURL` itself reads nil and the button
+    /// would immediately fail with "Add your noop-cloud server URL and token first."
+    func testIsConfiguredFalseWhenBundleURLIsMalformedEvenWithATokenPresent() {
+        XCTAssertFalse(CloudSyncSettings.isConfigured(info: ["CLOUDSYNC_URL": "not a url",
+                                                              "CLOUDSYNC_TOKEN": "some-token"]))
     }
 }
 #endif // CLOUD_SYNC

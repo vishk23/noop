@@ -442,6 +442,11 @@ struct DataSourcesView: View {
     /// The "Sync now" button (+ busy spinner) and status line — identical whichever fields are
     /// showing. Its own `VStack` (not a bare `Group`) so it's always a full, independent sibling in
     /// whichever outer `VStack` hosts it, never flattened sideways into a parent `HStack`.
+    ///
+    /// Falls back to the PERSISTED status (Finding 2) when this card's own `cloudSync.statusText` is
+    /// nil — e.g. right after launch, when the zero-touch auto-sync ran on its own throwaway
+    /// `CloudSyncModel` instance (see `CloudSyncGate`'s doc comment) and this screen's `@StateObject`
+    /// never saw it happen. A plain `UserDefaults` read on render, no cross-instance observation.
     private var cloudSyncSyncRow: some View {
         VStack(alignment: .leading, spacing: NoopMetrics.space3) {
             HStack(spacing: NoopMetrics.space3) {
@@ -456,6 +461,8 @@ struct DataSourcesView: View {
             }
             if let s = cloudSync.statusText {
                 Text(s).font(StrandFont.subhead).foregroundStyle(StrandPalette.textSecondary)
+            } else if let last = CloudSyncModel.lastPersistedStatus {
+                Text("Last sync: \(last)").font(StrandFont.subhead).foregroundStyle(StrandPalette.textSecondary)
             }
         }
     }

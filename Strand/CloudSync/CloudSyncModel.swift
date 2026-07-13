@@ -8,6 +8,32 @@ import WhoopStore
 import UIKit
 #endif
 
+/// Process-wide reentrancy guard for the cloud-sync lane. `busy` on a `CloudSyncModel` INSTANCE only
+/// guards within that one instance — but `autoSyncIfDue` runs on a throwaway `CloudSyncModel()`
+/// created fresh in `RootView`/`RootTabView`'s launch `.task` (a new instance every launch), while
+/// `DataSourcesView` holds its OWN long-lived `@StateObject` instance. Two different instances means
+/// two different `busy` flags: a manual "Sync now" tap on the Data Sources card can't see that the
+/// launch-time auto-sync (on its own throwaway instance) is already mid-upload, and vice versa — both
+/// would happily run `CloudSyncUploader.upload` concurrently against the same on-disk store and the
+/// same server. An `actor` serializes access to its own state automatically, making it the natural
+/// process-wide singleton shape here — `shared` is the one gate for the whole process.
+actor CloudSyncGate {
+    static let shared = CloudSyncGate()
+    private var inFlight = false
+
+    /// Claims the gate if it's free. Returns false (and claims nothing) if a sync is already running.
+    func begin() -> Bool {
+        if inFlight { return false }
+        inFlight = true
+        return true
+    }
+
+    /// Releases the gate. Must be called exactly once for every `begin()` that returned true.
+    func end() {
+        inFlight = false
+    }
+}
+
 /// Drives the Data Sources "Cloud Sync" card: save the noop-cloud server URL + token → pull confirmed
 /// edits → apply them locally → (iOS) re-export whatever changed into Apple Health. @MainActor so every
 /// `@Published` mutation is main-thread; the network/apply/write-back work hops off-main.
@@ -84,53 +110,109 @@ final class CloudSyncModel: ObservableObject {
     /// edits — the two halves of "zero-touch" in one round trip: this device's own data reaches the
     /// server, and any edits confirmed elsewhere reach this device. Stamps
     /// `UserDefaults["cloudsync.lastAutoSync"]` on SUCCESS ONLY, so a failed attempt (server
-    /// unreachable, network down) never blocks the next 20h-gated retry. Used by both the
-    /// user-initiated "Sync now" button and `autoSyncIfDue`'s on-launch catch-up — a manual tap also
-    /// resets the on-launch catch-up clock, so it doesn't immediately re-fire on the next launch.
+    /// unreachable, network down) never blocks the next 20h-gated retry. Used by the user-initiated
+    /// "Sync now" button; `autoSyncIfDue`'s on-launch catch-up runs the identical `performSync` body
+    /// under its own gated `Task` rather than calling this (see `runGatedSync`'s doc comment) — but a
+    /// manual tap still resets the SAME on-launch catch-up clock (`Self.lastAutoSyncKey`, written
+    /// inside `performSync`), so it doesn't immediately re-fire on the next launch.
     func syncNow(repo: Repository) {
         guard let urlString = CloudSyncSettings.effectiveURL, let token = CloudSyncSettings.effectiveToken,
               let url = URL(string: urlString) else {
             statusText = "Add your noop-cloud server URL and token first."
             return
         }
-        setBusy(true); statusText = "Uploading…"
-        Task {
-            var line: String
-            var succeeded = false
-            if let store = await repo.storeHandle() {
-                let client = CloudSyncClient(baseURL: url, token: token)
-                do {
-                    let uploaded = try await CloudSyncUploader.upload(store: store, client: client)
-                    let mb = Double(uploaded.bytes) / 1_048_576.0
-                    statusText = String(format: "Uploaded %.1f MB · pulling edits…", mb)
+        Task { await runGatedSync(repo: repo, url: url, token: token) }
+    }
 
-                    let summary = try await CloudSyncCoordinator.pull(store: store, client: client)
-                    var parts = [String(format: "Uploaded %.1f MB", mb),
-                                 "Applied \(summary.applied)", "skipped \(summary.skipped)"]
-                    if summary.needsAttention > 0 { parts.append("\(summary.needsAttention) attention") }
-                    line = parts.joined(separator: " · ")
-                    succeeded = true
-                    #if os(iOS) && canImport(HealthKit)
-                    line += await reExportToAppleHealthIfNeeded(repo: repo, store: store, summary: summary)
-                    #endif
-                } catch {
-                    line = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
-                }
-            } else {
-                line = "No local store."
-            }
-            statusText = line
-            if succeeded {
-                UserDefaults.standard.set(Date().timeIntervalSince1970, forKey: Self.lastAutoSyncKey)
-            }
-            await repo.refresh()
-            setBusy(false)
+    /// Acquires the process-wide `CloudSyncGate`, runs `performSync`, and always releases it —
+    /// written out as one linear sequence rather than `defer` (which can't `await`). This is safe
+    /// specifically because `performSync` never throws and never returns early once it starts: every
+    /// internal failure is caught inside it and folded into its own status-line string (see its
+    /// body), so falling off the end of this function really does mean "released on every exit path."
+    /// Shared by `syncNow` and `autoSyncIfDue` — each spawns its own `Task` calling this — rather than
+    /// having `autoSyncIfDue` acquire the gate and then call `syncNow` (which would try to acquire it
+    /// again and immediately see it as already held by the very call chain it's part of, bailing with
+    /// "Sync already in progress" on every auto-sync).
+    private func runGatedSync(repo: Repository, url: URL, token: String) async {
+        guard await CloudSyncGate.shared.begin() else {
+            statusText = "Sync already in progress"
+            return
         }
+        await performSync(repo: repo, url: url, token: token)
+        await CloudSyncGate.shared.end()
+    }
+
+    /// The actual upload + pull work, gated by `runGatedSync` — never called directly. Byte-identical
+    /// to `syncNow`'s pre-gate Task body, plus persisting the outcome for the Data Sources card to
+    /// read back (Finding 2: `CloudSyncModel.persistLastStatus`, below).
+    private func performSync(repo: Repository, url: URL, token: String) async {
+        setBusy(true); statusText = "Uploading…"
+        var line: String
+        var succeeded = false
+        if let store = await repo.storeHandle() {
+            let client = CloudSyncClient(baseURL: url, token: token)
+            do {
+                let uploaded = try await CloudSyncUploader.upload(store: store, client: client)
+                let mb = Double(uploaded.bytes) / 1_048_576.0
+                statusText = String(format: "Uploaded %.1f MB · pulling edits…", mb)
+
+                let summary = try await CloudSyncCoordinator.pull(store: store, client: client)
+                var parts = [String(format: "Uploaded %.1f MB", mb),
+                             "Applied \(summary.applied)", "skipped \(summary.skipped)"]
+                if summary.needsAttention > 0 { parts.append("\(summary.needsAttention) attention") }
+                line = parts.joined(separator: " · ")
+                succeeded = true
+                #if os(iOS) && canImport(HealthKit)
+                line += await reExportToAppleHealthIfNeeded(repo: repo, store: store, summary: summary)
+                #endif
+            } catch {
+                line = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+            }
+        } else {
+            line = "No local store."
+        }
+        statusText = line
+        if succeeded {
+            UserDefaults.standard.set(Date().timeIntervalSince1970, forKey: Self.lastAutoSyncKey)
+        }
+        Self.persistLastStatus(line)
+        await repo.refresh()
+        setBusy(false)
     }
 
     /// UserDefaults key for the last successful `syncNow` (manual or automatic) — read by
-    /// `autoSyncIfDue`, written by `syncNow` on success only.
+    /// `autoSyncIfDue`, written by `performSync` on success only.
     private static let lastAutoSyncKey = "cloudsync.lastAutoSync"
+
+    /// UserDefaults key for the outcome of the last sync attempt, success OR failure, persisted by
+    /// `performSync` on EVERY completion (Finding 2). Read directly by the Data Sources card so an
+    /// auto-sync that ran on a throwaway `CloudSyncModel` instance (see `CloudSyncGate`'s doc comment)
+    /// is still visible on the card's own instance, whose `statusText` never saw it happen.
+    private static let lastStatusKey = "cloudsync.lastStatus"
+
+    /// The last sync's outcome, formatted for display ("<line> · <short time>"), or nil if no sync
+    /// has ever completed on this device. A plain synchronous UserDefaults read — deliberately not
+    /// reactive/`@Published`: `performSync` always ends with a `repo.refresh()`, which already
+    /// re-renders the screens that observe `repo`, so the next render picks up a fresh value with no
+    /// extra observation machinery.
+    static var lastPersistedStatus: String? {
+        UserDefaults.standard.string(forKey: lastStatusKey)
+    }
+
+    private static let shortTimeFormatter: DateFormatter = {
+        let f = DateFormatter()
+        f.dateStyle = .none
+        f.timeStyle = .short
+        return f
+    }()
+
+    /// Persist `line` (the human-readable outcome `performSync` just computed) plus a short local
+    /// time, so a later launch's Data Sources card can show "Last sync: …" even when ITS OWN
+    /// `statusText` is nil — e.g. right after launch, before that screen's own `CloudSyncModel`
+    /// `@StateObject` has run a sync itself.
+    private static func persistLastStatus(_ line: String) {
+        UserDefaults.standard.set("\(line) · \(shortTimeFormatter.string(from: Date()))", forKey: lastStatusKey)
+    }
 
     /// Pure 20h gate, `(lastRun, now) -> Bool`, so the threshold is unit-testable without UserDefaults,
     /// a store, or a network (see `CloudSyncModelAutoSyncGateTests`). `lastRun == 0` (never synced) is
@@ -145,16 +227,20 @@ final class CloudSyncModel: ObservableObject {
 
     /// On-launch daily catch-up (Phase 3.5: zero-touch): silently no-ops when the lane isn't configured
     /// — `CloudSyncSettings.isConfigured` already covers both a bundle-injected build and a manual
-    /// Keychain save — otherwise fires `syncNow` when it's been >20h since the last success. Call-time
-    /// `repo:` parameter, same reason as every other method here (see the `@StateObject` declaration's
-    /// note). A plain (non-`async`) MainActor call, mirroring `pullNow`/`syncNow`'s own shape: it
-    /// spawns its OWN `Task` internally and returns immediately, so a caller on the launch-critical path
-    /// (`RootView`/`RootTabView`'s `.task`) is never blocked waiting on the network.
+    /// Keychain save — otherwise runs the same gated sync as `syncNow` when it's been >20h since the
+    /// last success. Call-time `repo:` parameter, same reason as every other method here (see the
+    /// `@StateObject` declaration's note). A plain (non-`async`) MainActor call, mirroring
+    /// `pullNow`/`syncNow`'s own shape: it spawns its OWN `Task` internally and returns immediately, so
+    /// a caller on the launch-critical path (`RootView`/`RootTabView`'s `.task`) is never blocked
+    /// waiting on the network. Deliberately does NOT call `syncNow(repo:)` — see `runGatedSync`'s doc
+    /// comment for why that would self-deadlock the gate.
     func autoSyncIfDue(repo: Repository) {
         guard CloudSyncSettings.isConfigured else { return }
         let last = UserDefaults.standard.double(forKey: Self.lastAutoSyncKey)
         guard Self.isAutoSyncDue(lastRun: last, now: Date().timeIntervalSince1970) else { return }
-        syncNow(repo: repo)
+        guard let urlString = CloudSyncSettings.effectiveURL, let token = CloudSyncSettings.effectiveToken,
+              let url = URL(string: urlString) else { return }
+        Task { await runGatedSync(repo: repo, url: url, token: token) }
     }
 
     #if os(iOS) && canImport(HealthKit)

@@ -37,7 +37,26 @@ enum CloudSyncSettings {
     /// True once both an EFFECTIVE server URL and token are available — a Keychain value, a
     /// bundle-injected one, or a mix of both. Phase 3.5 (zero-touch): a bundle-only install counts as
     /// configured with no Keychain write ever happening.
-    static var isConfigured: Bool { effectiveURL != nil && effectiveToken != nil }
+    static var isConfigured: Bool { isConfigured(info: Bundle.main.infoDictionary ?? [:]) }
+
+    /// Testable variant of `isConfigured`: identical Keychain-wins-over-bundle precedence, but takes
+    /// an explicit info dict instead of reading live `Bundle.main`. Keychain state never needed a seam
+    /// — a test can already set/clear it directly via `serverURL`/`token`/`clear()` — only the bundle
+    /// side was unswappable. Pass `info: [:]` to assert "Keychain-only" behaviour deterministically,
+    /// regardless of whatever CLOUDSYNC_URL/CLOUDSYNC_TOKEN this test PROCESS's real bundle happens to
+    /// carry: once a personal `OuraSecrets.xcconfig` carries real cloud-sync credentials, the live,
+    /// no-arg `isConfigured` reads true even with the Keychain cleared, which the original
+    /// bundle-unaware `CloudSyncSettingsTests` didn't anticipate (see that file's history).
+    ///
+    /// Also runs the URL through `isValidServerURL`, same as `effectiveURL` — this must stay in sync
+    /// with `effectiveURL`'s own validation (both derive the URL half from the same `effectiveValue`
+    /// call), or `isConfigured` could read true for a malformed bundle URL that `effectiveURL` itself
+    /// then reads as nil, enabling a "Sync now" button that immediately fails.
+    static func isConfigured(info: [String: Any]) -> Bool {
+        guard let url = effectiveValue(keychain: serverURL, infoKey: "CLOUDSYNC_URL", info: info),
+              isValidServerURL(url) else { return false }
+        return effectiveValue(keychain: token, infoKey: "CLOUDSYNC_TOKEN", info: info) != nil
+    }
 
     /// Remove both stored values.
     static func clear() {
@@ -69,9 +88,17 @@ enum CloudSyncSettings {
     /// The noop-cloud server URL a manual Save in the Data Sources card wrote to the Keychain, or the
     /// build-injected `CLOUDSYNC_URL` (from the untracked `OuraSecrets.xcconfig` → project.yml →
     /// Info.plist chain — see `OuraCredentials.swift`'s doc comment for the identical pattern) when no
-    /// Keychain override exists. nil disables the whole cloud-sync lane.
+    /// Keychain override exists. nil disables the whole cloud-sync lane. Runs the merged value through
+    /// `isValidServerURL` before returning it — a Keychain value already passed that exact check at
+    /// `CloudSyncModel.saveSettings` time (so this is a no-op there), but a bundle-injected URL from
+    /// Info.plist is never validated anywhere else, so a malformed `CLOUDSYNC_URL` xcconfig value is
+    /// caught here instead of reaching `CloudSyncClient.url(path:query:)`'s force-unwrapped
+    /// `URLComponents`-built request URL and crashing at the first sync.
     static var effectiveURL: String? {
-        effectiveValue(keychain: serverURL, infoKey: "CLOUDSYNC_URL", info: Bundle.main.infoDictionary ?? [:])
+        guard let raw = effectiveValue(keychain: serverURL, infoKey: "CLOUDSYNC_URL",
+                                        info: Bundle.main.infoDictionary ?? [:]),
+              isValidServerURL(raw) else { return nil }
+        return raw
     }
 
     /// The read-write token, same Keychain-wins-over-bundle precedence as `effectiveURL`.
@@ -79,14 +106,28 @@ enum CloudSyncSettings {
         effectiveValue(keychain: token, infoKey: "CLOUDSYNC_TOKEN", info: Bundle.main.infoDictionary ?? [:])
     }
 
+    /// True when `s` parses as an absolute URL with a scheme and host — the same shape check
+    /// `CloudSyncModel.saveSettings` runs before a manually-entered URL is ever written to the
+    /// Keychain. Internal (not `private`) so it's directly unit-testable — pure, no `Bundle`/Keychain
+    /// dependency at all.
+    static func isValidServerURL(_ s: String) -> Bool {
+        guard let comps = URLComponents(string: s), let scheme = comps.scheme, !scheme.isEmpty,
+              let host = comps.host, !host.isEmpty else { return false }
+        return true
+    }
+
     /// True when the lane is configured ENTIRELY from the bundle-injected build credentials, with no
     /// Keychain override at all. Drives the Data Sources card: bundle-configured shows a one-line
     /// "Configured from build" note instead of the URL/token fields; any Keychain value (even a
     /// partial one) falls through to the manual fields so a user's own in-progress edit is never
     /// silently hidden behind the collapsed summary.
-    static var isBundleConfigured: Bool {
+    static var isBundleConfigured: Bool { isBundleConfigured(info: Bundle.main.infoDictionary ?? [:]) }
+
+    /// Testable variant of `isBundleConfigured` — same shape as `isConfigured(info:)` above and for
+    /// the same reason (see its doc comment): pass `info: [:]` to assert "no bundle creds"
+    /// deterministically regardless of this test process's real `Bundle.main`.
+    static func isBundleConfigured(info: [String: Any]) -> Bool {
         guard serverURL == nil, token == nil else { return false }
-        let info = Bundle.main.infoDictionary ?? [:]
         return bundleValue("CLOUDSYNC_URL", from: info) != nil && bundleValue("CLOUDSYNC_TOKEN", from: info) != nil
     }
 
