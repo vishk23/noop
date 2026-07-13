@@ -120,9 +120,10 @@ final class CloudSyncModel: ObservableObject {
         }
     }
 
-    /// Upload this device's own `.noopbak` to the noop-cloud server, then pull + apply any confirmed
-    /// edits — the two halves of "zero-touch" in one round trip: this device's own data reaches the
-    /// server, and any edits confirmed elsewhere reach this device. Stamps
+    /// Pull + apply any confirmed edits, then upload this device's own `.noopbak` to the noop-cloud
+    /// server (skipped when nothing has changed since the last upload — see `performSync`'s doc
+    /// comment) — the two halves of "zero-touch" in one round trip: any edits confirmed elsewhere reach
+    /// this device, and this device's own (possibly just-corrected) data reaches the server. Stamps
     /// `UserDefaults["cloudsync.lastAutoSync"]` on SUCCESS ONLY, so a failed attempt (server
     /// unreachable, network down) never blocks the next 20h-gated retry. Used by the user-initiated
     /// "Sync now" button; `autoSyncIfDue`'s on-launch catch-up runs the identical `performSync` body
@@ -156,26 +157,37 @@ final class CloudSyncModel: ObservableObject {
         await CloudSyncGate.shared.end()
     }
 
-    /// The actual upload + pull work, gated by `runGatedSync` — never called directly. Byte-identical
+    /// The actual pull + upload work, gated by `runGatedSync` — never called directly. Byte-identical
     /// to `syncNow`'s pre-gate Task body, plus persisting the outcome for the Data Sources card to
     /// read back (Finding 2: `CloudSyncModel.persistLastStatus`, below).
+    ///
+    /// PULL-FIRST, UPLOAD-LAST (Cloud Sync v2 — reordered from the original upload-then-pull): pulling
+    /// and applying confirmed edits BEFORE this device uploads its own `.noopbak` means the upload
+    /// captures the just-corrected local state, so the server's mirror reflects THIS sync's edits
+    /// immediately — the original upload-first order sent the PRE-edit-application snapshot, so an
+    /// edit applied this sync only reached the server's mirror on the NEXT sync's upload, one full
+    /// cycle late. One consequence: a pull failure now aborts the whole sync before the upload ever
+    /// runs (previously the upload, which ran first, could still succeed even when the following pull
+    /// failed). That trade-off is intentional — an upload that ran anyway would still ship the stale
+    /// pre-edit state, exactly the problem this reorder fixes.
+    ///
+    /// SKIP-UNCHANGED UPLOAD: the upload only actually runs when `WhoopStore.contentToken()` (computed
+    /// AFTER pull/recompute, so a just-applied edit already counts) differs from the token saved after
+    /// the last successful upload FROM THIS DEVICE. A full re-export can be hundreds of MB; a device
+    /// that synced an hour ago with no new samples and no applied edits has nothing new to ship.
     private func performSync(repo: Repository, url: URL, token: String) async {
-        setBusy(true); statusText = "Uploading…"
+        setBusy(true); statusText = "Pulling edits…"
         var line: String
         var succeeded = false
         if let store = await repo.storeHandle() {
             let client = CloudSyncClient(baseURL: url, token: token)
             do {
-                let uploaded = try await CloudSyncUploader.upload(store: store, client: client)
-                let mb = Double(uploaded.bytes) / 1_048_576.0
-                statusText = String(format: "Uploaded %.1f MB · pulling edits…", mb)
-
                 let summary = try await CloudSyncCoordinator.pull(store: store, client: client)
-                var parts = [String(format: "Uploaded %.1f MB", mb),
-                             "Applied \(summary.applied)", "skipped \(summary.skipped)"]
+                var parts = ["Applied \(summary.applied)", "skipped \(summary.skipped)"]
                 if summary.needsAttention > 0 { parts.append("\(summary.needsAttention) attention") }
                 line = parts.joined(separator: " · ")
-                succeeded = true
+                statusText = line
+
                 // Rebuild the daily rollups before the Apple Health re-export, so the vitals it
                 // exports (which read dailyMetric) reflect the just-applied edits too.
                 var didRecompute = false
@@ -197,6 +209,29 @@ final class CloudSyncModel: ObservableObject {
                 line += await reExportToAppleHealthIfNeeded(repo: repo, store: store, summary: summary,
                                                             force: didRecompute)
                 #endif
+
+                // Skip-unchanged upload (Cloud Sync v2): computed AFTER pull/recompute above, so an
+                // edit this device just applied already makes the token differ from the last upload's
+                // — the corrected state uploads THIS sync, matching the pull-first reorder's whole
+                // point (see this method's doc comment). `try?`: a token-computation failure must not
+                // abort an otherwise-successful sync — it just falls through to "upload anyway", the
+                // same safe default as a first-ever sync (no saved token to compare against).
+                let freshToken = try? await store.contentToken()
+                let lastUploadToken = UserDefaults.standard.string(forKey: Self.lastUploadTokenKey)
+                if let freshToken, freshToken == lastUploadToken {
+                    parts.append("Up to date (nothing new to upload)")
+                    line = parts.joined(separator: " · ")
+                } else {
+                    statusText = "Uploading…"
+                    let uploaded = try await CloudSyncUploader.upload(store: store, client: client)
+                    let mb = Double(uploaded.bytes) / 1_048_576.0
+                    parts.append(String(format: "Uploaded %.1f MB", mb))
+                    line = parts.joined(separator: " · ")
+                    if let freshToken {
+                        UserDefaults.standard.set(freshToken, forKey: Self.lastUploadTokenKey)
+                    }
+                }
+                succeeded = true
             } catch {
                 line = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
             }
@@ -215,6 +250,16 @@ final class CloudSyncModel: ObservableObject {
     /// UserDefaults key for the last successful `syncNow` (manual or automatic) — read by
     /// `autoSyncIfDue`, written by `performSync` on success only.
     private static let lastAutoSyncKey = "cloudsync.lastAutoSync"
+
+    /// UserDefaults key for the `WhoopStore.contentToken()` value as of the last successful upload
+    /// FROM THIS DEVICE (Cloud Sync v2 skip-unchanged upload) — written by `performSync` only when an
+    /// upload actually ran and succeeded, never on a skip (a skip means the saved token is STILL
+    /// accurate) or a failure (a failed upload never shipped that token's content, so the NEXT sync
+    /// must still compare against whatever WAS last actually uploaded). Deliberately a `UserDefaults`
+    /// key, like `lastAutoSyncKey`/`lastStatusKey` above, not a `WhoopStore` cursor: it is per-device
+    /// sync bookkeeping about an UPLOAD this device performed, not data the store itself owns, and
+    /// `cursors` only stores `Int` values anyway (this token is a composite string).
+    private static let lastUploadTokenKey = "cloudsync.lastUploadToken"
 
     /// UserDefaults key for the outcome of the last sync attempt, success OR failure, persisted by
     /// `performSync` on EVERY completion (Finding 2). Read directly by the Data Sources card so an
