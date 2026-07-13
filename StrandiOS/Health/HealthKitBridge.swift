@@ -383,7 +383,6 @@ final class HealthKitBridge: ObservableObject {
         let hourlyStepsBackfilled = UserDefaults.standard.bool(forKey: HealthKitBridge.hourlyStepsBackfilledKey)
         let hourlyStepsStart: Date = hourlyStepsBackfilled ? start
             : (cal.date(byAdding: .day, value: -90, to: cal.startOfDay(for: end)) ?? start)
-        let hourlySteps = await collectHourlySteps(start: hourlyStepsStart, end: end)
 
         // Build + upsert the store rows under the apple-health source.
         let appleRows = byDay.map { (day, a) in
@@ -444,6 +443,10 @@ final class HealthKitBridge: ObservableObject {
         // lastSync — a false "success", and the next delta sync skipped the window. (Reimplemented
         // from @vulnix0x4's PR #375.)
         do {
+            // Collect hourly steps here (not before) so a transient HealthKit error throws to the
+            // catch block and prevents the backfill flag from permanently locking out the 90-day window.
+            let hourlySteps = try await collectHourlySteps(start: hourlyStepsStart, end: end)
+
             try await store.upsertAppleDaily(appleRows, deviceId: appleDeviceId)
             try await store.upsertDailyMetrics(dmRows, deviceId: appleDeviceId)
             try await store.upsertMetricSeries(points, deviceId: appleDeviceId)
@@ -906,9 +909,10 @@ final class HealthKitBridge: ObservableObject {
     /// `HKStatisticsCollectionQuery` shape but bucketed by HOUR instead of day so a backfill can show
     /// exactly which hours the phone was recording. `anchorDate` is local midnight — same anchor
     /// `collect()` uses for its daily buckets — so hour buckets fall on local-clock hour boundaries,
-    /// not UTC ones. Silently returns fewer (or zero) rows on a HealthKit query error, same as
-    /// `collect()`; the next foreground/background catch-up re-walks the window.
-    private func collectHourlySteps(start: Date, end: Date) async -> [(ts: Int, steps: Int)] {
+    /// not UTC ones. Throws on a HealthKit query error (distinguished from a genuinely-empty 90-day
+    /// window, which returns zero rows); a transient error will propagate to the sync's existing
+    /// `catch` block, preventing the backfill flag from permanently locking out the 90-day window.
+    private func collectHourlySteps(start: Date, end: Date) async throws -> [(ts: Int, steps: Int)] {
         guard let type = HKQuantityType.quantityType(forIdentifier: .stepCount) else { return [] }
         let cal = Calendar.current
         let anchor = cal.startOfDay(for: start)
@@ -916,11 +920,15 @@ final class HealthKitBridge: ObservableObject {
             HKQuery.predicateForSamples(withStart: start, end: end, options: .strictStartDate),
             Self.notNoopAuthored,
         ])
-        return await withCheckedContinuation { (cont: CheckedContinuation<[(ts: Int, steps: Int)], Never>) in
+        return try await withCheckedThrowingContinuation { (cont: CheckedContinuation<[(ts: Int, steps: Int)], Error>) in
             let q = HKStatisticsCollectionQuery(quantityType: type, quantitySamplePredicate: predicate,
                                                 options: .cumulativeSum, anchorDate: anchor,
                                                 intervalComponents: DateComponents(hour: 1))
-            q.initialResultsHandler = { _, results, _ in
+            q.initialResultsHandler = { _, results, error in
+                if let error {
+                    cont.resume(throwing: error)
+                    return
+                }
                 var rows: [(ts: Int, steps: Int)] = []
                 results?.enumerateStatistics(from: start, to: end) { stats, _ in
                     if let sum = stats.sumQuantity() {
