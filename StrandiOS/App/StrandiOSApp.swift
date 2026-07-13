@@ -14,6 +14,12 @@ import UserNotifications
 /// `RootTabView` so the iOS app keeps the same gating without depending on the macOS-only shell.
 @main
 struct StrandiOSApp: App {
+    #if CLOUD_SYNC
+    /// The ONLY reason this app has an AppDelegate at all — APNs device-token registration + silent
+    /// (content-available) push delivery are UIKit callbacks with no SwiftUI equivalent. See
+    /// `CloudSyncAppDelegate`'s doc comment. CLOUD_SYNC-gated so a default build links none of this.
+    @UIApplicationDelegateAdaptor(CloudSyncAppDelegate.self) private var cloudSyncAppDelegate
+    #endif
     @StateObject private var model: AppModel
     @StateObject private var health: HealthKitBridge
     /// The phone→watch link. Built + activated here so the watch app actually receives snapshots on a
@@ -58,6 +64,19 @@ struct StrandiOSApp: App {
         // BGTaskSchedulerPermittedIdentifiers). `schedule()` itself is NOT called here — only when the
         // app backgrounds (below) — so this alone doesn't consume the earliest-begin-date window.
         CloudSyncBackgroundRefresh.register(model: model)
+        // Hand the AppDelegate shim the model it needs for a push-triggered background sync (it has no
+        // other way to reach the shared Repository/IntelligenceEngine — see
+        // `CloudSyncAppDelegate.model`'s doc comment). Set BEFORE requesting registration below, so the
+        // model is never nil by the time a delegate callback could possibly fire.
+        CloudSyncAppDelegate.model = model
+        // APNs registration itself: request only when the lane is actually configured — an unconfigured
+        // device has no server to hand a token to. `NOOP.entitlements` doesn't carry `aps-environment`
+        // in this branch yet, so this will call `didFailToRegisterForRemoteNotificationsWithError` on
+        // every launch until the integrator adds it (see `CloudSyncAppDelegate`'s doc comment) — that's
+        // expected, not a bug.
+        if CloudSyncSettings.isConfigured {
+            UIApplication.shared.registerForRemoteNotifications()
+        }
         #endif
         _model = StateObject(wrappedValue: model)
         _health = StateObject(wrappedValue: HealthKitBridge(

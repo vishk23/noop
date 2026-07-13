@@ -90,6 +90,32 @@ final class CloudSyncClient {
         return (decoded.bytes, decoded.latestDay)
     }
 
+    // MARK: - Device registration (Cloud Sync v2: APNs silent-push wake)
+
+    /// POST /register-device, Bearer-authed, `{"token":"<hex>","platform":"ios"}` — hands the server
+    /// this device's APNs device token so it can wake this device with a silent (content-available)
+    /// push the moment a NEW edit is confirmed elsewhere, instead of only ever reaching it on the next
+    /// background-refresh/launch poll. `token` is the hex-encoded APNs device token (the caller,
+    /// `CloudSyncAppDelegate`, does the hex-encoding — this method just ships whatever string it's
+    /// given).
+    ///
+    /// The server endpoint ships in parallel with this client (code-complete ahead of it), so a 404
+    /// here is EXPECTED for a while — see `CloudSyncAppDelegate`'s call site for why that's treated as
+    /// benign rather than a real failure. Same uniform error contract as every other call on this
+    /// client (`CloudSyncError.badResponse` for any non-2xx status): no status-code special-casing
+    /// happens in here, that judgment call belongs to the caller.
+    func registerDevice(token: String) async throws {
+        var req = URLRequest(url: url(path: "register-device"))
+        req.httpMethod = "POST"
+        req.setValue("Bearer \(self.token)", forHTTPHeaderField: "Authorization")
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        req.httpBody = try JSONEncoder().encode(RegisterDeviceRequest(token: token, platform: "ios"))
+        let (data, status) = try await send(req)
+        guard (200..<300).contains(status) else {
+            throw CloudSyncError.badResponse(status, bodyPrefix(data))
+        }
+    }
+
     private func sendUpload(_ req: URLRequest, fromFile fileURL: URL) async throws -> (Data, Int) {
         do {
             let (data, resp) = try await session.upload(for: req, fromFile: fileURL)
@@ -130,6 +156,11 @@ private struct AckRequest: Encodable {
 
 private struct AckResponse: Decodable {
     let acked: Int
+}
+
+private struct RegisterDeviceRequest: Encodable {
+    let token: String
+    let platform: String
 }
 
 private struct IngestResponse: Decodable {

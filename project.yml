@@ -254,6 +254,12 @@ targets:
           # paths run. Cloud Sync v2's own BGAppRefreshTaskRequest (CloudSyncBackgroundRefresh) shares this
           # SAME "fetch" mode — one background mode covers every BGAppRefreshTask identifier in the app.
           - fetch
+          # Cloud Sync v2: required for iOS to wake the backgrounded app on a silent (content-available)
+          # APNs push (CloudSyncAppDelegate.didReceiveRemoteNotification). Code-complete ahead of the
+          # server/entitlement: `NOOP.entitlements` doesn't carry `aps-environment` in this branch yet
+          # (see CloudSyncAppDelegate's doc comment), so no push can actually arrive until that lands —
+          # this mode alone is inert without it, but harmless to declare early.
+          - remote-notification
         # #510: permit the scheduled debug auto-export's BGAppRefreshTask identifier. MUST match
         # ScheduledDebugExport.bgTaskIdentifier EXACTLY and be registered at launch (StrandiOSApp.init);
         # otherwise iOS refuses to schedule or deliver the background drop.
