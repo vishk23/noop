@@ -37,27 +37,51 @@ final class CloudSyncAppDelegate: NSObject, UIApplicationDelegate {
         guard let urlString = CloudSyncSettings.effectiveURL, let token = CloudSyncSettings.effectiveToken,
               let url = URL(string: urlString) else { return }
         let hexToken = deviceToken.map { String(format: "%02x", $0) }.joined()
+        // Breadcrumb (readable via the app container's preferences plist): which leg of
+        // token→POST last ran, so a silent registration failure is diagnosable without a debugger.
+        UserDefaults.standard.set("token-received \(Date())", forKey: Self.registrationBreadcrumbKey)
         let client = CloudSyncClient(baseURL: url, token: token)
         Task {
             do {
                 try await client.registerDevice(token: hexToken)
+                UserDefaults.standard.set("registered \(Date())", forKey: Self.registrationBreadcrumbKey)
             } catch CloudSyncError.badResponse(404, _) {
                 // Expected during rollout: the server's /register-device endpoint ships in parallel
                 // with this client. Benign — a fresh install, a token refresh (APNs rotates tokens
                 // occasionally), or simply the next relaunch after the server catches up will retry
                 // this same call, so there's nothing to recover here.
+                UserDefaults.standard.set("post-404 \(Date())", forKey: Self.registrationBreadcrumbKey)
             } catch {
                 // Any other failure (network down, non-404 error): log-not-crash, matching every other
                 // CloudSync network call's posture — push registration is a nice-to-have, never
                 // something worth surfacing to the user or aborting launch over.
+                UserDefaults.standard.set("post-error: \(error) \(Date())", forKey: Self.registrationBreadcrumbKey)
             }
         }
+    }
+
+    /// UserDefaults key for the registration breadcrumb above — diagnosis-only, never read by code.
+    static let registrationBreadcrumbKey = "cloudsync.push.lastRegistration"
+
+    /// Request APNs registration HERE — the canonical didFinishLaunching site — not from
+    /// `StrandiOSApp.init()`: a request made during the SwiftUI `App` struct's init runs BEFORE the
+    /// app finishes launching, and UIKit silently ignores it (found live: no token callback and no
+    /// failure callback ever fired; the breadcrumb below never advanced past absent).
+    func application(_ application: UIApplication,
+                     didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]? = nil) -> Bool {
+        if CloudSyncSettings.effectiveURL != nil, CloudSyncSettings.effectiveToken != nil {
+            UserDefaults.standard.set("requested \(Date())", forKey: Self.registrationBreadcrumbKey)
+            application.registerForRemoteNotifications()
+        }
+        return true
     }
 
     /// Expected on EVERY launch of this branch (see the type's doc comment: no `aps-environment`
     /// entitlement yet). Silent — there is no user-facing push-status UI to update, and the
     /// BGAppRefreshTask + on-launch catch-up paths cover the same ground without APNs at all.
     func application(_ application: UIApplication, didFailToRegisterForRemoteNotificationsWithError error: Error) {
+        UserDefaults.standard.set("os-fail: \(error.localizedDescription) \(Date())",
+                                  forKey: Self.registrationBreadcrumbKey)
     }
 
     /// A silent (content-available) push arrived: run the SAME gated background sync the
@@ -84,7 +108,10 @@ final class CloudSyncAppDelegate: NSObject, UIApplicationDelegate {
             await repository.refresh()
         }
         Task {
-            let ran = await cloudSync.backgroundSyncIfDue(repo: repository)
+            // Unconditional (CloudSyncGate-guarded) — see `syncFromPush`'s doc comment: the 4h
+            // staleness gate belongs to the OS-initiated BGAppRefresh path, not to an explicit
+            // server-side request for fresh data.
+            let ran = await cloudSync.syncFromPush(repo: repository)
             completionHandler(ran ? .newData : .noData)
         }
     }

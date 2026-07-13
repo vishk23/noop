@@ -69,14 +69,11 @@ struct StrandiOSApp: App {
         // `CloudSyncAppDelegate.model`'s doc comment). Set BEFORE requesting registration below, so the
         // model is never nil by the time a delegate callback could possibly fire.
         CloudSyncAppDelegate.model = model
-        // APNs registration itself: request only when the lane is actually configured — an unconfigured
-        // device has no server to hand a token to. Gate on the EFFECTIVE credentials (Keychain OR the
-        // Phase-3.5 bundle injection), NOT `isConfigured`: `isConfigured` is Keychain-only, so a
-        // zero-touch bundle-credentialed device (the normal personal setup) would never register —
-        // found live: devices stayed 0 after the entitlement landed because this gate never opened.
-        if CloudSyncSettings.effectiveURL != nil, CloudSyncSettings.effectiveToken != nil {
-            UIApplication.shared.registerForRemoteNotifications()
-        }
+        // APNs registration itself lives in `CloudSyncAppDelegate.didFinishLaunching` — NOT here:
+        // a registerForRemoteNotifications() call made during this init runs before the app finishes
+        // launching, and UIKit silently ignores it (no token callback, no failure callback — found
+        // live). The delegate requests it at the canonical launch point, gated on the same EFFECTIVE
+        // (Keychain-or-bundle) credentials.
         #endif
         _model = StateObject(wrappedValue: model)
         _health = StateObject(wrappedValue: HealthKitBridge(

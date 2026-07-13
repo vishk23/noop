@@ -366,10 +366,25 @@ final class CloudSyncModel: ObservableObject {
     @discardableResult
     func backgroundSyncIfDue(repo: Repository) async -> Bool {
         guard !Self.isRunningUnderXCTest else { return false }
-        guard CloudSyncSettings.isConfigured else { return false }
+        // Effective (Keychain OR bundle) credentials are the configuration check — `isConfigured`
+        // is Keychain-only and would keep a zero-touch bundle-credentialed device gated forever.
         let last = UserDefaults.standard.double(forKey: Self.lastAutoSyncKey)
         guard Self.isAutoSyncDue(lastRun: last, now: Date().timeIntervalSince1970,
                                   intervalS: Self.backgroundSyncIntervalS) else { return false }
+        guard let urlString = CloudSyncSettings.effectiveURL, let token = CloudSyncSettings.effectiveToken,
+              let url = URL(string: urlString) else { return false }
+        await runGatedSync(repo: repo, url: url, token: token)
+        return true
+    }
+
+    /// Push-triggered sync (`request_sync` → APNs silent push → here): UNCONDITIONAL, no staleness
+    /// gate — the push already carries intent ("an agent wants fresh data NOW"; the server throttles
+    /// request_sync to one push per 120s), so routing it through `backgroundSyncIfDue`'s 4h gate
+    /// would silently ignore exactly the syncs the feature exists to perform. Overlap safety is
+    /// `runGatedSync`'s CloudSyncGate, same as every other entry point.
+    @discardableResult
+    func syncFromPush(repo: Repository) async -> Bool {
+        guard !Self.isRunningUnderXCTest else { return false }
         guard let urlString = CloudSyncSettings.effectiveURL, let token = CloudSyncSettings.effectiveToken,
               let url = URL(string: urlString) else { return false }
         await runGatedSync(repo: repo, url: url, token: token)
