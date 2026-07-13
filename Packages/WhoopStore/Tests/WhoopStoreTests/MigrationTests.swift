@@ -96,4 +96,44 @@ final class MigrationTests: XCTestCase {
         let cols = try await store.columnNamesForTest(table: "pairedDevice")
         XCTAssertTrue(cols.contains("peripheralId"), "pairedDevice missing v16 peripheralId column")
     }
+
+    /// v26 heals `deviceId = 'oura-api'` rows written with Oura's native 0-100 `efficiency` (before the
+    /// OuraApiParser fix) back to NOOP's 0-1 fraction convention. UPDATE-only: seed rows at the v25
+    /// schema (i.e. BEFORE v26 has run), then apply the rest of the migrator and confirm the heal.
+    func testV26HealsOuraEfficiencyPercentToFraction() async throws {
+        let dbQueue = try DatabaseQueue()
+        try WhoopStore.makeMigrator().migrate(dbQueue, upTo: "v25-oura-raw")
+        try await dbQueue.write { db in
+            // oura-api, bad (percent) → must be healed to a fraction.
+            try db.execute(sql: """
+                INSERT INTO sleepSession (deviceId, startTs, endTs, efficiency) VALUES ('oura-api', 100, 200, 90)
+                """)
+            try db.execute(sql: """
+                INSERT INTO dailyMetric (deviceId, day, efficiency) VALUES ('oura-api', '2026-01-01', 90)
+                """)
+            // oura-api, already a fraction → must be left unchanged (idempotent predicate: efficiency > 1.5).
+            try db.execute(sql: """
+                INSERT INTO sleepSession (deviceId, startTs, endTs, efficiency) VALUES ('oura-api', 300, 400, 0.9)
+                """)
+            try db.execute(sql: """
+                INSERT INTO dailyMetric (deviceId, day, efficiency) VALUES ('oura-api', '2026-01-02', 0.9)
+                """)
+            // A non-Oura row above the threshold must be left alone — the heal is deviceId-scoped.
+            try db.execute(sql: """
+                INSERT INTO sleepSession (deviceId, startTs, endTs, efficiency) VALUES ('my-whoop', 500, 600, 90)
+                """)
+        }
+
+        // Apply the FULL migrator: GRDB resumes from the already-applied v25, so only v26 runs here.
+        try WhoopStore.makeMigrator().migrate(dbQueue)
+
+        try await dbQueue.read { db in
+            XCTAssertEqual(try Double.fetchOne(db, sql: "SELECT efficiency FROM sleepSession WHERE startTs = 100"), 0.9)
+            XCTAssertEqual(try Double.fetchOne(db, sql: "SELECT efficiency FROM sleepSession WHERE startTs = 300"), 0.9)
+            XCTAssertEqual(try Double.fetchOne(db, sql: "SELECT efficiency FROM sleepSession WHERE startTs = 500"), 90,
+                           "a non-oura-api row must not be touched by the deviceId-scoped heal")
+            XCTAssertEqual(try Double.fetchOne(db, sql: "SELECT efficiency FROM dailyMetric WHERE day = '2026-01-01'"), 0.9)
+            XCTAssertEqual(try Double.fetchOne(db, sql: "SELECT efficiency FROM dailyMetric WHERE day = '2026-01-02'"), 0.9)
+        }
+    }
 }

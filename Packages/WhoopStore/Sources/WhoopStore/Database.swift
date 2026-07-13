@@ -500,6 +500,29 @@ extension WhoopStore {
             try db.create(index: "idx_ouraRaw_device_endpoint_day",
                           on: "ouraRaw", columns: ["deviceId", "endpoint", "day"])
         }
+
+        // v26 (Oura efficiency unit heal): the Oura API importer (OuraApiParser.swift) wrote Oura's
+        // native 0-100 integer `efficiency` straight into sleepSession.efficiency / dailyMetric.efficiency,
+        // but NOOP's own sleep pipeline (StrandAnalytics) stores that shared column as a 0-1 FRACTION
+        // everywhere it computes it (asleep ÷ in-bed) — same column, two scales for oura-api rows written
+        // before the importer fix. UPDATE-only, NO schema change: divides `efficiency` by 100 for every
+        // `deviceId = 'oura-api'` row where it's > 1.5 — a threshold no genuine fraction can exceed (max
+        // 1.0) and no genuine Oura percent can fall under (Oura's lowest real efficiency is well above
+        // 1.5%), so the predicate can't touch an already-correct row. Idempotent: a second run finds
+        // nothing left above the threshold. Scoped to deviceId so WHOOP-native and other-brand rows are
+        // never touched. No Android migration twin: this only heals data written by the Swift-only,
+        // OURA_CLOUD_IMPORT-gated cloud importer — android/ has no equivalent Oura REST/API import path
+        // (its `com.noop.oura` package is the BLE ring driver, unrelated).
+        migrator.registerMigration("v26-oura-efficiency-heal") { db in
+            try db.execute(sql: """
+                UPDATE sleepSession SET efficiency = efficiency / 100.0
+                WHERE deviceId = 'oura-api' AND efficiency > 1.5
+                """)
+            try db.execute(sql: """
+                UPDATE dailyMetric SET efficiency = efficiency / 100.0
+                WHERE deviceId = 'oura-api' AND efficiency > 1.5
+                """)
+        }
         return migrator
     }
 }
