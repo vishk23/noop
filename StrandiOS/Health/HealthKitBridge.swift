@@ -451,9 +451,16 @@ final class HealthKitBridge: ObservableObject {
             try await store.upsertDailyMetrics(dmRows, deviceId: appleDeviceId)
             try await store.upsertMetricSeries(points, deviceId: appleDeviceId)
             if !workoutRows.isEmpty { try await store.upsertWorkouts(workoutRows, deviceId: appleDeviceId) }
-            if !hourlySteps.isEmpty { try await store.upsertAppleStepHours(hourlySteps, deviceId: appleDeviceId) }
-            if !hourlyStepsBackfilled {
-                UserDefaults.standard.set(true, forKey: HealthKitBridge.hourlyStepsBackfilledKey)
+            // Only mark the backfill done once hourly data actually lands. HealthKit returns EMPTY
+            // (not an error) when step read-access is denied, and users grant Health scopes
+            // incrementally — so gating on non-empty, not just no-throw, stops a deny-then-grant
+            // sequence from burning the one-time 90-day widen before the user ever authorizes steps.
+            // A genuinely step-less window just re-scans next sync: cheap, bounded, self-healing.
+            if !hourlySteps.isEmpty {
+                try await store.upsertAppleStepHours(hourlySteps, deviceId: appleDeviceId)
+                if !hourlyStepsBackfilled {
+                    UserDefaults.standard.set(true, forKey: HealthKitBridge.hourlyStepsBackfilledKey)
+                }
             }
             try await writeBack(whoopStore: store)
             lastSync = Date()
