@@ -451,6 +451,13 @@ struct DataSourcesView: View {
         VStack(alignment: .leading, spacing: NoopMetrics.space3) {
             HStack(spacing: NoopMetrics.space3) {
                 Button {
+                    // Recompute rollups after applied edits — see CloudSyncModel.postApplyRefresh.
+                    let intelligence = model.intelligence
+                    let repository = repo
+                    cloudSync.postApplyRefresh = {
+                        await intelligence.analyzeRecent()
+                        await repository.refresh()
+                    }
                     cloudSync.syncNow(repo: repo)
                 } label: {
                     Label(cloudSync.busy ? "Syncing…" : "Sync now", systemImage: "arrow.triangle.2.circlepath")

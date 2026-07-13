@@ -189,6 +189,7 @@ struct RootView: View {
     // status pill is isolated into SidebarStatus so HR/frame ticks don't re-render the whole
     // NavigationSplitView shell + sidebar list.
     @EnvironmentObject var repo: Repository
+    @EnvironmentObject var model: AppModel
     /// Cross-screen navigation requests (e.g. Live → "Manage devices"). Observed here so a screen can
     /// switch the sidebar selection without owning it — see `NavRouter`.
     @EnvironmentObject var router: NavRouter
@@ -309,7 +310,14 @@ struct RootView: View {
             // whose async functions the CALLER wraps in `Task.detached` — this needs no detached wrapper
             // of its own to stay off the launch-critical path. The 20h gate lives in
             // `CloudSyncModel.isAutoSyncDue`.
-            CloudSyncModel().autoSyncIfDue(repo: repo)
+            let cloudSync = CloudSyncModel()
+            let intelligence = model.intelligence
+            let repository = repo
+            cloudSync.postApplyRefresh = {
+                await intelligence.analyzeRecent()
+                await repository.refresh()
+            }
+            cloudSync.autoSyncIfDue(repo: repo)
             #endif
         }
         // Honour a cross-screen request to open a top-level destination (e.g. Live's "Manage devices"),

@@ -7,6 +7,7 @@ import StrandDesign
 /// "More" list. Every screen is the same `StrandDesign`-built view the macOS app uses.
 struct RootTabView: View {
     @EnvironmentObject private var repo: Repository
+    @EnvironmentObject private var model: AppModel
     /// Cross-screen navigation requests (e.g. Live → "Manage devices"). Devices isn't a tab — it lives
     /// behind the More list — so a request presents it as a sheet, matching the quick-action screens.
     @EnvironmentObject private var router: NavRouter
@@ -122,7 +123,14 @@ struct RootTabView: View {
             #if CLOUD_SYNC
             // Cloud Sync: zero-touch on-launch catch-up (see RootView's identical wiring). No detached
             // wrapper needed — `autoSyncIfDue` spawns its own `Task` internally and returns immediately.
-            CloudSyncModel().autoSyncIfDue(repo: repo)
+            let cloudSync = CloudSyncModel()
+            let intelligence = model.intelligence
+            let repository = repo
+            cloudSync.postApplyRefresh = {
+                await intelligence.analyzeRecent()
+                await repository.refresh()
+            }
+            cloudSync.autoSyncIfDue(repo: repo)
             #endif
         }
         // Quick-action sheet presents with the calm easing (~0.42s) per the README sheet spec —

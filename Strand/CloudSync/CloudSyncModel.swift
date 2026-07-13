@@ -48,6 +48,20 @@ final class CloudSyncModel: ObservableObject {
     /// True once both a server URL and a token are stored in the Keychain (`CloudSyncSettings`).
     @Published var isConfigured = CloudSyncSettings.isConfigured
 
+    /// Recompute-and-refresh hook the wiring point supplies (IntelligenceEngine.analyzeRecent +
+    /// Repository.refresh). Cloud edits rewrite stored sessions/workouts, but the daily rollups the
+    /// UI headlines read (`dailyMetric.totalSleepMin`, efficiency, Rest/Charge) are only rebuilt by
+    /// the analyze cycle — which a pull does NOT trigger, so applied edits left the Sleep/Today
+    /// numbers stale until the next strap-data analysis (found live: 14 restaged nights applied while
+    /// the headline kept the pre-edit total). `performSync` invokes this whenever the applied-edits
+    /// cursor is ahead of `recomputedCursorName`.
+    var postApplyRefresh: (() async -> Void)?
+
+    /// Cursor (same `cursors` table as `CloudSyncCoordinator.cursorName`) recording the highest
+    /// journal seq the rollups were recomputed for. Cursor-vs-cursor — not `summary.applied > 0` —
+    /// so a build that gains this hook AFTER edits were already applied still heals on its first sync.
+    static let recomputedCursorName = "cloud_edits_recomputed"
+
     /// Validates `url` parses as an absolute URL (scheme + host) via `URLComponents` before saving.
     /// `CloudSyncClient.url(path:query:)` force-unwraps its `URLComponents`-built request URL, so a
     /// garbage base URL saved here would crash later at the first pull instead of failing this save
@@ -162,8 +176,26 @@ final class CloudSyncModel: ObservableObject {
                 if summary.needsAttention > 0 { parts.append("\(summary.needsAttention) attention") }
                 line = parts.joined(separator: " · ")
                 succeeded = true
+                // Rebuild the daily rollups before the Apple Health re-export, so the vitals it
+                // exports (which read dailyMetric) reflect the just-applied edits too.
+                var didRecompute = false
+                if let refresh = postApplyRefresh {
+                    let applied = (try? await store.cursor(CloudSyncCoordinator.cursorName)) ?? 0
+                    let recomputed = (try? await store.cursor(Self.recomputedCursorName)) ?? 0
+                    if applied > recomputed {
+                        statusText = "Recomputing days touched by edits…"
+                        await refresh()
+                        try? await store.setCursor(Self.recomputedCursorName, applied)
+                        didRecompute = true
+                        parts.append("recomputed")
+                        line = parts.joined(separator: " · ")
+                    }
+                }
                 #if os(iOS) && canImport(HealthKit)
-                line += await reExportToAppleHealthIfNeeded(repo: repo, store: store, summary: summary)
+                // force after a recompute: the vitals the write-back exports read dailyMetric, so a
+                // rollup rebuild needs a re-export even when THIS pull itself applied nothing.
+                line += await reExportToAppleHealthIfNeeded(repo: repo, store: store, summary: summary,
+                                                            force: didRecompute)
                 #endif
             } catch {
                 line = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
@@ -270,8 +302,9 @@ final class CloudSyncModel: ObservableObject {
     /// `refreshAuthIfPreviouslyGranted` only READS share status, it never prompts — before attempting
     /// the write-back. Returns a status-line SUFFIX: empty when nothing ran or it succeeded.
     private func reExportToAppleHealthIfNeeded(repo: Repository, store: WhoopStore,
-                                                summary: CloudApplySummary) async -> String {
-        guard summary.touchedSleep || summary.touchedWorkouts || summary.touchedHr else { return "" }
+                                                summary: CloudApplySummary,
+                                                force: Bool = false) async -> String {
+        guard force || summary.touchedSleep || summary.touchedWorkouts || summary.touchedHr else { return "" }
         do {
             let bridge = HealthKitBridge(repo: repo, appleDeviceId: "apple-health", noopDeviceId: "my-whoop")
             bridge.refreshAuthIfPreviouslyGranted()
