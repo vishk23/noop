@@ -193,6 +193,13 @@ enum CloudEditApplier {
             }
             _ = try await store.updateSleepStages(deviceId: p.deviceId, detectedStartTs: p.startTs,
                                                    stagesJSON: stagesJSON)
+            // Stage-lock: a cloud stage edit is an AUTHORITATIVE correction, not a placeholder to be
+            // re-derived. Without this, `Repository.selfHealEditedStages` (run by every analyzeRecent)
+            // restages the night from raw and — since a deliberate correction always differs from the
+            // stager's output — silently reverts it (found live: 14 applied restages clobbered by the
+            // first recompute). The lock lives in the `cursors` table (no schema change); a backup
+            // restored without it self-heals, because the journal re-pull re-applies + re-locks.
+            try? await store.setCursor("stagelock:\(p.deviceId):\(p.startTs)", 1)
             summary.applied += 1
             summary.touchedSleep = true
         } catch {

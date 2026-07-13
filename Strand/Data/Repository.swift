@@ -1280,6 +1280,12 @@ final class Repository: ObservableObject {
         guard !edited.isEmpty else { return [] }
         var healed = false
         for row in edited {
+            // Stage-locked rows carry an AUTHORITATIVE stage correction (cloud edit_sleep_stages —
+            // see CloudEditApplier's lock write). Re-deriving from raw would revert the correction
+            // on every analyze pass, since a deliberate edit always differs from the stager's output.
+            if ((try? await store.cursor("stagelock:\(computedDeviceId):\(row.startTs)")) ?? 0) == 1 {
+                continue
+            }
             // Re-derive over the LOCKED corrected window (effective onset → wake). Skip when the raw
             // isn't dense yet, or when the result already matches what's stored (steady state , no write).
             guard let newJSON = await restageFromRaw(start: row.effectiveStartTs, end: row.endTs),
