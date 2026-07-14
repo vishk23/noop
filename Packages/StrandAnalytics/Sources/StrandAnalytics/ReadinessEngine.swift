@@ -57,10 +57,15 @@ public enum ReadinessEngine {
         public let acwr: Double?
         /// Foster training monotony over the last week (nil if not enough strain history).
         public let monotony: Double?
+        /// How much history backs this read (HRV/RHR baseline density) — so the card can show
+        /// calibrating / building / solid instead of a confident number off a 7-night baseline.
+        public let confidence: ScoreConfidence
         public init(level: Level, headline: String, summary: String,
-                    signals: [Signal], acwr: Double?, monotony: Double?) {
+                    signals: [Signal], acwr: Double?, monotony: Double?,
+                    confidence: ScoreConfidence = .calibrating) {
             self.level = level; self.headline = headline; self.summary = summary
             self.signals = signals; self.acwr = acwr; self.monotony = monotony
+            self.confidence = confidence
         }
     }
 
@@ -209,8 +214,16 @@ public enum ReadinessEngine {
 
         let (level, headline, summary) = synthesize(signals: signals,
                                                     hasHistory: !history.isEmpty || acwr != nil)
+        // RD-confidence: surface how much history backs the read (HRV baseline density, the primary
+        // readiness driver). A read off a 7-night baseline must not look as certain as one off the full
+        // 30-night window. Insufficient reads carry .calibrating.
+        let hrvBaselineNights = history.suffix(baselineWindow).compactMap { $0.avgHrv }.count
+        let confidence = ScoreConfidence.readiness(hasRead: level != .insufficient,
+                                                   baselineNights: hrvBaselineNights,
+                                                   fullWindow: baselineWindow)
         return Readiness(level: level, headline: headline, summary: summary,
-                         signals: signals, acwr: acwr, monotony: monotony)
+                         signals: signals, acwr: acwr, monotony: monotony,
+                         confidence: confidence)
     }
 
     // MARK: Signal builders
