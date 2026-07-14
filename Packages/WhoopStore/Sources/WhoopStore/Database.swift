@@ -569,6 +569,24 @@ extension WhoopStore {
                 WHERE efficiency > 1.5
                 """)
         }
+
+        // v28: the phone's IANA timezone, recorded one row per LOCAL day. Every timestamp in the DB is
+        // epoch-UTC and nothing records which zone the phone was in when a day was lived, so any
+        // wall-clock interpretation of a historical night (bedtime, "3am", day boundaries) is guesswork
+        // once the traveller crosses zones (e.g. Pacific ↔ Eastern). This table stamps each local day
+        // with `TimeZone.current.identifier` so downstream analysis can localise that specific day's
+        // samples instead of assuming one fixed offset. `day` is the local calendar day ("YYYY-MM-DD")
+        // and PK, so a same-day re-record overwrites in place (idempotent upsert). Additive only — a NEW
+        // table, no existing row touched, old readers unaffected. The value also rides every upload as
+        // the `X-Phone-Timezone` header on POST /ingest so the server knows the CURRENT zone even before
+        // this table lands in a given mirror. Android Room twin deferred (Swift-only contributor); a Room
+        // migration adding `phoneTimezone` is needed before an Android release.
+        migrator.registerMigration("v28-phone-timezone") { db in
+            try db.create(table: "phoneTimezone") { t in
+                t.column("day", .text).primaryKey()   // local calendar day "YYYY-MM-DD"
+                t.column("tzId", .text).notNull()      // IANA identifier, e.g. "America/Los_Angeles"
+            }
+        }
         return migrator
     }
 }

@@ -408,6 +408,17 @@ final class IntelligenceEngine: ObservableObject {
         // boundary inside the window is a negligible edge case for an hour-of-day band.)
         let tzOffset = TimeZone.current.secondsFromGMT()
 
+        // #tz-upload: stamp TODAY's local calendar day with the phone's IANA timezone so historical
+        // nights stay localisable once the user crosses zones (Pacific ↔ Eastern). Every timestamp in
+        // the DB is epoch-UTC and `tzOffset` above is only an integer offset — it can't distinguish
+        // "America/Los_Angeles" from any other −07:00 zone or survive a DST transition. analyzeRecent is
+        // the daily hook (idle tick + every post-sync rescore), and the upsert is keyed by day so
+        // repeated same-day passes overwrite one row rather than churning. Fire-and-forget: a failure
+        // here must never block scoring. The same identifier also rides each upload as the
+        // `X-Phone-Timezone` header (CloudSyncClient.ingest).
+        let todayLocal = AnalyticsEngine.dayString(Self.midnightLocal(now, offsetSec: tzOffset), offsetSec: tzOffset)
+        try? await store.upsertPhoneTimezone(day: todayLocal, tzId: TimeZone.current.identifier)
+
         // ── Pass 1: analyse each offloaded night against the IMPORTED-ONLY baseline. For a BLE-only
         // user the imported daily rows are empty, so the HRV baseline isn't usable yet and recovery is
         // null here , but each night's avgHrv/restingHr are computed baseline-INDEPENDENTLY, so we

@@ -80,6 +80,12 @@ final class CloudSyncClient {
         req.httpMethod = "POST"
         req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
         req.setValue("application/octet-stream", forHTTPHeaderField: "Content-Type")
+        // #tz-upload: the upload body is the whole SQLite DB (epoch-UTC timestamps only), so the server
+        // has no way to know which zone this phone is in right now. Ship the CURRENT IANA identifier as a
+        // header the server stores on the ingestLog row (and surfaces via data_freshness) — this answers
+        // "what zone is the phone in as of this upload" even before the per-day `phoneTimezone` table
+        // lands in a given mirror.
+        req.setValue(TimeZone.current.identifier, forHTTPHeaderField: "X-Phone-Timezone")
         let (data, status) = try await sendUpload(req, fromFile: fileURL)
         guard (200..<300).contains(status) else {
             throw CloudSyncError.badResponse(status, bodyPrefix(data))
