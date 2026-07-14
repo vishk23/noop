@@ -139,6 +139,7 @@ public enum ReadinessEngine {
             unit: "ms",
             decimals: 0,
             higherIsBetter: true,
+            logDomain: true,   // RD1: lnRMSSD — HRV is right-skewed
             goodText: "above your baseline - well recovered",
             neutralText: "in your normal range",
             watchText: "a touch below baseline",
@@ -217,13 +218,21 @@ public enum ReadinessEngine {
     /// Build a z-score signal for a metric where the baseline is the trailing window.
     private static func zSignal(value: Double?, baseline: [Double],
                                 key: String, label: String, unit: String, decimals: Int,
-                                higherIsBetter: Bool,
+                                higherIsBetter: Bool, logDomain: Bool = false,
                                 goodText: String, neutralText: String,
                                 watchText: String, badText: String) -> Signal? {
-        guard let v = value, baseline.count >= minBaseline,
-              let m = mean(baseline), let sd = sampleSD(baseline), sd > 0 else { return nil }
+        guard let v = value, baseline.count >= minBaseline else { return nil }
+        // RD1: right-skewed metrics (HRV/RMSSD) are z-scored in the LOG domain — lnRMSSD is closer to
+        // normal, so a symmetric z is statistically valid, whereas a raw-ms z over-weights the long
+        // upper tail and misstates tail rarity (Plews/Altini; the app's own HRVReadiness works this
+        // way). RHR/resp are ~normal and stay linear. Evidence stays in the metric's own units, but the
+        // baseline shown is then the GEOMETRIC mean (exp of the log-mean) — a typical night, not an
+        // outlier-inflated arithmetic mean.
+        let tv = logDomain ? log(max(v, 1.0)) : v
+        let tb = logDomain ? baseline.map { log(max($0, 1.0)) } : baseline
+        guard let m = mean(tb), let sd = sampleSD(tb), sd > 0 else { return nil }
         // Orient z so positive always means "better".
-        let z = (higherIsBetter ? (v - m) : (m - v)) / sd
+        let z = (higherIsBetter ? (tv - m) : (m - tv)) / sd
         let flag: Flag
         let text: String
         switch z {
@@ -233,7 +242,8 @@ public enum ReadinessEngine {
         default:            flag = .bad;     text = badText
         }
         return Signal(key: key, label: label,
-                      evidence: evidence(value: v, baseline: m, unit: unit, decimals: decimals),
+                      evidence: evidence(value: v, baseline: logDomain ? exp(m) : m,
+                                         unit: unit, decimals: decimals),
                       detail: text, flag: flag)
     }
 
