@@ -4,9 +4,10 @@ import StrandAnalytics
 
 /// Surfaces the strap battery state as a user notification — a LOW warning when the cell falls to
 /// the threshold so the user can top up before tonight's sleep, and a CHARGED note when it reaches
-/// 100%. `ensureAuthorized()` checks/requests OS permission — called on toggle-on AND (since the
-/// setting defaults on) the first time Automations appears, so a fresh install still gets asked —
-/// status-only check at fire time, and the persisted gate advances even when delivery is deferred.
+/// 100%. `NotificationAuthorizer.ensureAuthorized()` checks/requests OS permission — called on
+/// toggle-on AND (since the setting defaults on) the first time Automations appears, so a fresh
+/// install still gets asked — status-only check at fire time, and the persisted gate advances even
+/// when delivery is deferred.
 /// On-device only; gated behind the user's "Battery alerts" setting (default ON) by the caller (#368).
 enum BatteryNotifier {
     private static let lowAlertedKey = "behavior.batteryLowAlerted"
@@ -51,50 +52,6 @@ enum BatteryNotifier {
             if fireLow { low = true }
             if fireFull { full = true }
             return (fireLow, fireFull, clearFull, low, full)
-        }
-    }
-
-    /// What the caller should do given the CURRENT authorization status, without touching the OS.
-    /// Pure classification, extracted so this decision has a seam a test can drive directly — every
-    /// other notifier in the app inlines the equivalent switch inside a `getNotificationSettings`
-    /// closure, which needs a live `UNUserNotificationCenter` round-trip to exercise at all.
-    enum AuthDecision { case proceed, mustAsk, deny }
-    static func decision(for status: UNAuthorizationStatus) -> AuthDecision {
-        switch status {
-        case .authorized, .provisional, .ephemeral: return .proceed
-        case .notDetermined: return .mustAsk
-        default: return .deny   // .denied, or any future non-authorized case
-        }
-    }
-
-    /// Outcome of an authorization check — lets the caller react instead of silently leaving
-    /// "Battery alerts" on when the OS will never actually deliver. Mirrors `WindDownNudge.EnableOutcome`.
-    enum EnableOutcome { case authorized, denied }
-
-    /// Check current authorization and ask ONCE if undetermined, then report back on the main actor.
-    ///
-    /// Called from two places: when the user flips "Battery alerts" on in Automations, AND once,
-    /// defensively, the first time that screen appears while alerts are ALREADY on. The second call
-    /// site closes the actual root cause of "never seen a single notification, including low-battery":
-    /// `batteryAlerts` defaults to `true` (#368), so a user who never touches the toggle produces no
-    /// `onChange` transition — the old fire-and-forget `requestAuthorization()` this replaces was
-    /// NEVER called, the system permission dialog never appeared, `authorizationStatus` stayed
-    /// `.notDetermined` forever, and `post()` below silently no-opped on every crossing for the life
-    /// of the install. Shape mirrors `WindDownNudge.setEnabled`: ask only when undetermined, never
-    /// re-prompt once answered either way.
-    static func ensureAuthorized(completion: @escaping @MainActor (EnableOutcome) -> Void) {
-        let center = UNUserNotificationCenter.current()
-        center.getNotificationSettings { settings in
-            switch decision(for: settings.authorizationStatus) {
-            case .proceed:
-                Task { @MainActor in completion(.authorized) }
-            case .mustAsk:
-                center.requestAuthorization(options: [.alert, .sound]) { granted, _ in
-                    Task { @MainActor in completion(granted ? .authorized : .denied) }
-                }
-            case .deny:
-                Task { @MainActor in completion(.denied) }
-            }
         }
     }
 
@@ -155,12 +112,12 @@ enum BatteryNotifier {
 
     private static func post(identifier: String, title: String, body: String) {
         let center = UNUserNotificationCenter.current()
-        // Authorization is requested once via ensureAuthorized() when alerts are enabled (or on
-        // first appearance of the settings screen); here we only check status (no second prompt).
-        // Same classification as `decision(for:)` so "OK to proceed without re-asking" and "OK to
-        // post" never disagree.
+        // Authorization is requested once via NotificationAuthorizer.ensureAuthorized() when alerts
+        // are enabled (or on first appearance of the settings screen); here we only check status (no
+        // second prompt). Same classification as `NotificationAuthorizer.decision(for:)` so "OK to
+        // proceed without re-asking" and "OK to post" never disagree.
         center.getNotificationSettings { settings in
-            guard decision(for: settings.authorizationStatus) == .proceed else { return }
+            guard NotificationAuthorizer.decision(for: settings.authorizationStatus) == .proceed else { return }
             let content = UNMutableNotificationContent()
             content.title = title
             content.body = body
