@@ -38,6 +38,33 @@ public enum DaytimeStress {
     public static let highBandFloor: Double = 2.0
     /// Consecutive most-recent covered hours that must all be HIGH to flag sustained stress.
     public static let sustainedHours: Int = 3
+
+    // MARK: - Motion gate (MOVE E — the correctness gate)
+    //
+    // Cardiac signals cannot tell psychological stress from EXERTION: a brisk walk and an anxious
+    // meeting both raise HR and drop HRV. Without a motion channel, `analyze` scored an ambulatory
+    // hour as "stress" — the central correctness bug. When the caller supplies the day's gravity
+    // (wrist accelerometer), an hour that was substantially ambulatory is MASKED (`level == nil`,
+    // `HourPoint.maskedForActivity == true`) rather than scored, and it is excluded from the calm
+    // reference and the coverage/"time in high stress" totals. No gravity → no masking → byte-
+    // identical prior behaviour (honest: we only gate when we can see motion).
+
+    /// An hour whose gravity-derived activity is ambulatory for at least this fraction of its
+    /// records is EXERTION, not stress — masked, not scored. "Ambulatory" = a per-record activity
+    /// intensity above `WorkoutDetector.motionThreshold` (0.20 L2-g, the codebase's calibrated walk
+    /// floor: desk ≈ 0.05–0.10 g, walking ≈ 0.2–0.4 g). 0.30 ⇒ "≥ 30 % of the hour was walking/
+    /// moving"; below it, a stray reach or a single trip to the kitchen doesn't mask a desk hour.
+    /// First-cut, wants tuning against real worn days (an hourly grain is coarse — this is the gate
+    /// that later unblocks finer 5-min epochs, at which point the fraction can tighten). Range (0, 1].
+    public static let activityMaskFraction: Double = 0.30
+    /// Post-exercise shadow: HR stays elevated for a while AFTER exertion ends, so the single hour
+    /// that immediately FOLLOWS a directly-ambulatory hour is ALSO masked WHILE its mean HR is still
+    /// above the calm reference by this margin (bpm). A following hour whose HR has already returned
+    /// to the calm reference is scored normally — the shadow self-limits to genuine cardiac recovery.
+    /// Deliberately ONE hour deep (keyed on the directly-active hour, not chained through prior
+    /// shadows) so a genuinely tense afternoon that happens to follow a workout isn't masked away.
+    /// Range ≥ 0.
+    public static let postActivityShadowBPM: Double = 8.0
     /// First/last local hour-of-day treated as "waking" for the timeline (06:00–22:00).
     public static let wakingStartHour: Int = 6
     public static let wakingEndHour: Int = 22
@@ -136,16 +163,23 @@ public enum DaytimeStress {
         public let meanHR: Double?
         /// RMSSD over the hour's clean R-R (ms), or nil (too few clean beats).
         public let rmssd: Double?
+        /// True when this hour was left unscored because it was AMBULATORY (exertion), not because
+        /// it lacked HR — so `level == nil` here means "masked as activity", not "no data". Lets the
+        /// UI distinguish "you were moving" from "no reading" and keeps active hours out of the calm
+        /// reference and the coverage totals. See the motion-gate constants above.
+        public let maskedForActivity: Bool
 
         /// True when the hour was scored (had enough HR to place on the curve).
         public var hasData: Bool { level != nil }
 
-        public init(hour: Int, startTs: Int, level: Double?, meanHR: Double?, rmssd: Double?) {
+        public init(hour: Int, startTs: Int, level: Double?, meanHR: Double?, rmssd: Double?,
+                    maskedForActivity: Bool = false) {
             self.hour = hour
             self.startTs = startTs
             self.level = level
             self.meanHR = meanHR
             self.rmssd = rmssd
+            self.maskedForActivity = maskedForActivity
         }
     }
 
@@ -174,10 +208,16 @@ public enum DaytimeStress {
         /// (there, a missing RMSSD is already handled per-hour by `rawScore`, not flagged
         /// day-wide) and false for `.empty`.
         public let hrOnlyFallback: Bool
+        /// ADDITIVE — count of waking hours left unscored because they were AMBULATORY (the motion
+        /// gate fired), i.e. `hours.filter { $0.maskedForActivity }.count`. Lets a caller report
+        /// honest coverage ("N hours excluded — you were moving") instead of a silently short
+        /// timeline. 0 when no gravity was supplied or nothing was masked; 0 for `.empty`.
+        public let activityMaskedHours: Int
 
         public init(hours: [HourPoint], sustainedHigh: Bool, sustainedRun: Int,
                     dayMean: Double?, peak: HourPoint?,
-                    highStressMinutes: Int = 0, hrOnlyFallback: Bool = false) {
+                    highStressMinutes: Int = 0, hrOnlyFallback: Bool = false,
+                    activityMaskedHours: Int = 0) {
             self.hours = hours
             self.sustainedHigh = sustainedHigh
             self.sustainedRun = sustainedRun
@@ -185,6 +225,7 @@ public enum DaytimeStress {
             self.peak = peak
             self.highStressMinutes = highStressMinutes
             self.hrOnlyFallback = hrOnlyFallback
+            self.activityMaskedHours = activityMaskedHours
         }
 
         /// The scored hours only (level non-nil), in time order.
@@ -193,7 +234,8 @@ public enum DaytimeStress {
         /// Empty read — used when the day had no usable intraday HR at all.
         public static let empty = Result(hours: [], sustainedHigh: false, sustainedRun: 0,
                                          dayMean: nil, peak: nil,
-                                         highStressMinutes: 0, hrOnlyFallback: false)
+                                         highStressMinutes: 0, hrOnlyFallback: false,
+                                         activityMaskedHours: 0)
     }
 
     // MARK: - Shared stress math (identical formula to the daily StressModel)
@@ -253,12 +295,16 @@ public enum DaytimeStress {
     ///   - rr: the day's `[RRInterval]`.
     ///   - tzOffsetSeconds: seconds east of UTC, for placing each bucket on the LOCAL
     ///     clock (so "waking hours" and the hour labels are local). Defaults to UTC.
+    ///   - gravity: the day's `[GravitySample]` (wrist accelerometer), for the motion gate. Defaults
+    ///     empty: with no gravity NOTHING is masked and the read is byte-identical to before. When
+    ///     present, ambulatory hours are masked out of the score (see the motion-gate constants).
     ///   - mode: `.dayRelative` (DEFAULT — unchanged existing behaviour) or
     ///     `.baselineRelative` (Oura-style, vs a personal rolling baseline). ADDITIVE and
     ///     opt-in: existing callers that don't pass `mode` keep the exact prior behaviour.
     ///
     /// Returns `.empty` when there isn't a single hour with enough HR to score.
     public static func analyze(hr: [HRSample], rr: [RRInterval],
+                               gravity: [GravitySample] = [],
                                tzOffsetSeconds: Int = 0,
                                mode: ScoringMode = .dayRelative) -> Result {
         // v7.0.2 perf (#707): buckets the day's full HR + R-R streams into per-hour aggregates and runs an
@@ -277,14 +323,21 @@ public enum DaytimeStress {
         let key = StressKey(
             hr: StreamFingerprint.of(hr, ts: { $0.ts }, quant: { Int($0.bpm) }),
             rr: StreamFingerprint.of(rr, ts: { $0.ts }, quant: { Int($0.rrMs) }),
+            // Fold all three axes into one quant so two different gravity streams can't share a key
+            // (same hr/rr, different motion must NOT reuse a cached result).
+            gravity: StreamFingerprint.of(gravity, ts: { $0.ts }, quant: {
+                Int(($0.x * 128).rounded()) &+ Int(($0.y * 128).rounded()) &* 257
+                    &+ Int(($0.z * 128).rounded()) &* 66_049
+            }),
             tz: tzOffsetSeconds, mode: modeKey)
         return analyzeCache.value(key) {
-            analyzeUncached(hr: hr, rr: rr, tzOffsetSeconds: tzOffsetSeconds, mode: mode)
+            analyzeUncached(hr: hr, rr: rr, gravity: gravity, tzOffsetSeconds: tzOffsetSeconds, mode: mode)
         }
     }
 
     private struct StressKey: Hashable {
-        let hr: StreamFingerprint; let rr: StreamFingerprint; let tz: Int; let mode: ModeKey
+        let hr: StreamFingerprint; let rr: StreamFingerprint; let gravity: StreamFingerprint
+        let tz: Int; let mode: ModeKey
     }
 
     /// Hashable fingerprint of `ScoringMode` for the memo cache — `BaselineState` itself isn't
@@ -298,6 +351,7 @@ public enum DaytimeStress {
     private static let analyzeCache = AnalyticsMemoCache<StressKey, Result>(capacity: 8)
 
     private static func analyzeUncached(hr: [HRSample], rr: [RRInterval],
+                                        gravity: [GravitySample],
                                         tzOffsetSeconds: Int, mode: ScoringMode) -> Result {
         guard !hr.isEmpty else { return .empty }
 
@@ -330,6 +384,30 @@ public enum DaytimeStress {
             aggs.append(HourAgg(bucket: b, meanHR: mHR, rmssd: rrRes.rmssd, nHR: hrs.count))
         }
 
+        // 2b) Motion gate: bucket the day's gravity-derived activity by the SAME local hour and mark
+        //     each hour AMBULATORY when at least `activityMaskFraction` of its records clear the
+        //     calibrated walk floor (`WorkoutDetector.motionThreshold`) — reusing the exact activity
+        //     series that SedentaryDetector / WorkoutDetector already trust. Empty gravity → no active
+        //     buckets → nothing masked below (byte-identical to the pre-motion behaviour).
+        var activeFracByBucket: [Int: Double] = [:]
+        if !gravity.isEmpty {
+            var counts: [Int: (active: Int, total: Int)] = [:]
+            for p in WorkoutDetector.activitySeries(gravity) {
+                let local = p.ts + tzOffsetSeconds
+                let bucket = floorDiv(local, bucketSeconds) * bucketSeconds
+                var e = counts[bucket] ?? (0, 0)
+                e.total += 1
+                if p.intensity > WorkoutDetector.motionThreshold { e.active += 1 }
+                counts[bucket] = e
+            }
+            for (b, e) in counts where e.total > 0 {
+                activeFracByBucket[b] = Double(e.active) / Double(e.total)
+            }
+        }
+        func isAmbulatory(_ bucket: Int) -> Bool {
+            (activeFracByBucket[bucket] ?? 0) >= activityMaskFraction
+        }
+
         // 3) The reference point + spread for each signal — WHERE they come from depends on
         //    `mode`. Every other step (bucketing above, the waking-hour filter, the squash
         //    curve, sustained-high, high-stress-minutes below) is identical between modes.
@@ -352,7 +430,10 @@ public enum DaytimeStress {
             // hours of it. Letting those night hours into the reference drags the "calm" anchor
             // far beneath every waking hour, inflating an ordinary calm day toward HIGH and
             // falsely tripping the sustained-high Breathe nudge.
-            let referenceAggs = aggs.filter { isWakingHour($0.bucket) }
+            // Ambulatory hours are excluded from the day's OWN calm reference too: an exertion
+            // hour's elevated HR / suppressed HRV must not pull the calm anchor up or inflate the
+            // across-hour spread the z-scores divide by.
+            let referenceAggs = aggs.filter { isWakingHour($0.bucket) && !isAmbulatory($0.bucket) }
             let hrMeans = referenceAggs.compactMap { $0.meanHR }
             let rmssdVals = referenceAggs.compactMap { $0.rmssd }
             refHR = calmReference(hrMeans, calmIsLow: true)         // calm HR is LOW
@@ -397,15 +478,26 @@ public enum DaytimeStress {
             let hourOfDay = floorDiv(a.bucket, bucketSeconds) % 24
             // The wall-clock bucket start (undo the local shift applied above).
             let wallStart = a.bucket - tzOffsetSeconds
-            // Score only when at least one signal is present AND HR cleared the count gate
-            // (HR is the always-available anchor; RMSSD enriches it when beats allow).
-            let level: Double? = a.meanHR != nil
+            // Motion gate: an AMBULATORY hour — or the post-exercise shadow hour whose HR hasn't yet
+            // recovered to the calm reference — is EXERTION, so its elevated HR is masked out of the
+            // score instead of read as stress. The shadow is gated on `refHR` so it self-limits to
+            // genuine cardiac recovery (a following hour already back at baseline scores normally).
+            // Only meaningful when the hour actually HAD a reading to withhold — a no-HR hour is plain
+            // `.noData`, not "masked".
+            let shadow = isAmbulatory(a.bucket - bucketSeconds)
+                && a.meanHR != nil && refHR != nil && a.meanHR! > refHR! + postActivityShadowBPM
+            let masked = a.meanHR != nil && (isAmbulatory(a.bucket) || shadow)
+            // Score only when at least one signal is present AND HR cleared the count gate AND the
+            // hour wasn't motion-masked (HR is the always-available anchor; RMSSD enriches it).
+            let level: Double? = (a.meanHR != nil && !masked)
                 ? squash(rawScore(hr: a.meanHR, meanHR: refHR, sdHR: sdHR,
                                   rmssd: a.rmssd, meanRMSSD: refRMSSD, sdRMSSD: sdRMSSD))
                 : nil
             points.append(HourPoint(hour: hourOfDay, startTs: wallStart,
-                                    level: level, meanHR: a.meanHR, rmssd: a.rmssd))
+                                    level: level, meanHR: a.meanHR, rmssd: a.rmssd,
+                                    maskedForActivity: masked))
         }
+        let activityMaskedHours = points.reduce(0) { $0 + ($1.maskedForActivity ? 1 : 0) }
 
         let scored = points.compactMap { p -> (HourPoint, Double)? in p.level.map { (p, $0) } }
         guard !scored.isEmpty else {
@@ -416,7 +508,8 @@ public enum DaytimeStress {
             return points.isEmpty ? .empty
                 : Result(hours: points, sustainedHigh: false, sustainedRun: 0,
                          dayMean: nil, peak: nil,
-                         highStressMinutes: 0, hrOnlyFallback: hrOnlyFallback)
+                         highStressMinutes: 0, hrOnlyFallback: hrOnlyFallback,
+                         activityMaskedHours: activityMaskedHours)
         }
 
         // 5) Sustained-high flag: walk back from the latest SCORED hour while each is HIGH.
@@ -437,7 +530,8 @@ public enum DaytimeStress {
 
         return Result(hours: points, sustainedHigh: sustained, sustainedRun: run,
                       dayMean: dayMean, peak: peak,
-                      highStressMinutes: highStressMinutes, hrOnlyFallback: hrOnlyFallback)
+                      highStressMinutes: highStressMinutes, hrOnlyFallback: hrOnlyFallback,
+                      activityMaskedHours: activityMaskedHours)
     }
 
     // MARK: - Helpers
