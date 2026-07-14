@@ -491,6 +491,45 @@ too, not left behind.
 
 ---
 
+## Phone timezone archive
+
+Every timestamp in the DB is **epoch-UTC**, and nothing else records which zone the phone was in
+when a day was lived, so any wall-clock reading of a historical night (bedtime, "3am", day
+boundaries) is guesswork once the wearer crosses zones (Pacific ↔ Eastern) — a hard-coded-offset
+assumption already corrupted an analysis pass. This table stamps each **local calendar day** with
+the phone's IANA timezone so downstream analysis can localise that specific day's samples.
+
+### `phoneTimezone` *(v28)*
+
+One row per local calendar day. Written by `PhoneTimezoneStore.upsertPhoneTimezone(day:tzId:)`
+(`Packages/WhoopStore/Sources/WhoopStore/PhoneTimezoneStore.swift`), stamped from
+`TimeZone.current.identifier` by `IntelligenceEngine.analyzeRecent` (the daily hook) as a
+fire-and-forget write that never blocks scoring. Migration `v28-phone-timezone`
+(`Packages/WhoopStore/Sources/WhoopStore/Database.swift`) — additive only, a new table, no
+existing row touched, numbered past upstream's v26 and local v27.
+
+| Column | Type | Notes |
+| --- | --- | --- |
+| `day` | TEXT NOT NULL | Primary key. Local calendar day, `YYYY-MM-DD`. |
+| `tzId` | TEXT NOT NULL | IANA identifier, e.g. `"America/Los_Angeles"`. |
+
+**Primary key:** `day`. `upsertPhoneTimezone(...)` is idempotent on it via `ON CONFLICT(day) DO
+UPDATE` — re-recording the same day overwrites `tzId` in place rather than duplicating.
+`phoneTimezone(day:)` reads a single day back (nil when none stored).
+
+**Also rides every upload as a header.** When Cloud Sync is compiled in (`CLOUD_SYNC`),
+`CloudSyncClient.ingest` (`Strand/CloudSync/CloudSyncClient.swift`) sets `X-Phone-Timezone:
+TimeZone.current.identifier` on `POST /ingest`, so the server records the phone's **current** zone
+even before this per-day table lands in a given mirror. Default builds are offline and send no such
+header (`docs/PRIVACY_SECURITY.md` §1). The noop-cloud server stores the header on its `ingestLog`
+row (surfaced via `data_freshness.phoneTz`) and joins this table to attach a per-night `tzId` on
+`sleep_summary`.
+
+**Android twin deferred** (Swift-only contributor): a Room migration adding `phoneTimezone` is
+needed before an Android release, per the cross-platform migration-parity contract.
+
+---
+
 ## Index summary
 
 | Index | Table | Columns | Purpose |

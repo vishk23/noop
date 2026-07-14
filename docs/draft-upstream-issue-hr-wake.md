@@ -1,3 +1,5 @@
+> **Filed as https://github.com/ryanbr/noop/issues/462 on 2026-07-14.** The fix shipped in this fork (default ON); see `docs/ANALYTICS.md` → *Motion-corroborated wake*. This file is kept as the filed issue's source.
+
 # Sleep scoring over-calls WAKE when resting HR is elevated but the wrist is motionless (supplement / fever / alcohol nights)
 
 ## Summary
