@@ -309,6 +309,12 @@ Consecutive same-stage epochs are merged into `StageSegment`s tiling `[start, en
 - `SleepSession` — `start`, `end`, `efficiency` (AASM `asleep / in-bed`, where `asleep = in-bed − wake`), `stages`, per-session `restingHR` (lowest 5-min rolling-mean HR) and `avgHRV` (mean RMSSD over 5-min tumbling windows).
 - `hypnogramMetrics(_:)` — AASM-style roll-up: TIB / TST / SPT / SOL / REM latency / WASO / efficiency / disturbances, plus deep/REM/light minutes and percentages.
 
+### Displayed sleep onset — the headline "Asleep at" spans the whole bridged night
+
+The Sleep screen headline ("Asleep at …") reports the onset of the **whole bridged night**, not the main session's start. A night stored as a short first-sleep fragment + a brief walk + the main session bridges into one group when the gap is under `gapBridgeMaxMin` (60 min). The display onset walk (`SleepView.nightOnsetTs` → `isPreOnsetAwakeStub`) previously mis-classified such a fragment as a spurious pre-onset lead through two stacked defects: (1) the #259 relative "minor lead" test compared the fragment's asleep minutes against 15% of the main block, so on a long main sleep a genuine short first sleep was skipped and the headline jumped forward to the main session's start; (2) the stub test read asleep minutes via the dict-only `decodeStages`, which returns nil for the segment-array `stagesJSON` an on-device **computed** night stores — so every fragment counted as 0 asleep minutes and tripped the "essentially sleepless stub" branch, bypassing defect (1)'s floor entirely.
+
+Fix: an **absolute floor** `preOnsetStubMinorAsleepFloorMin = 20` (min) under the #259 relative test — a leading fragment carrying **≥ 20 asleep minutes** is never treated as a spurious lead, whatever the main block's size — plus a format-agnostic `decodedAsleepMinutes` (dict-of-minutes decode with a segment-array fallback) used at both onset call sites, so the floor's input is populated on computed nights too. The relaxation is strict (it can only un-skip a real first sleep, never newly skip one), so the displayed onset now equals the bridged night's first sleep and agrees with the Apple Health write-back span (bridged night groups, #294/#364). The #736 sleepless-stub skip and the #259 tiny-stray-lead (≤ 10 min) behavior are unchanged. The constant and decode seam live in `Strand/Screens/SleepView.swift`; a Kotlin twin of the constant, the onset-walk rule, and the both-format decode is deferred (Swift-only contributor).
+
 ---
 
 ## The **Rest** score composite — *"how restorative was your sleep?"*
