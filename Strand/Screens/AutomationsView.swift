@@ -37,6 +37,10 @@ struct AutomationsView: View {
     /// posting read — has no UI to flip and is stuck at its default OFF. Bind the SAME raw key here so
     /// iPhone users can actually turn wrist alerts on. Default OFF, matching the store's default.
     @AppStorage("notif.masterEnabled") private var wristAlertsMaster = false
+    /// Wrist-alerts twin of `showNotifDeniedAlert`: shown when the user flips "Enable wrist alerts"
+    /// on but notifications are denied at the OS level, so the wrist-buzz mirror can never post. iOS
+    /// only — the card that drives it is `#if os(iOS)`.
+    @State private var showWristNotifDeniedAlert = false
     #endif
 
     var body: some View {
@@ -66,6 +70,14 @@ struct AutomationsView: View {
         } message: {
             Text("Turn on notifications for NOOP in Settings to get your battery alerts.")
         }
+        #if os(iOS)
+        .alert(String(localized: "Notifications are off"), isPresented: $showWristNotifDeniedAlert) {
+            Button(String(localized: "Open Settings")) { NotificationPresenter.openSystemSettings() }
+            Button(String(localized: "Not now"), role: .cancel) {}
+        } message: {
+            Text("Turn on notifications for NOOP in Settings to get your wrist alerts.")
+        }
+        #endif
     }
 
     // MARK: - Wrist alerts master (iOS only — PR #572)
@@ -83,6 +95,22 @@ struct AutomationsView: View {
                 ToggleRow(label: String(localized: "Enable wrist alerts"),
                           help: String(localized: "The master switch for every wrist buzz (inactivity, stress, alerts). Off keeps the strap quiet no matter what else is on."),
                           isOn: $wristAlertsMaster)
+                    .onChangeCompat(of: wristAlertsMaster) { on in
+                        // The wrist-buzz mirror posts through UNUserNotificationCenter
+                        // (AppModel.postWristAlert), so an enabled master with notifications denied at
+                        // the OS level silently buzzes nothing. Ask on the flip — mirrors the battery
+                        // card. No first-appearance `.task` twin here: this master defaults OFF (unlike
+                        // "Battery alerts", #368), so there's no already-on install with a missed prompt
+                        // to backfill — the `onChange` fires on the only transition that matters.
+                        guard on else { return }
+                        NotificationAuthorizer.ensureAuthorized { outcome in
+                            if outcome == .denied {
+                                // The OS won't deliver — don't leave the switch lying about being on.
+                                wristAlertsMaster = false
+                                showWristNotifDeniedAlert = true
+                            }
+                        }
+                    }
             }
         }
     }
@@ -365,7 +393,7 @@ struct AutomationsView: View {
                       isOn: $behavior.batteryAlerts)
                 .onChangeCompat(of: behavior.batteryAlerts) { on in
                     guard on else { return }
-                    BatteryNotifier.ensureAuthorized { outcome in
+                    NotificationAuthorizer.ensureAuthorized { outcome in
                         if outcome == .denied {
                             // The OS won't deliver — don't leave the switch lying about being on.
                             // This is a direct reaction to the user's own flip, so (unlike the
@@ -391,10 +419,10 @@ struct AutomationsView: View {
         // here: the user hasn't taken an explicit action on this control, so silently reflecting
         // reality (toggle off) is the non-naggy choice; the loud recovery alert stays reserved for
         // the direct-flip path above. Re-running on every appearance is harmless — the OS is never
-        // re-prompted once answered (see `BatteryNotifier.decision(for:)`).
+        // re-prompted once answered (see `NotificationAuthorizer.decision(for:)`).
         .task {
             guard behavior.batteryAlerts else { return }
-            BatteryNotifier.ensureAuthorized { outcome in
+            NotificationAuthorizer.ensureAuthorized { outcome in
                 if outcome == .denied { behavior.batteryAlerts = false }
             }
         }

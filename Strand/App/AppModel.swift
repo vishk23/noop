@@ -1041,13 +1041,15 @@ final class AppModel: ObservableObject {
 
     #if os(iOS)
     /// Shared post path: gate on the wrist-alerts master, then deliver only if the OS already authorized
-    /// notifications (no second system prompt , BatteryNotifier-style status-only check). A fresh
+    /// notifications (no second system prompt — status-only check). Uses the shared
+    /// `NotificationAuthorizer.decision(for:)` classifier so the wrist-buzz mirror and the "Enable wrist
+    /// alerts" toggle's `ensureAuthorized` prompt never disagree on what counts as authorized. A fresh
     /// identifier per category means a new alert replaces the old one rather than stacking.
     private static func postWristAlert(identifier: String, title: String, body: String) {
         guard UserDefaults.standard.bool(forKey: wristAlertsMasterKey) else { return }
         let center = UNUserNotificationCenter.current()
         center.getNotificationSettings { settings in
-            guard settings.authorizationStatus == .authorized else { return }
+            guard NotificationAuthorizer.decision(for: settings.authorizationStatus) == .proceed else { return }
             let content = UNMutableNotificationContent()
             content.title = title
             content.body = body
