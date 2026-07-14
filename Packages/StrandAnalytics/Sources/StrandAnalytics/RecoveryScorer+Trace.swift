@@ -71,17 +71,29 @@ extension RecoveryScorer {
         // pairs in the SAME order recovery(...) appends them so the renormalization below matches.
         var terms: [(name: String, z: Double, w: Double)] = []
 
+        // Resting-HR z, computed up front (like recovery()) so the saturation guard can read the
+        // HRV<->RHR coupling before the HRV term is built. nil when there is no RHR baseline.
+        let rhrZForGuard: Double? = rhrBaseline.map { zScore($0.baseline, mean: rhr, spread: $0.spread) }
+
         // HRV term: higher is better. (Always present once usable; the cold-start guard above returned.)
+        // The low-HRV penalty is eased when resting HR corroborates parasympathetic saturation, using
+        // the SAME guard recovery() applies — so the trace's HRV term matches the scored one exactly.
         // L9: every WEIGHT / SCALE / centre constant goes through r2() too (not just the z-scores), so a
         // future non-round weight (e.g. 0.333) renders identically on Swift and Kotlin and the parity
         // fixture cannot silently desync. The values render the same as before today.
-        let hrvZ = zScore(hrv, mean: hrvBaseline.baseline, spread: hrvBaseline.spread)
-        terms.append(("hrv", hrvZ, wHRV))
-        lines.append("charge term hrv z=\(r2(hrvZ)) w=\(r2(wHRV)) (higher HRV is better)")
+        let hrvZRaw = zScore(hrv, mean: hrvBaseline.baseline, spread: hrvBaseline.spread)
+        let sat = parasympatheticSaturation(hrvZ: hrvZRaw, rhrZ: rhrZForGuard)
+        terms.append(("hrv", sat.effectiveHrvZ, wHRV))
+        lines.append("charge term hrv z=\(r2(sat.effectiveHrvZ)) w=\(r2(wHRV)) (higher HRV is better)")
+        // Name the eased penalty ONLY when the guard fired, so a "Charge looks high for low HRV"
+        // report shows exactly why: low HRV + low resting HR = benign vagal saturation, penalty eased.
+        if sat.active {
+            lines.append("charge saturation active hrvZraw=\(r2(hrvZRaw)) rhrZ=\(r2(rhrZForGuard ?? 0)) "
+                + "damp=\(r2(sat.dampFraction)) (low HRV + low resting HR: parasympathetic saturation, HRV penalty eased)")
+        }
 
-        // RHR term: lower is better -> (mu - x) / sigma.
-        if let b = rhrBaseline {
-            let z = zScore(b.baseline, mean: rhr, spread: b.spread)
+        // RHR term: lower is better -> (mu - x) / sigma. (Reuses the z computed for the guard.)
+        if let z = rhrZForGuard {
             terms.append(("rhr", z, wRHR))
             lines.append("charge term rhr z=\(r2(z)) w=\(r2(wRHR)) (lower RHR is better)")
         } else {

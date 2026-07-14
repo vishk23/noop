@@ -154,6 +154,14 @@ extension RecoveryScorer {
 
         var drivers: [ChargeDriver] = []
 
+        // Was the low-HRV penalty eased by the parasympathetic-saturation guard on THIS night?
+        // Recompute the SAME HRV / resting-HR coupling the score used so the HRV verdict can honestly
+        // explain a lighter-than-usual penalty (its deltaPoints already reflect the easing, since
+        // points(...) routes through recovery(...), which applies the guard).
+        let hrvZFull = zScore(hrv, mean: hrvBaseline.baseline, spread: hrvBaseline.spread)
+        let rhrZFull: Double? = rhrBaseline.map { zScore($0.baseline, mean: rhr, spread: $0.spread) }
+        let hrvSaturationEased = parasympatheticSaturation(hrvZ: hrvZFull, rhrZ: rhrZFull).active
+
         // ── HRV (dominant driver; always present once the score exists) ──────────
         // Higher HRV vs baseline supports recovery. Neutral = HRV at the baseline mean.
         drivers.append(ChargeDriver(
@@ -164,7 +172,8 @@ extension RecoveryScorer {
                                          skinTempDev: skinTempDev)),
             valueText: "\(Int(hrv.rounded())) ms",
             baselineText: "\(Int(hrvBaseline.baseline.rounded())) ms baseline",
-            verdict: hrvVerdict(value: hrv, baseline: hrvBaseline.baseline)))
+            verdict: hrvVerdict(value: hrv, baseline: hrvBaseline.baseline,
+                                saturationEased: hrvSaturationEased)))
 
         // ── Resting HR (lower vs baseline supports recovery) ─────────────────────
         // Neutral = resting HR at the baseline mean.
@@ -232,9 +241,16 @@ extension RecoveryScorer {
 
     // MARK: - Plain-English verdicts (no fabricated numbers; direction only)
 
-    static func hrvVerdict(value: Double, baseline: Double) -> String {
+    static func hrvVerdict(value: Double, baseline: Double, saturationEased: Bool = false) -> String {
         if value > baseline { return "above baseline, supporting recovery" }
-        if value < baseline { return "below baseline, limiting recovery" }
+        if value < baseline {
+            // Parasympathetic saturation: resting HR is also low and decoupled from HRV, so the low
+            // HRV reads as a benign saturated vagal state, not fatigue, and its penalty is eased.
+            // Say so instead of the plain fatigue read. (Only reached when the guard actually fired.)
+            return saturationEased
+                ? "below baseline, but low resting HR signals parasympathetic saturation, so the penalty is eased"
+                : "below baseline, limiting recovery"
+        }
         return "at baseline"
     }
 
