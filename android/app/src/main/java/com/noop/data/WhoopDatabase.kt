@@ -47,8 +47,9 @@ import androidx.sqlite.db.SupportSQLiteDatabase
         DayOwnershipRow::class,
         LabMarkerRow::class,
         LiveSessionRow::class,
+        AppleStepHour::class,
     ],
-    version = 18,
+    version = 19,
     exportSchema = false,
 )
 abstract class WhoopDatabase : RoomDatabase() {
@@ -480,6 +481,32 @@ abstract class WhoopDatabase : RoomDatabase() {
             }
         }
 
+        /**
+         * v18 -> v19: ADDITIVE, adds the `appleStepHour` table, the Android twin of the Swift WhoopStore
+         * `v26-apple-step-hour` migration. Hourly Apple-Health step counts: `appleDaily.steps` flattens a
+         * whole day to one total, so a dead/absent phone for part of a day is invisible; this per-hour table
+         * records exactly which hours had a recording. `ts` is the hour-bucket start (unix seconds), `steps`
+         * the cumulative sum within that hour, composite PK (deviceId, ts) so the hourly upsert is idempotent.
+         *
+         * CREATE TABLE only (no existing data touched), so already-offloaded raw streams survive. The SQL MUST
+         * match Room's generated schema for [AppleStepHour] exactly: deviceId TEXT NOT NULL, ts INTEGER NOT NULL,
+         * steps INTEGER NOT NULL (all Kotlin non-null, no SQL DEFAULT), composite PRIMARY KEY (deviceId, ts) in
+         * declaration order. SCHEMA-ONLY twin: the Apple-Health IMPORT that fills it is iOS-only (HealthKit has
+         * no Android analogue), so Android carries the table for .noopbak byte-parity but no importer writes it.
+         * No destructive fallback (see the class doc). Exposed as [APPLE_STEP_HOUR_MIGRATION_SQL] so a plain-JVM
+         * unit test can pin the shape without Robolectric.
+         */
+        internal val APPLE_STEP_HOUR_MIGRATION_SQL: List<String> = listOf(
+            "CREATE TABLE IF NOT EXISTS `appleStepHour` (`deviceId` TEXT NOT NULL, " +
+                "`ts` INTEGER NOT NULL, `steps` INTEGER NOT NULL, PRIMARY KEY(`deviceId`, `ts`))",
+        )
+
+        internal val MIGRATION_18_19 = object : Migration(18, 19) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                for (stmt in APPLE_STEP_HOUR_MIGRATION_SQL) db.execSQL(stmt)
+            }
+        }
+
         private fun build(appContext: Context): WhoopDatabase =
             Room.databaseBuilder(appContext, WhoopDatabase::class.java, DB_NAME)
                 // #1014: replace ONLY the corruption handling of the default open-helper. The
@@ -495,6 +522,7 @@ abstract class WhoopDatabase : RoomDatabase() {
                     MIGRATION_5_6, MIGRATION_6_7, MIGRATION_7_8, MIGRATION_8_9, MIGRATION_9_10,
                     MIGRATION_10_11, MIGRATION_11_12, MIGRATION_12_13, MIGRATION_13_14,
                     MIGRATION_14_15, MIGRATION_15_16, MIGRATION_16_17, MIGRATION_17_18,
+                    MIGRATION_18_19,
                 )
                 // #1037: a FRESH install builds the schema straight at the current version and runs NO
                 // migrations, so the MIGRATION_7_8 "my-whoop" registry seed never fires and the WHOOP,
