@@ -42,6 +42,36 @@ public enum DaytimeStress {
     public static let wakingStartHour: Int = 6
     public static let wakingEndHour: Int = 22
 
+    // MARK: - Scoring mode
+
+    /// WHERE each hour's "calm" reference point + spread come from. Every other step —
+    /// bucketing, the waking-hour filter, the squash curve, sustained-high, high-stress-minutes
+    /// — is identical between modes; only the reference differs.
+    public enum ScoringMode: Equatable, Sendable {
+        /// DEFAULT — unchanged from before this mode existed. Each hour is z-scored against
+        /// THIS DAY's own calm-hour reference (`calmReference`): the lower quartile of the
+        /// day's own waking-hour mean HR, the upper quartile of its own waking-hour RMSSD. No
+        /// personal history needed — the day is its own baseline. Byte-identical output to the
+        /// pre-existing single-mode `analyze` for the same hr/rr/tzOffsetSeconds.
+        case dayRelative
+
+        /// Oura-style — each hour is z-scored against the PERSONAL rolling baseline for daytime
+        /// HR (and, when available, daytime RMSSD): the SAME Winsorized-EWMA machinery
+        /// (`Baselines.update` / `Baselines.foldHistory`) that backs the nightly HRV /
+        /// resting-HR baselines elsewhere in the app, using `Baselines.metricCfg["daytime_hr"]`
+        /// / `["daytime_rmssd"]` (see `Baselines.daytimeHRCfg` / `daytimeRMSSDCfg`). A caller
+        /// builds `hr` (and, when it has the history, `rmssd`) by folding this person's past
+        /// daytime aggregates — e.g. day N's `calmReference` output — the same way the nightly
+        /// baselines are folded from past nights.
+        ///
+        /// `rmssd` is `nil` when no personal RMSSD baseline exists yet — e.g. an imported,
+        /// Oura-era day with no R-R stream, so there is no history to fold one from. The
+        /// stressor then honestly falls back to HR-only scoring for the whole read and flags
+        /// `Result.hrOnlyFallback`; this mirrors the per-hour graceful-nil already in
+        /// `rawScore`, just at the whole-baseline grain instead of the single-hour grain.
+        case baselineRelative(hr: BaselineState, rmssd: BaselineState?)
+    }
+
     // MARK: - Output
 
     /// One hour of the daytime timeline. `level` is the shared 0–3 stress proxy, or nil
@@ -82,14 +112,30 @@ public enum DaytimeStress {
         public let dayMean: Double?
         /// Peak scored hour (highest `level`), or nil.
         public let peak: HourPoint?
+        /// ADDITIVE — total minutes across SCORED waking hours at/above `highBandFloor`, the
+        /// Oura-comparable "time in high stress" figure. Each scored hour is one `bucketSeconds`
+        /// bucket, so this is `(# high-band scored hours) * bucketSeconds / 60`. Compare against
+        /// Oura's `stress_high_s / 60` — NOOP's timeline is hourly-grain vs Oura's ~5-minute
+        /// grain, so treat this as a coarse approximation, not a precise match. 0 for `.empty`
+        /// and for any day with no scored hours.
+        public let highStressMinutes: Int
+        /// ADDITIVE — true when `.baselineRelative` mode was requested but had no personal RMSSD
+        /// baseline to score against (e.g. an imported Oura-era day with no R-R history), so the
+        /// whole read honestly fell back to HR-only scoring. Always false in `.dayRelative` mode
+        /// (there, a missing RMSSD is already handled per-hour by `rawScore`, not flagged
+        /// day-wide) and false for `.empty`.
+        public let hrOnlyFallback: Bool
 
         public init(hours: [HourPoint], sustainedHigh: Bool, sustainedRun: Int,
-                    dayMean: Double?, peak: HourPoint?) {
+                    dayMean: Double?, peak: HourPoint?,
+                    highStressMinutes: Int = 0, hrOnlyFallback: Bool = false) {
             self.hours = hours
             self.sustainedHigh = sustainedHigh
             self.sustainedRun = sustainedRun
             self.dayMean = dayMean
             self.peak = peak
+            self.highStressMinutes = highStressMinutes
+            self.hrOnlyFallback = hrOnlyFallback
         }
 
         /// The scored hours only (level non-nil), in time order.
@@ -97,7 +143,8 @@ public enum DaytimeStress {
 
         /// Empty read — used when the day had no usable intraday HR at all.
         public static let empty = Result(hours: [], sustainedHigh: false, sustainedRun: 0,
-                                         dayMean: nil, peak: nil)
+                                         dayMean: nil, peak: nil,
+                                         highStressMinutes: 0, hrOnlyFallback: false)
     }
 
     // MARK: - Shared stress math (identical formula to the daily StressModel)
@@ -144,25 +191,52 @@ public enum DaytimeStress {
     ///   - rr: the day's `[RRInterval]`.
     ///   - tzOffsetSeconds: seconds east of UTC, for placing each bucket on the LOCAL
     ///     clock (so "waking hours" and the hour labels are local). Defaults to UTC.
+    ///   - mode: `.dayRelative` (DEFAULT — unchanged existing behaviour) or
+    ///     `.baselineRelative` (Oura-style, vs a personal rolling baseline). ADDITIVE and
+    ///     opt-in: existing callers that don't pass `mode` keep the exact prior behaviour.
     ///
     /// Returns `.empty` when there isn't a single hour with enough HR to score.
     public static func analyze(hr: [HRSample], rr: [RRInterval],
-                               tzOffsetSeconds: Int = 0) -> Result {
+                               tzOffsetSeconds: Int = 0,
+                               mode: ScoringMode = .dayRelative) -> Result {
         // v7.0.2 perf (#707): buckets the day's full HR + R-R streams into per-hour aggregates and runs an
         // RMSSD per hour — invoked from the Stress view, so a `body` re-evaluation re-buckets the whole day.
-        // Memoize on the streams' fingerprint + tz offset; result is a small `Result`, raw arrays not held.
+        // Memoize on the streams' fingerprint + tz offset + scoring mode; result is a small `Result`, raw
+        // arrays not held. The mode key folds in only (baseline, spread) for baseline-relative — the two
+        // fields that can change the score — not the whole BaselineState (nValid/status/etc. never do).
+        let modeKey: ModeKey
+        switch mode {
+        case .dayRelative:
+            modeKey = .dayRelative
+        case .baselineRelative(let hrBaseline, let rmssdBaseline):
+            modeKey = .baselineRelative(hrBaseline: hrBaseline.baseline, hrSpread: hrBaseline.spread,
+                                        rmssdBaseline: rmssdBaseline?.baseline, rmssdSpread: rmssdBaseline?.spread)
+        }
         let key = StressKey(
             hr: StreamFingerprint.of(hr, ts: { $0.ts }, quant: { Int($0.bpm) }),
             rr: StreamFingerprint.of(rr, ts: { $0.ts }, quant: { Int($0.rrMs) }),
-            tz: tzOffsetSeconds)
-        return analyzeCache.value(key) { analyzeUncached(hr: hr, rr: rr, tzOffsetSeconds: tzOffsetSeconds) }
+            tz: tzOffsetSeconds, mode: modeKey)
+        return analyzeCache.value(key) {
+            analyzeUncached(hr: hr, rr: rr, tzOffsetSeconds: tzOffsetSeconds, mode: mode)
+        }
     }
 
-    private struct StressKey: Hashable { let hr: StreamFingerprint; let rr: StreamFingerprint; let tz: Int }
+    private struct StressKey: Hashable {
+        let hr: StreamFingerprint; let rr: StreamFingerprint; let tz: Int; let mode: ModeKey
+    }
+
+    /// Hashable fingerprint of `ScoringMode` for the memo cache — `BaselineState` itself isn't
+    /// `Hashable`, and only its `baseline`/`spread` can change the score, so those are what get
+    /// folded in (see the `analyze` doc above).
+    private enum ModeKey: Hashable {
+        case dayRelative
+        case baselineRelative(hrBaseline: Double, hrSpread: Double, rmssdBaseline: Double?, rmssdSpread: Double?)
+    }
+
     private static let analyzeCache = AnalyticsMemoCache<StressKey, Result>(capacity: 8)
 
     private static func analyzeUncached(hr: [HRSample], rr: [RRInterval],
-                                        tzOffsetSeconds: Int) -> Result {
+                                        tzOffsetSeconds: Int, mode: ScoringMode) -> Result {
         guard !hr.isEmpty else { return .empty }
 
         // 1) Bucket HR + R-R into LOCAL hour-of-day buckets, keyed by the bucket start
@@ -194,25 +268,57 @@ public enum DaytimeStress {
             aggs.append(HourAgg(bucket: b, meanHR: mHR, rmssd: rrRes.rmssd, nHR: hrs.count))
         }
 
-        // 3) The day's OWN quiet reference: centre on the CALM end (the lower quartile of
-        //    hourly mean HR, the upper quartile of hourly RMSSD), and spread from the
-        //    across-hour SD. This makes a flat day read ~baseline and a spiky day surface
-        //    its tense hours — without any cross-day history. Falls back to the plain mean
-        //    when there are too few scored hours for a quartile.
-        //
-        //    Built from the WAKING hours only — the same hours scored in step 4. Sleep is the
-        //    calmest, lowest-HR / highest-HRV stretch of the day, and the analysis window
-        //    always begins at local midnight, so the current day routinely carries several
-        //    hours of it. Letting those night hours into the reference drags the "calm" anchor
-        //    far beneath every waking hour, inflating an ordinary calm day toward HIGH and
-        //    falsely tripping the sustained-high Breathe nudge.
-        let referenceAggs = aggs.filter { isWakingHour($0.bucket) }
-        let hrMeans = referenceAggs.compactMap { $0.meanHR }
-        let rmssdVals = referenceAggs.compactMap { $0.rmssd }
-        let refHR = calmReference(hrMeans, calmIsLow: true)         // calm HR is LOW
-        let refRMSSD = calmReference(rmssdVals, calmIsLow: false)   // calm HRV is HIGH
-        let sdHR = std(hrMeans, mean: mean(hrMeans))
-        let sdRMSSD = std(rmssdVals, mean: mean(rmssdVals))
+        // 3) The reference point + spread for each signal — WHERE they come from depends on
+        //    `mode`. Every other step (bucketing above, the waking-hour filter, the squash
+        //    curve, sustained-high, high-stress-minutes below) is identical between modes.
+        let refHR: Double?
+        let sdHR: Double
+        let refRMSSD: Double?
+        let sdRMSSD: Double
+        let hrOnlyFallback: Bool
+        switch mode {
+        case .dayRelative:
+            // The day's OWN quiet reference: centre on the CALM end (the lower quartile of
+            // hourly mean HR, the upper quartile of hourly RMSSD), and spread from the
+            // across-hour SD. This makes a flat day read ~baseline and a spiky day surface
+            // its tense hours — without any cross-day history. Falls back to the plain mean
+            // when there are too few scored hours for a quartile.
+            //
+            // Built from the WAKING hours only — the same hours scored in step 4. Sleep is the
+            // calmest, lowest-HR / highest-HRV stretch of the day, and the analysis window
+            // always begins at local midnight, so the current day routinely carries several
+            // hours of it. Letting those night hours into the reference drags the "calm" anchor
+            // far beneath every waking hour, inflating an ordinary calm day toward HIGH and
+            // falsely tripping the sustained-high Breathe nudge.
+            let referenceAggs = aggs.filter { isWakingHour($0.bucket) }
+            let hrMeans = referenceAggs.compactMap { $0.meanHR }
+            let rmssdVals = referenceAggs.compactMap { $0.rmssd }
+            refHR = calmReference(hrMeans, calmIsLow: true)         // calm HR is LOW
+            refRMSSD = calmReference(rmssdVals, calmIsLow: false)   // calm HRV is HIGH
+            sdHR = std(hrMeans, mean: mean(hrMeans))
+            sdRMSSD = std(rmssdVals, mean: mean(rmssdVals))
+            hrOnlyFallback = false
+
+        case .baselineRelative(let hrBaseline, let rmssdBaseline):
+            // The PERSONAL cross-day baseline, folded by the caller from past daytime
+            // aggregates via `Baselines.update`/`foldHistory` (see the `ScoringMode` doc).
+            // `sigma` is the SAME abs-dev-to-Gaussian-σ conversion `Baselines.deviation` uses.
+            refHR = hrBaseline.baseline
+            sdHR = Baselines.sigma(hrBaseline)
+            if let rmssdBaseline {
+                refRMSSD = rmssdBaseline.baseline
+                sdRMSSD = Baselines.sigma(rmssdBaseline)
+                hrOnlyFallback = false
+            } else {
+                // No personal RMSSD baseline exists (e.g. an Oura-era day with no R-R history to
+                // fold one from). `rawScore` already treats a nil meanRMSSD as "skip this term",
+                // so passing nil here gracefully degrades to HR-only scoring — flagged honestly
+                // in the output rather than silently.
+                refRMSSD = nil
+                sdRMSSD = 0
+                hrOnlyFallback = true
+            }
+        }
 
         // 4) Score each waking-hour bucket on the shared 0–3 curve.
         var points: [HourPoint] = []
@@ -235,10 +341,13 @@ public enum DaytimeStress {
         let scored = points.compactMap { p -> (HourPoint, Double)? in p.level.map { (p, $0) } }
         guard !scored.isEmpty else {
             // No scorable waking hour — still return the (unscored) timeline so the UI can
-            // show "not enough data" rather than nothing.
+            // show "not enough data" rather than nothing. `hrOnlyFallback` is a MODE property
+            // (whether a personal RMSSD baseline existed to score against), so it's still worth
+            // reporting even though nothing ended up scored.
             return points.isEmpty ? .empty
                 : Result(hours: points, sustainedHigh: false, sustainedRun: 0,
-                         dayMean: nil, peak: nil)
+                         dayMean: nil, peak: nil,
+                         highStressMinutes: 0, hrOnlyFallback: hrOnlyFallback)
         }
 
         // 5) Sustained-high flag: walk back from the latest SCORED hour while each is HIGH.
@@ -251,8 +360,15 @@ public enum DaytimeStress {
         let dayMean = mean(scored.map { $0.1 })
         let peak = scored.max { $0.1 < $1.1 }?.0
 
+        // 6) Oura-comparable "time in high stress": each scored hour at/above `highBandFloor`
+        //    is one full `bucketSeconds` bucket, converted to minutes. Uses the SAME threshold
+        //    `StressBand.high` (StressView) and the sustained-high check above already use, so
+        //    all three stay in lockstep by construction.
+        let highStressMinutes = scored.filter { $0.1 >= highBandFloor }.count * (bucketSeconds / 60)
+
         return Result(hours: points, sustainedHigh: sustained, sustainedRun: run,
-                      dayMean: dayMean, peak: peak)
+                      dayMean: dayMean, peak: peak,
+                      highStressMinutes: highStressMinutes, hrOnlyFallback: hrOnlyFallback)
     }
 
     // MARK: - Helpers
