@@ -127,6 +127,96 @@ object RecoveryScorer {
     /** Sleep-performance scale (±2 z spans the normal range). */
     const val sleepPerfScale: Double = 0.12
 
+    // ─────────────────────────────────────────────────────────────────────────
+    // Parasympathetic-saturation guard (Charge) — Kotlin twin of the Swift guard
+    // ─────────────────────────────────────────────────────────────────────────
+    //
+    // A low nightly HRV is normally a fatigue signal, so the HRV term (wHRV = 0.55, the dominant
+    // driver) pulls Charge DOWN. But there is a known BENIGN pattern the raw z-score mis-reads:
+    // parasympathetic (vagal) saturation. In a very fit or very relaxed state the RMSSD-HRV response
+    // saturates and reads LOW while resting HR reads LOW too, and the two DECOUPLE. That is not poor
+    // recovery — it is a saturated rest state — yet the dominant HRV penalty tanks Charge anyway.
+    //
+    // The discriminator is the SIGN of the resting-HR term versus the HRV term. recovery() builds the
+    // HRV term as (hrv - mu)/sigma (NEGATIVE when HRV is below baseline = the penalty) and the RHR term
+    // as (mu - rhr)/sigma (POSITIVE when resting HR is below baseline = recovery-good). In a normally-
+    // coupled autonomic response a low HRV travels WITH a HIGH resting HR (sympathetic drive), so both
+    // terms point the SAME way (down). When instead the HRV term points "bad" while the resting-HR term
+    // points "good", the expected HRV<->RHR coupling has broken — the signature of vagal saturation, not
+    // fatigue. In that regime the guard EASES (never removes) the low-HRV penalty; real fatigue (low HRV
+    // + HIGH resting HR) is left exactly as it was.
+
+    /** Personal-sigma units BOTH the low-HRV arm and the low-resting-HR arm must clear before the guard
+     *  engages. 0.5 sigma keeps it OFF marginal / noise nights. Mirrors Swift `RecoveryScorer.satEnterZ`. */
+    const val satEnterZ: Double = 0.5
+
+    /** Personal-sigma units at which the saturation signal reaches FULL strength; between [satEnterZ] and
+     *  this the easing ramps linearly from 0 to [satMaxDampFraction]. Mirrors Swift `satFullZ`. */
+    const val satFullZ: Double = 1.5
+
+    /** Maximum fraction of the low-HRV penalty the guard will ever credit back. 0.5 = at most HALF the
+     *  penalty is eased, so a genuinely low-HRV night is NEVER scored as if HRV sat at baseline. Mirrors
+     *  Swift `satMaxDampFraction`. */
+    const val satMaxDampFraction: Double = 0.5
+
+    /**
+     * Outcome of the parasympathetic-saturation check for one night. Mirrors Swift
+     * `RecoveryScorer.ParasympatheticSaturation`.
+     *
+     * @property effectiveHrvZ effective HRV z after easing. Equals the input hrvZ when the guard is
+     *   inactive; when active it is shrunk toward 0 (never past it), lightening the low-HRV penalty.
+     * @property active true iff the saturation regime was detected AND the penalty was actually eased.
+     * @property dampFraction fraction of the HRV penalty credited back, in [0, satMaxDampFraction]. 0 when inactive.
+     */
+    data class ParasympatheticSaturation(
+        val effectiveHrvZ: Double,
+        val active: Boolean,
+        val dampFraction: Double,
+    )
+
+    /**
+     * Detect parasympathetic saturation from tonight's HRV and resting-HR z-scores and, when the
+     * signature is present, ease the low-HRV penalty by shrinking its (negative) z toward 0. Mirrors
+     * Swift `RecoveryScorer.parasympatheticSaturation` byte-for-byte.
+     *
+     * @param hrvZ the HRV term as recovery() builds it, (hrv - mu)/sigma. Higher is better; a NEGATIVE
+     *   value means HRV is below baseline (the penalty direction).
+     * @param rhrZ the resting-HR term as recovery() builds it, (mu - rhr)/sigma. Higher is better; a
+     *   POSITIVE value means resting HR is below baseline (the recovery-good direction). null when there
+     *   is no resting-HR baseline — with nothing to corroborate the low HRV, the guard never fires.
+     */
+    internal fun parasympatheticSaturation(hrvZ: Double, rhrZ: Double?): ParasympatheticSaturation {
+        // Without a resting-HR term there is nothing to corroborate the low HRV: benign saturation and
+        // real fatigue are indistinguishable from HRV alone, so score the night as-is.
+        if (rhrZ == null) {
+            return ParasympatheticSaturation(effectiveHrvZ = hrvZ, active = false, dampFraction = 0.0)
+        }
+        // Saturation SIGNATURE, in personal-sigma units:
+        //   hrvLow > 0 <=> HRV below baseline (the penalty we might ease)
+        //   rhrLow > 0 <=> resting HR below baseline (the corroborating "also low" signal)
+        // Both must clear satEnterZ, so only a clear low-HRV + low-RHR decoupling is ever eased and a
+        // low-HRV + HIGH-RHR fatigue night (rhrLow < 0) can never qualify.
+        val hrvLow = -hrvZ
+        val rhrLow = rhrZ
+        if (hrvLow < satEnterZ || rhrLow < satEnterZ) {
+            return ParasympatheticSaturation(effectiveHrvZ = hrvZ, active = false, dampFraction = 0.0)
+        }
+        // Strength is driven by the WEAKER of the two arms (min), normalized from the entry gate to
+        // satFullZ and clamped to [0, 1]. Using the weaker arm is deliberately conservative.
+        val couplingStrength = min(hrvLow, rhrLow)
+        val s = max(0.0, min(1.0, (couplingStrength - satEnterZ) / (satFullZ - satEnterZ)))
+        val dampFraction = satMaxDampFraction * s
+        // Ease by shrinking the (negative) HRV z toward 0. (1 - dampFraction) stays in
+        // [1 - satMaxDampFraction, 1], so the penalty is only ever REDUCED — never removed, never
+        // sign-flipped into a bonus.
+        val effectiveHrvZ = hrvZ * (1.0 - dampFraction)
+        return ParasympatheticSaturation(
+            effectiveHrvZ = effectiveHrvZ,
+            active = dampFraction > 0.0,
+            dampFraction = dampFraction,
+        )
+    }
+
     /** Rolling-mean HR window (seconds) for the resting-HR estimate. */
     const val restingHRWindowS: Int = 5 * 60
 
@@ -348,13 +438,21 @@ object RecoveryScorer {
 
         val terms = ArrayList<Pair<Double, Double>>() // (z, weight)
 
-        // HRV term: higher is better.
+        // Resting-HR z, computed up front: the parasympathetic-saturation guard needs to inspect the
+        // HRV<->RHR coupling BEFORE the dominant HRV term is folded in. null when there is no RHR
+        // baseline (no RHR term), in which case the guard cannot fire.
+        val rhrZ: Double? = rhrBaseline?.let { zScore(it.mean, rhr, it.spread) }
+
+        // HRV term: higher is better. When resting HR corroborates a benign parasympathetic-saturation
+        // pattern (HRV low AND resting HR low, decoupled), the low-HRV penalty is eased — never on a
+        // low-HRV + HIGH-resting-HR fatigue night. See [parasympatheticSaturation].
         hrvBaseline?.let { b ->
-            terms.add(zScore(hrv, b.mean, b.spread) to wHRV)
+            val hrvZ = zScore(hrv, b.mean, b.spread)
+            terms.add(parasympatheticSaturation(hrvZ = hrvZ, rhrZ = rhrZ).effectiveHrvZ to wHRV)
         }
-        // RHR term: lower is better → (μ − x) / σ.
-        rhrBaseline?.let { b ->
-            terms.add(zScore(b.mean, rhr, b.spread) to wRHR)
+        // RHR term: lower is better → (μ − x) / σ. Unchanged by the guard (reuses the z above).
+        rhrZ?.let { z ->
+            terms.add(z to wRHR)
         }
         // Resp term: lower is better, optional.
         if (resp != null && respBaseline != null) {
