@@ -103,4 +103,33 @@ final class DailyStressEngineTests: XCTestCase {
         let days = (1...4).map { dm($0, hrv: 90, rhr: 50) }
         XCTAssertNil(DailyStressEngine.evaluate(days: days), "fewer than the minimum baseline nights → nil")
     }
+
+    func testGradualDeclineIsSurfacedByTheMedianLongReference() {
+        // A slow multi-week HRV decline (120 → 74 over 60 nights), today at the low end. A recency-
+        // WEIGHTED "long" baseline collapses onto the recent low and reads ~0% (the bug a real device's
+        // gradually-declining data exposed); the robust MEDIAN long reference captures the decline.
+        var days: [DailyMetric] = []
+        for i in 0..<60 {
+            days.append(dm(i + 1, hrv: 120.0 - Double(i) * (46.0 / 59.0), rhr: 46))   // 120 → 74 linear
+        }
+        days.append(dm(61, hrv: 74, rhr: 46))
+        let cs = DailyStressEngine.evaluate(days: days)!.chronicShift!
+        XCTAssertGreaterThan(cs.hrvPctBelowLongTerm, 10,
+            "the median long reference must surface a months-long decline that a recency-weighted long baseline would hide")
+    }
+
+    func testMultipleDeviceRowsPerDayAreDedupedToOnePerDay() {
+        // Two source rows for the same day (Apple with only RHR, WHOOP with HRV+RHR): the richer row
+        // wins, and the baseline windows count DAYS not device-rows (else a "60-day" window shrinks).
+        var days: [DailyMetric] = []
+        for i in 1...20 {
+            days.append(dm(i, hrv: nil, rhr: 55))         // apple-like: RHR only
+            days.append(dm(i, hrv: 90, rhr: 50))          // whoop-like: richer (HRV present)
+        }
+        days.append(dm(21, hrv: 66, rhr: 60))
+        let s = DailyStressEngine.evaluate(days: days)!
+        // If dedup failed, the HRV baseline would still work but be built off far fewer than 20 days;
+        // the score should still classify a clear HRV-down + RHR-up night as stress.
+        XCTAssertEqual(s.quadrant, .sympatheticStress)
+    }
 }

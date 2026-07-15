@@ -126,11 +126,28 @@ public enum DailyStressEngine {
     /// day is `today` (a "yyyy-MM-dd") if given and present, else the latest row carrying HRV/RHR.
     /// Returns nil when there is no scorable day or too little baseline.
     public static func evaluate(days: [DailyMetric], today: String? = nil) -> DailyStress? {
-        let sorted = days.sorted { $0.day < $1.day }
+        let sorted = dedupByDay(days.sorted { $0.day < $1.day })
         let idx: Int?
         if let today { idx = sorted.firstIndex { $0.day == today && ($0.avgHrv != nil || $0.restingHr != nil) } }
         else { idx = sorted.lastIndex { $0.avgHrv != nil || $0.restingHr != nil } }
         guard let i = idx else { return nil }
+        return evaluateSorted(sorted, at: i)
+    }
+
+    /// Batch-score every scorable day in ONE pass — sorts once, so a caller drawing the whole trend pays
+    /// O(n · window) folds instead of O(n²·log n) re-sorts. Chronological (day, score) pairs.
+    public static func evaluateSeries(days: [DailyMetric]) -> [(day: String, stress: DailyStress)] {
+        let sorted = dedupByDay(days.sorted { $0.day < $1.day })
+        var out: [(day: String, stress: DailyStress)] = []
+        out.reserveCapacity(sorted.count)
+        for i in sorted.indices where sorted[i].avgHrv != nil || sorted[i].restingHr != nil {
+            if let s = evaluateSorted(sorted, at: i) { out.append((day: sorted[i].day, stress: s)) }
+        }
+        return out
+    }
+
+    /// Score `sorted[i]` against the days strictly before it. `sorted` MUST be day-ascending.
+    static func evaluateSorted(_ sorted: [DailyMetric], at i: Int) -> DailyStress? {
         let scored = sorted[i]
         let history = Array(sorted[0..<i])   // strictly before today
 
@@ -196,16 +213,24 @@ public enum DailyStressEngine {
 
     static func chronicShift(scored: DailyMetric, history: [DailyMetric],
                              shortHRVln: BaselineState, longHist: [DailyMetric]) -> ChronicShift? {
-        guard let longHRVln = foldLnHRV(longHist), longHRVln.usable else { return nil }
-        // % the recent HRV baseline sits below the long-term (both are geometric centres in ln-space).
-        let hrvPct = (1.0 - exp(shortHRVln.baseline - longHRVln.baseline)) * 100.0
-        let shortRHR = foldRHR(Array(history.suffix(shortWindowDays)))
-        let longRHR = foldRHR(longHist)
-        let rhrBpm: Double = (shortRHR?.usable == true && longRHR?.usable == true)
-            ? shortRHR!.baseline - longRHR!.baseline : 0.0
+        let longLnHRV = longHist.compactMap { $0.avgHrv.map { log(max($0, 1.0)) } }
+        guard longLnHRV.count >= minBaselineNights else { return nil }
+        // The long-term reference is a ROBUST MEDIAN centre over the long window — deliberately NOT the
+        // recency-weighted EWMA the short baseline uses: with the same short half-life the "60-day" EWMA
+        // collapses onto the recent level and the shift we exist to surface vanishes (it read 0% on real
+        // gradually-declining data). The short baseline stays the recent EWMA centre; short-vs-long median
+        // is the sustained shift.
+        let longCenterLn = median(longLnHRV)
+        let hrvPct = (1.0 - exp(shortHRVln.baseline - longCenterLn)) * 100.0
+
+        let shortRHR = history.suffix(shortWindowDays).compactMap { $0.restingHr.map(Double.init) }
+        let longRHR = longHist.compactMap { $0.restingHr.map(Double.init) }
+        let rhrBpm: Double = (shortRHR.count >= 3 && longRHR.count >= minBaselineNights)
+            ? shortRHR.reduce(0, +) / Double(shortRHR.count) - median(longRHR) : 0.0
+
         let sustained = hrvPct >= sustainedHRVPctThreshold && rhrBpm >= sustainedRHRBpmThreshold
-        // Duration: trailing nights whose HRV sat below the long-term band (mean − 0.5σ, the SWC edge).
-        let bandFloorLn = longHRVln.baseline - swcBand * max(1.253 * longHRVln.spread, 1e-9)
+        // Duration: trailing nights whose HRV sat below the long-term band (median − 0.5·robust σ).
+        let bandFloorLn = longCenterLn - swcBand * max(1.4826 * mad(longLnHRV), 1e-9)
         var d = 0
         for row in (history + [scored]).reversed() {
             guard let h = row.avgHrv else { continue }
@@ -213,6 +238,36 @@ public enum DailyStressEngine {
         }
         return ChronicShift(hrvPctBelowLongTerm: hrvPct, rhrBpmAboveLongTerm: rhrBpm,
                             isSustainedLoad: sustained, daysBelowBand: d)
+    }
+
+    /// Median of an unsorted array (0 for empty).
+    static func median(_ xs: [Double]) -> Double {
+        guard !xs.isEmpty else { return 0 }
+        let s = xs.sorted(); let n = s.count
+        return n % 2 == 1 ? s[n / 2] : (s[n / 2 - 1] + s[n / 2]) / 2
+    }
+    /// Median absolute deviation (robust spread; ×1.4826 ≈ σ for normal data).
+    static func mad(_ xs: [Double]) -> Double {
+        let m = median(xs)
+        return median(xs.map { abs($0 - m) })
+    }
+
+    /// Collapse multiple same-day rows (one per source device — Oura / WHOOP / Apple) into ONE row per
+    /// calendar day, keeping the richest (HRV beats RHR beats neither). `sorted` MUST be day-ascending.
+    /// Without this, the trailing-window baselines count DEVICE-ROWS, not days, so a "60-day" window can
+    /// cover ~30 calendar days and the chronic-shift reference never reaches the pre-shift level.
+    static func dedupByDay(_ sorted: [DailyMetric]) -> [DailyMetric] {
+        var out: [DailyMetric] = []
+        out.reserveCapacity(sorted.count)
+        func richness(_ m: DailyMetric) -> Int { (m.avgHrv != nil ? 2 : 0) + (m.restingHr != nil ? 1 : 0) }
+        for row in sorted {
+            if let last = out.last, last.day == row.day {
+                if richness(row) > richness(last) { out[out.count - 1] = row }
+            } else {
+                out.append(row)
+            }
+        }
+        return out
     }
 
     // MARK: - Baseline folds (reuse the shared window-fold spine: reject OFF so a sustained shift adapts)

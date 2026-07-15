@@ -205,7 +205,7 @@ struct StressView: View {
 
             // 2. Today's numbers — uniform tiles in one grid.
             VStack(alignment: .leading, spacing: NoopMetrics.gap) {
-                SectionHeader("Today", overline: "Markers", trailing: String(localized: "vs 30-day baseline"))
+                SectionHeader("Today", overline: "Markers", trailing: String(localized: "vs your baseline"))
                 tileGrid(model)
             }
             .staggeredAppear(index: 1)
@@ -600,7 +600,7 @@ struct StressView: View {
                      : "Stress is derived from two autonomic signals.")
                     .font(StrandFont.body)
                     .foregroundStyle(StrandPalette.textPrimary)
-                Text("We compare today's resting heart rate and HRV to your own 30-day baseline. A higher-than-usual resting HR and a lower-than-usual HRV both push the score up, classic signs the body is activated. The combined shift is mapped onto a 0-3 scale: 0 is calm, 1.5 sits at your baseline, 3 is highly activated.")
+                Text("We compare today's resting heart rate and HRV to your own recent baseline (HRV on a log scale, the way the science recommends). A higher-than-usual resting HR AND a lower-than-usual HRV together are the classic sign of activation — and we only read low HRV as stress when your resting HR is up too, so a deeply-relaxed low-HRV night isn't mistaken for stress. The combined shift is mapped onto a 0-3 scale: 0 is calm, 1.5 sits at your baseline, 3 is highly activated. A sustained shift in your baseline itself is called out separately.")
                     .font(StrandFont.subhead)
                     .foregroundStyle(StrandPalette.textSecondary)
                     .fixedSize(horizontal: false, vertical: true)
@@ -766,6 +766,12 @@ struct StressModel {
     let calmTimeValue: String    // e.g. "58%"
     let calmTimeCaption: String  // e.g. "of last 30 days"
     let usingStored: Bool        // true when today's value came from the stored series
+    /// The Buchheit autonomic quadrant behind today's derived score (nil for a stored/cold-start day).
+    let quadrant: DailyStressEngine.Quadrant?
+    /// The sustained baseline-shift readout — surfaced SEPARATELY from the score (a sustained supplement /
+    /// training / illness load reads as a *shifted baseline*, not acute daily stress). Nil until there's
+    /// enough long history, or on a stored day.
+    let chronicShift: DailyStressEngine.ChronicShift?
 
     /// Last up-to-14 trend values, for the hero tile sparkline.
     var sparkValues: [Double] { Array(fullTrend.suffix(14)).map(\.value) }
@@ -814,16 +820,26 @@ struct StressModel {
         let rhrT = today.restingHr.map(Double.init)
         let hrvT = today.avgHrv
 
-        // Resolve today's score: prefer a stored value, else derive.
+        // Resolve today's score: prefer a stored (imported) value; else the DailyStressEngine
+        // (dual-baseline, coupled, log-domain); else the legacy StressMath path for a cold-start day the
+        // engine can't yet score (< its minimum baseline). The engine also yields today's autonomic
+        // quadrant + the separate chronic-shift readout.
+        // One batch pass scores every day against its OWN prior baseline (sorts once) — reused for both
+        // today's headline and the whole trend below.
+        let engineByDay: [String: DailyStressEngine.DailyStress] = Dictionary(
+            DailyStressEngine.evaluateSeries(days: days).map { ($0.day, $0.stress) },
+            uniquingKeysWith: { a, _ in a })
+        let engineToday = engineByDay[today.day]
         let derivedAvailable = (rhrT != nil && meanRHR != nil) || (hrvT != nil && meanHRV != nil)
         let storedToday = storedByDay[today.day]
-        guard storedToday != nil || derivedAvailable else { return nil }
+        guard storedToday != nil || engineToday != nil || derivedAvailable else { return nil }
 
-        let derivedToday: Double? = derivedAvailable
+        let legacyDerived: Double? = derivedAvailable
             ? StressMath.squash(StressMath.rawScore(
                 rhrToday: rhrT, meanRHR: meanRHR, sdRHR: sdRHR,
                 hrvToday: hrvT, meanHRV: meanHRV, sdHRV: sdHRV))
             : nil
+        let derivedToday: Double? = engineToday?.score ?? legacyDerived
 
         let s = storedToday ?? derivedToday ?? 1.5
         self.usingStored = storedToday != nil
@@ -833,22 +849,37 @@ struct StressModel {
         self.hrvToday = hrvT
         self.rhrDelta = (rhrT != nil && meanRHR != nil) ? (rhrT! - meanRHR!) : nil
         self.hrvDelta = (hrvT != nil && meanHRV != nil) ? (hrvT! - meanHRV!) : nil
+        // Quadrant + chronic-shift apply only to an engine-derived score, not a stored/import day.
+        self.quadrant = storedToday == nil ? engineToday?.quadrant : nil
+        self.chronicShift = storedToday == nil ? engineToday?.chronicShift : nil
 
-        self.explanation = StressMath.explanation(
+        var explanationText = StressMath.explanation(
             band: self.band,
             rhrDelta: self.rhrDelta,
             hrvDelta: self.hrvDelta,
             usingStored: self.usingStored
         )
+        // Surface a SUSTAINED baseline shift as CONTEXT — never folded into the number. A low daily
+        // score sitting on top of a suppressed baseline is a shifted "normal", not calm; and a real
+        // sustained load stays visible instead of being defined away once the short baseline adapts.
+        if let cs = self.chronicShift, cs.isSustainedLoad {
+            explanationText += " Your resting HRV has held about \(Int(cs.hrvPctBelowLongTerm.rounded()))% "
+                + "below your 60-day normal — a sustained autonomic shift (a supplement, a heavy training "
+                + "block, or getting run down can all do this), not just today."
+        }
+        self.explanation = explanationText
 
-        // Full daily proxy history: stored value if present for the day, else the
-        // z-score derivation against the SAME baseline so the line is comparable.
+        // Full daily history: a stored value if present, else the engine's score for THAT day — each day
+        // vs its OWN contemporaneous dual baseline (fixing the old line, which re-scored all history
+        // against today's single baseline), else the legacy proxy for an early day the engine can't score.
         var pts: [TrendPoint] = []
         for d in days {
             guard let date = Self.dayParser.date(from: d.day) else { continue }
             if let v = storedByDay[d.day] {
-                pts.append(TrendPoint(date: date, value: v))
-                continue
+                pts.append(TrendPoint(date: date, value: v)); continue
+            }
+            if let e = engineByDay[d.day] {
+                pts.append(TrendPoint(date: date, value: e.score)); continue
             }
             let dRHR = d.restingHr.map(Double.init)
             let dHRV = d.avgHrv
