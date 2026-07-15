@@ -81,10 +81,7 @@ final class PuffinDeepBufferLog {
     private var disabled = false
 
     private var isEnabled: Bool {
-        // LOCAL personal-capture build: force-ON + 600 MB cap to catch the 2026-07-14 dead-strap backlog
-        // whole (~380 MB of hex) before the ack-trim frees it from the strap. Never commit this.
-        UserDefaults.standard.set(600, forKey: "PuffinDeepBufferSoftCapMB")
-        return true
+        UserDefaults.standard.bool(forKey: PuffinFrameRecorder.enabledKey)
     }
 
     /// `<AppSupport>/OpenWhoop/puffin-deepbuffers.jsonl` — OUTSIDE `puffin-captures/`, whose soft-cap
