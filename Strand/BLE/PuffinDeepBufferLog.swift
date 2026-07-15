@@ -31,7 +31,17 @@ final class PuffinDeepBufferLog {
     /// The 2140-B buffers are ~4.3 KB of hex each and arrive in bursts, so a bigger cap than the
     /// EVENT log: 60 MB live keeps roughly a few hours of accumulated high-rate bursts, ample to
     /// reverse the layout, and rotation bounds total disk at ~120 MB.
-    private static let softCapBytes = 60 * 1024 * 1024
+    ///
+    /// Overridable via the `PuffinDeepBufferSoftCapMB` default because the 60 MB figure is sized for
+    /// "a few hours of bursts", which is the STEADY-STATE case. Recovering a dead-strap backlog is the
+    /// other case: the strap banks one 1244-B + one 2140-B buffer per SECOND of history, so a 16 h
+    /// backlog is ~190 MB raw / ~380 MB of hex — it would rotate away most of itself before the drain
+    /// ends, and the ack-trim frees those buffers from the strap permanently as it goes. A one-shot
+    /// raise is the only way to keep a full backlog intact. 0 or unset keeps the 60 MB default.
+    private static var softCapBytes: Int {
+        let mb = UserDefaults.standard.integer(forKey: "PuffinDeepBufferSoftCapMB")
+        return (mb > 0 ? mb : 60) * 1024 * 1024
+    }
 
     /// WHOOP 5/MG inner-record type byte for the R22 deep packets (type 47 / 0x2F), at offset 8 (the
     /// same position `BLEManager.isOffloadFrame` / `PuffinEventLog` index). The 1 Hz historical rollup
@@ -40,6 +50,23 @@ final class PuffinDeepBufferLog {
     private static let innerRecordOffset = 8
     /// Skip the ~124-B ≈1 Hz record; keep the 1244-/2140-B high-rate buffers.
     private static let minBufferBytes = 1000
+
+    /// Lowercase hex, table-driven. NOT cosmetic: this runs on the MainActor inside the offload ack path,
+    /// and the obvious `frame.map { String(format: "%02x", $0) }.joined()` costs one Foundation formatter
+    /// call + one String allocation PER BYTE — ~3 ms for a 2140-B buffer. The strap banks one 1244-B and
+    /// one 2140-B buffer per second of history, so draining a backlog at 5x real-time formats ~170
+    /// buffers/sec ≈ 400 ms of every second, and the strap sits idle waiting for the ack behind it. A
+    /// nibble lookup into a byte array is ~80x cheaper and allocates once.
+    private static let hexDigits: [UInt8] = Array("0123456789abcdef".utf8)
+    nonisolated static func hexString(_ bytes: [UInt8]) -> String {
+        var out = [UInt8]()
+        out.reserveCapacity(bytes.count * 2)
+        for b in bytes {
+            out.append(hexDigits[Int(b >> 4)])
+            out.append(hexDigits[Int(b & 0x0F)])
+        }
+        return String(decoding: out, as: UTF8.self)
+    }
 
     /// Pure predicate: is `frame` a WHOOP 5/MG high-rate deep buffer? A reassembled frame's inner-record
     /// type byte sits at offset 8, so this needs `count > 8` before indexing. Extracted so the offset-8
@@ -54,7 +81,10 @@ final class PuffinDeepBufferLog {
     private var disabled = false
 
     private var isEnabled: Bool {
-        UserDefaults.standard.bool(forKey: PuffinFrameRecorder.enabledKey)
+        // LOCAL personal-capture build: force-ON + 600 MB cap to catch the 2026-07-14 dead-strap backlog
+        // whole (~380 MB of hex) before the ack-trim frees it from the strap. Never commit this.
+        UserDefaults.standard.set(600, forKey: "PuffinDeepBufferSoftCapMB")
+        return true
     }
 
     /// `<AppSupport>/OpenWhoop/puffin-deepbuffers.jsonl` — OUTSIDE `puffin-captures/`, whose soft-cap
@@ -96,14 +126,33 @@ final class PuffinDeepBufferLog {
         guard !disabled, Self.isDeepBuffer(frame), isEnabled else { return }
         let tsMs = Int(Date().timeIntervalSince1970 * 1000)
         let strapTs = Self.strapTs(frame).map { String($0) } ?? "null"
-        let hex = frame.map { String(format: "%02x", $0) }.joined()
+        let hex = Self.hexString(frame)
         // #423/#455: run the raw-IMU decoder on the 1244-B buffer so every captured IMU frame carries
         // its decoded activity summary (cadence/energy/jerk/gyro) inline beside the raw hex. This is the
         // first CALLER of `Whoop5RawImu.decode` outside its own tests — it exercises the decoder on real
         // device captures and makes each JSONL line self-checking (raw ↔ decode) with NO stored table,
         // migration, or downstream gate. Instrumentation only, per the derived-signal rule; the 2140-B
         // optical buffer stays raw-only (its layout isn't decoded yet).
-        let imu = Self.decodedImuField(frame)
+        // LIVE frames only — a hygiene measure, NOT a throughput fix. Keeping the honest numbers here so
+        // nobody re-derives the wrong conclusion from this file a third time:
+        //
+        // A real 19 h drain (3,018 buffers / 208 s) shows a mean gap of 89.1 ms after a 1244-B buffer vs
+        // 49.0 ms after a 2140-B one. That asymmetry is NOT this decode — it is pure airtime, and reading
+        // it as a stall is an off-by-one. A gap is the time for the NEXT frame(s) to arrive, not the
+        // previous frame's processing, and the ~124-B v18 record sits between the two logged buffers
+        // (it's below `minBufferBytes`, so it is invisible here). So the gap after the 1244-B spans
+        // 124+2140 = 2264 B and the gap after the 2140-B spans only 1244 B. One free parameter — the link
+        // rate — fixed by the total (3508 B / 138.1 ms = 25.4 KB/s) then predicts the SPLIT with zero
+        // further freedom: 89.13 ms and 48.97 ms, against 89.1 and 49.0 observed. The two gaps
+        // independently agree on the byte rate to 0.09%. The link is a metronome; there is no stall.
+        // Removing this decode measured 7.2x -> 7.7x, consistent with its true ~7 ms cost, not 40 ms.
+        //
+        // It is still right to skip during offload: it is per-frame work on the MainActor in the delivery
+        // path, it buys nothing there, and the raw `hex` on this very line is the decoder's own input — so
+        // the summary is recomputable offline from the archive at any time. Live frames arrive ~1/s, where
+        // the inline summary is free and makes each line self-checking. Capture captures; analysis is
+        // downstream. The real duty-cycle costs are the idle watchdog and the auto-continue cap.
+        let imu = isOffload ? "" : Self.decodedImuField(frame)
         let line = "{\"ts_ms\":\(tsMs),\"strap_ts\":\(strapTs),\"size\":\(frame.count),"
             + "\"offload\":\(isOffload),\"char\":\"\(char.uuidString.lowercased())\",\"hex\":\"\(hex)\"\(imu)}\n"
         do {

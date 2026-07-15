@@ -314,10 +314,26 @@ struct Whoop5EmptyOffloadTracker {
 /// its idle timeout — the reported ~15-min sync). The stale/PAST-epoch case 2b actually exists for (#451)
 /// reads BEHIND the frontier, never future-dated, so it is untouched.
 struct BackfillContinuation {
-    /// Hard cap on consecutive auto-continues per connection (resets on disconnect). 6 × ~60s ≈ 6 min of
-    /// back-to-back draining — enough to chew through a multi-night backlog far faster than the 15-min
-    /// floor, without letting a misbehaving strap monopolise Bluetooth.
-    static let defaultMaxAutoContinues = 6
+    /// Hard cap on consecutive auto-continues per connection (resets on disconnect), as a LAST-RESORT
+    /// backstop only. Guards 2 and 3 are the real protection and they stop on *evidence*: 2 stops the
+    /// moment the strap is no longer ahead of our frontier, 3 stops the moment a session fails to move
+    /// the trim cursor. A strap that is both genuinely behind AND genuinely handing over data is not
+    /// pathological — it is working, and cutting it off is the bug.
+    ///
+    /// The old value of 6 came with the rationale "6 × ~60s ≈ 6 min of back-to-back draining — enough to
+    /// chew through a multi-night backlog". That premise is arithmetically wrong. Offload runs at ~7x
+    /// real-time (airtime-limited at ~25.4 KB/s against the 3508 B the strap banks per second-of-history),
+    /// so six minutes of draining recovers ~42 minutes of history — not a multi-night backlog. Recovering
+    /// a single dead-strap night (~19 h) needs ~2.7 h of draining, i.e. ~50+ sessions. At 6 the cap fires
+    /// mid-recovery and drops to `backfillIntervalSeconds` (900 s) — a 6.7% duty cycle, turning a ~3 h
+    /// drain into ~12 h+. That is the "worst practical impact" recorded in
+    /// docs/bugs/2026-07-15-strap-battery-backfill-observability.md (A5), measured on a real 18 h backlog.
+    ///
+    /// 120 covers a full night's recovery with ~2x margin while still bounding a truly runaway loop that
+    /// somehow satisfies guards 2 and 3 forever. The cap resets on disconnect, so it was never a battery
+    /// ceiling across a day — only a ceiling on one continuous recovery, which is exactly when we want to
+    /// keep going.
+    static let defaultMaxAutoContinues = 120
     /// How far ahead the strap must be (seconds) before "more backlog remains" is real, not clock noise.
     /// Matches StuckStrapDetector.behindGapSeconds (5 min) so the two agree on "behind".
     static let defaultBehindGapSeconds = 300
@@ -1643,10 +1659,22 @@ public final class BLEManager: NSObject, ObservableObject {
     /// Re-arm the idle watchdog. Called on every offload frame during backfill so the timer resets
     /// as long as the strap keeps sending HISTORY; if the strap goes silent the timer fires and we
     /// exit the session (the durable strap_trim cursor means the next session resumes where we left
-    /// off). Timeout is generous (60 s, not 20 s): the unstoppable ~2/s type-43 raw flood eats BLE
-    /// airtime, so genuine offload frames can arrive in bursts with multi-second lulls between chunks
-    /// — a short watchdog cut sessions short mid-drain. Longer = more records drained per session.
-    static let backfillIdleTimeoutSeconds = 60
+    /// off). Timeout must clear the real inter-frame tail: the unstoppable ~2/s type-43 raw flood eats
+    /// BLE airtime, so genuine offload frames arrive with lulls between chunks — a short watchdog cut
+    /// sessions short mid-drain.
+    ///
+    /// 60 s was set without a measurement of that tail; it is ~24x the real worst case, and every session
+    /// pays it in full as dead air on the way out. A 3,018-buffer arrival trace from a real 19 h drain
+    /// puts inter-frame gaps at p50 64 ms / p90 106 ms / p99 273 ms / max 2,520 ms — the tail sits at
+    /// chunk boundaries (~51 records, where decode + insert + cursor + ack happen), not mid-chunk. 15 s is
+    /// ~6x that measured max, still clears the flood, and cuts the per-session exit cost by 4x.
+    ///
+    /// Deliberately NOT the ~5 s the tail alone would justify: that margin protects against a tail we have
+    /// sampled over ONE drain on ONE firmware, and the downside is asymmetric. Firing early is safe but
+    /// wasteful — the in-memory chunk is dropped un-acked, so the strap keeps it and the next session
+    /// refetches — whereas firing late only costs idle seconds. Buy the cheap 4x; leave the risky 3x until
+    /// the tail is instrumented across firmwares.
+    static let backfillIdleTimeoutSeconds = 15
     private func armBackfillTimeout() {
         backfillTimeout?.cancel()
         let item = DispatchWorkItem { [weak self] in

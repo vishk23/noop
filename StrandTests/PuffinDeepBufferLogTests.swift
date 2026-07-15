@@ -18,6 +18,29 @@ final class PuffinDeepBufferLogTests: XCTestCase {
         XCTAssertTrue(PuffinDeepBufferLog.isDeepBuffer(g))
     }
 
+    func testHexStringMatchesFormatterForEveryByteValue() {
+        // Byte-for-byte parity with the `String(format: "%02x")` encoding it replaces, across the whole
+        // domain — the JSONL is a research archive, so a wrong nibble is silent corruption of the only
+        // copy of buffers the strap has already freed.
+        let all = (0...255).map { UInt8($0) }
+        XCTAssertEqual(PuffinDeepBufferLog.hexString(all),
+                       all.map { String(format: "%02x", $0) }.joined())
+        XCTAssertEqual(PuffinDeepBufferLog.hexString([]), "")
+        XCTAssertEqual(PuffinDeepBufferLog.hexString([0x00, 0x0F, 0xF0, 0xFF]), "000ff0ff")
+    }
+
+    func testHexStringIsFastEnoughForTheAckPath() {
+        // Guards the regression that matters: this runs on the MainActor inside the offload ack path, so
+        // a per-byte Foundation formatter (~3 ms per 2140-B buffer) throttles the whole drain. Encoding
+        // one buffer must stay far under a millisecond. Threshold is deliberately loose — it's catching
+        // an 80x cliff, not micro-benchmarking.
+        let frame = (0..<2140).map { UInt8($0 & 0xFF) }
+        let start = Date()
+        for _ in 0..<100 { _ = PuffinDeepBufferLog.hexString(frame) }
+        let perBuffer = Date().timeIntervalSince(start) / 100
+        XCTAssertLessThan(perBuffer, 0.001, "hex encode regressed to \(perBuffer * 1000) ms/buffer")
+    }
+
     func testRejectsSmallType2FRecord() {
         // The ~124-B type-0x2F frame is the 1 Hz rollup NOOP already decodes — below the size gate,
         // it must NOT be logged as a high-rate buffer.
