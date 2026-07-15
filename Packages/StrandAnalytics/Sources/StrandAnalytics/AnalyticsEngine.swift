@@ -536,14 +536,16 @@ public enum AnalyticsEngine {
             return weight > 0 ? total / weight : nil
         }()
 
-        // Daily SDNN (ms) = whole-night sample-SD (Task Force ddof=1) over the in-bed R-R across matched
-        // sessions — the BROAD autonomic-variability metric (both autonomic branches), the slow /
-        // accumulated-load twin of the vagal RMSSD `avgHRVDaily` above (which is fast, deep-window / vagal).
-        // Same in-sleep R-R the HRV trace uses; nil when too few clean beats (HRVAnalyzer's own gate).
+        // Daily SDNN (ms) = the 5-min SDNN INDEX (Task Force) over the in-bed R-R across matched sessions —
+        // the mean of per-5-min-segment SDNN, the BROAD autonomic-variability metric (both branches) and the
+        // slow twin of the vagal RMSSD `avgHRVDaily` above. The index (not a single whole-night SD) is used
+        // deliberately: whole-night SD is dominated by the slow HR drift across sleep stages and reads 2-3×
+        // high, which would mislabel Apple Health (its SDNN samples are short-window) and make any cross-check
+        // against a watch meaningless. The 5-min index is window-comparable to those. nil when no segment has
+        // enough clean beats (HRVAnalyzer's own gate). Keeps the R-R timestamps (segmentation needs them).
         let avgSDNNDaily: Double? = {
             let inBed = rr.filter { r in matched.contains { r.ts >= $0.start && r.ts < $0.end } }
-                          .map { Double($0.rrMs) }
-            return inBed.isEmpty ? nil : HRVAnalyzer.analyze(rawRR: inBed).sdnn
+            return inBed.isEmpty ? nil : HRVAnalyzer.sdnnIndex(inBed, segmentSec: 300)
         }()
 
         // ── HRV & Autonomic nightly trace (#141) ──────────────────────────────

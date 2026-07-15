@@ -68,11 +68,13 @@ public struct DailyMetric: Equatable, Codable {
     // call site is unaffected.
     public let spo2Red: Int?           // mean raw red PPG ADC during detected sleep
     public let spo2Ir: Int?            // mean raw IR PPG ADC during detected sleep
-    /// Nightly SDNN (ms — Task Force whole-night sample SD, ddof=1). The BROAD autonomic-variability
-    /// twin of `avgHrv` (which is RMSSD for the strap: the fast, vagal, "recovered today?" metric). SDNN
-    /// captures overall variability across the night — both autonomic branches — a slower, accumulated-load
-    /// read. v29 column, nullable: WHOOP/on-device nights compute it from the night's R-R (`HRVAnalyzer`);
-    /// Apple rows mirror their own SDNN reading; Oura/other imports carry no SDNN so it stays nil.
+    /// Nightly SDNN (ms — the Task Force 5-min SDNN INDEX: mean of per-5-min-segment SDNN, ddof=1). The
+    /// BROAD autonomic-variability twin of `avgHrv` (which is RMSSD for the strap: the fast, vagal,
+    /// "recovered today?" metric). The 5-min index — not a single whole-night SD — is stored deliberately:
+    /// whole-night SD is dominated by the slow HR drift across sleep stages (reads 2-3× high) and is not
+    /// comparable to a watch's short-window SDNN; the index is. v29 column, nullable: WHOOP/on-device nights
+    /// compute it from the night's R-R (`HRVAnalyzer.sdnnIndex`); Apple rows mirror their own SDNN reading;
+    /// Oura/other imports carry no SDNN so it stays nil.
     public let avgSdnn: Double?
     public init(day: String, totalSleepMin: Double?, efficiency: Double?, deepMin: Double?,
                 remMin: Double?, lightMin: Double?, disturbances: Int?, restingHr: Int?,
