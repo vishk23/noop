@@ -34,26 +34,85 @@ struct CrossDeviceHRVView: View {
     @State private var eras: [CrossDeviceHRVTrend.Era] = []
     @State private var rows: [Row] = []          // all nights, one continuous series (hero)
     @State private var segments: [[Row]] = []    // nights grouped per era (raw, scale-honest)
+    @State private var latestNight: Repository.NightHRV?   // dual-metric header + Apple cross-check
     @State private var loaded = false
 
     var body: some View {
         ScreenScaffold(title: "Cross-Device HRV",
                        subtitle: "Your full HRV history, stitched across a device switch") {
             VStack(alignment: .leading, spacing: NoopMetrics.sectionSpacing) {
-                if rows.count >= 2 {
-                    heroTrend
-                    rawTrend
-                    eraLegend
-                    methodology
-                } else if loaded {
-                    emptyCard
-                } else {
+                if !loaded {
                     ProgressView()
                         .frame(maxWidth: .infinity, minHeight: 220, alignment: .center)
+                } else {
+                    latestNightSection
+                    if rows.count >= 2 {
+                        heroTrend
+                        rawTrend
+                        eraLegend
+                        methodology
+                    } else if latestNight == nil {
+                        emptyCard
+                    }
                 }
             }
         }
         .task { await load() }
+    }
+
+    // MARK: 0 · Latest night — both HRV metrics, labeled (+ Apple cross-check)
+
+    @ViewBuilder private var latestNightSection: some View {
+        if let n = latestNight, n.rmssd != nil || n.sdnn != nil {
+            VStack(alignment: .leading, spacing: NoopMetrics.gap) {
+                SectionHeader("Latest Night", overline: "Both HRV metrics, labeled", trailing: prettyDay(n.day))
+                NoopCard(tint: StrandPalette.metricPurple) {
+                    VStack(alignment: .leading, spacing: NoopMetrics.cardInnerSpacing) {
+                        HStack(alignment: .top, spacing: 0) {
+                            metricColumn("RMSSD", n.rmssd, "beat-to-beat · vagal", StrandPalette.metricPurple)
+                            Divider().frame(height: 46).overlay(StrandPalette.hairline)
+                            metricColumn("SDNN", n.sdnn, "5-min index · overall", StrandPalette.metricCyan)
+                        }
+                        if let local = n.sdnn, let apple = n.appleSdnn, apple > 0 {
+                            Divider().overlay(StrandPalette.hairline)
+                            appleCrossCheck(local: local, apple: apple)
+                        }
+                        Text("RMSSD tracks fast vagal (parasympathetic) tone; SDNN captures overall variability. Both are computed from the same night's beats — different lenses, not different data — so they're no longer collapsed into one ambiguous \u{201C}HRV\u{201D} number.")
+                            .font(StrandFont.footnote).foregroundStyle(StrandPalette.textTertiary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                }
+            }
+        }
+    }
+
+    private func metricColumn(_ label: LocalizedStringKey, _ value: Double?, _ caption: String,
+                              _ accent: Color) -> some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Text(label).strandOverline()
+            Text(value.map { "\(Int($0.rounded())) ms" } ?? "—")
+                .font(StrandFont.title2)
+                .foregroundStyle(value == nil ? StrandPalette.textTertiary : accent)
+            Text(caption).font(StrandFont.footnote).foregroundStyle(StrandPalette.textTertiary)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(.horizontal, 2)
+    }
+
+    private func appleCrossCheck(local: Double, apple: Double) -> some View {
+        let deltaPct = Int(((local - apple) / apple * 100).rounded())
+        return VStack(alignment: .leading, spacing: 3) {
+            Text("Apple Watch cross-check").strandOverline()
+            HStack {
+                Text("NOOP 5-min SDNN \(Int(local.rounded())) ms")
+                Spacer()
+                Text("Apple \(Int(apple.rounded())) ms")
+            }
+            .font(StrandFont.subhead).foregroundStyle(StrandPalette.textSecondary)
+            Text("\(deltaPct >= 0 ? "+" : "")\(deltaPct)% vs your watch — both are short-window SDNN (NOOP over 5-min segments, Apple ~1-min), so NOOP's usually reads a little higher but tracks the same nightly moves.")
+                .font(StrandFont.footnote).foregroundStyle(StrandPalette.textTertiary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
     }
 
     // MARK: 1 · Era-relative long-term trend (the continuous shape across the switch)
@@ -256,6 +315,14 @@ struct CrossDeviceHRVView: View {
         guard let d = Self.dayParser.date(from: day) else { return day }
         return Self.monthYearFmt.string(from: d)
     }
+    private static let dayFmt: DateFormatter = {
+        let f = DateFormatter(); f.dateFormat = "MMM d"; f.locale = Locale(identifier: "en_US_POSIX")
+        return f
+    }()
+    private func prettyDay(_ day: String) -> String {
+        guard let d = Self.dayParser.date(from: day) else { return day }
+        return Self.dayFmt.string(from: d)
+    }
 
     // MARK: - Load
 
@@ -274,9 +341,12 @@ struct CrossDeviceHRVView: View {
         }
         if !cur.isEmpty { segs.append(cur) }
 
+        let night = await repo.latestNightHRV()
+
         self.eras = result.eras
         self.rows = parsed
         self.segments = segs
+        self.latestNight = night
         self.loaded = true
     }
 }

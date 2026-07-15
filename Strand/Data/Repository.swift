@@ -850,6 +850,33 @@ final class Repository: ObservableObject {
         return await unionDailyMetrics(store: store, from: fromDay, to: toDay)
     }
 
+    /// The most recent night's HRV in BOTH metrics, plus the Apple reading for the same day when present —
+    /// backs the "Latest Night" dual-metric header + the honest Apple cross-check on the Cross-Device screen.
+    /// `rmssd` is the strap's `avgHrv` (beat-to-beat); `sdnn` is `avgSdnn` (the 5-min SDNN index, already
+    /// window-matched to Apple's short-window SDNN, so `sdnn` vs `appleSdnn` is a like-for-like check).
+    struct NightHRV: Equatable {
+        let day: String
+        let rmssd: Double?
+        let sdnn: Double?
+        let appleSdnn: Double?
+    }
+
+    func latestNightHRV() async -> NightHRV? {
+        guard let store = await ensureStore() else { return nil }
+        var latest: DailyMetric?
+        for id in importedReadIds + computedReadIds {
+            let rows = (try? await store.dailyMetrics(deviceId: id, from: "2018-01-01", to: "9999-12-31")) ?? []
+            for r in rows where r.avgHrv != nil {
+                if latest == nil || r.day > latest!.day { latest = r }
+            }
+        }
+        guard let night = latest else { return nil }
+        let appleRows = (try? await store.dailyMetrics(deviceId: Self.appleHealthSource,
+                                                       from: night.day, to: night.day)) ?? []
+        return NightHRV(day: night.day, rmssd: night.avgHrv, sdnn: night.avgSdnn,
+                        appleSdnn: appleRows.first?.avgSdnn)
+    }
+
     /// Full-history nightly HRV tagged by its WINNING source id, for the cross-device HRV trend
     /// (`CrossDeviceHRVTrend`). One winner per day: the real wearable of each era (Oura under "oura-api",
     /// WHOOP under the strap/import/computed ids) — the real id strings are preserved so the engine's
