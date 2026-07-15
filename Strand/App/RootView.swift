@@ -17,6 +17,7 @@ enum NavItem: String, CaseIterable, Identifiable, Hashable {
     case workouts = "Workouts"
     case health = "Health"
     case stress = "Stress"
+    case crossDeviceHRV = "Cross-Device HRV"
     case labBook = "Lab Book"
     case rhythm = "Rhythm"
     case appleHealth = "Apple Health"
@@ -52,6 +53,7 @@ enum NavItem: String, CaseIterable, Identifiable, Hashable {
         case .workouts: return "Workouts"
         case .health: return "Health"
         case .stress: return "Stress"
+        case .crossDeviceHRV: return "Cross-Device HRV"
         case .labBook: return "Lab Book"
         case .rhythm: return "Rhythm"
         case .appleHealth: return "Apple Health"
@@ -94,6 +96,7 @@ enum NavItem: String, CaseIterable, Identifiable, Hashable {
         case .workouts: return String(localized: "Workouts")
         case .health: return String(localized: "Health")
         case .stress: return String(localized: "Stress")
+        case .crossDeviceHRV: return String(localized: "Cross-Device HRV")
         case .labBook: return String(localized: "Lab Book")
         case .rhythm: return String(localized: "Rhythm")
         case .appleHealth: return String(localized: "Apple Health")
@@ -128,6 +131,7 @@ enum NavItem: String, CaseIterable, Identifiable, Hashable {
         case .workouts: return "figure.run"
         case .health: return "heart.text.square.fill"
         case .stress: return "gauge.with.dots.needle.50percent"
+        case .crossDeviceHRV: return "waveform.path.ecg.rectangle"
         case .labBook: return "books.vertical.fill"
         case .rhythm: return "waveform.path"
         case .appleHealth: return "heart.fill"
@@ -170,7 +174,7 @@ struct NavGroup: Identifiable {
         // all collapse under this single Insights group rather than scattering across the flat list.
         NavGroup(title: "Insights", id: "insights", items: [
             .intelligence, .insightsHub, .coach, .explore, .compare, .insights,
-            .labBook, .rhythm, .trends,
+            .labBook, .rhythm, .trends, .crossDeviceHRV,
         ]),
         NavGroup(title: "Data & App", id: "data_app", items: [
             .devices, .dataSources, .appleHealth, .xiaomi, .backupSync, .fusedRecord,
@@ -442,6 +446,7 @@ struct RootView: View {
         case .workouts: WorkoutsView()
         case .health: HealthView()
         case .stress: StressView()
+        case .crossDeviceHRV: CrossDeviceHRVView()
         case .labBook: LabBookView()
         case .rhythm: RhythmHost()
         case .appleHealth: AppleHealthView()

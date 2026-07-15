@@ -349,6 +349,7 @@ enum DemoScreens {
         case "sleep":    return AnyView(SleepView())
         case "live":     return AnyView(LiveView())
         case "stress":   return AnyView(StressView())
+        case "crossdevicehrv": return AnyView(CrossDeviceHRVView())
         case "workouts": return AnyView(WorkoutsView())
         case "health":   return AnyView(HealthView())
         case "insights": return AnyView(InsightsView())

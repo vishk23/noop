@@ -850,6 +850,40 @@ final class Repository: ObservableObject {
         return await unionDailyMetrics(store: store, from: fromDay, to: toDay)
     }
 
+    /// Full-history nightly HRV tagged by its WINNING source id, for the cross-device HRV trend
+    /// (`CrossDeviceHRVTrend`). One winner per day: the real wearable of each era (Oura under "oura-api",
+    /// WHOOP under the strap/import/computed ids) — the real id strings are preserved so the engine's
+    /// `brandBucket` segments the Oura era from the WHOOP era. `apple-health` is deliberately EXCLUDED:
+    /// Apple's HRV is SDNN, method-incompatible with the strap/Oura RMSSD this trend plots (the #696
+    /// method-mixing hazard), and its `brandBucket` "whoop" tag would fragment a wearable era on any day it
+    /// backfilled. Oldest→newest; only nights with a positive HRV.
+    func crossDeviceHrvHistory(from: String = "2018-01-01",
+                               to: String = "9999-12-31") async
+        -> [(day: String, sourceId: String, hrv: Double)] {
+        guard let store = await ensureStore() else { return [] }
+        // Priority: live strap + canonical import first, then wearable imports (Oura/Fitbit/Garmin), then
+        // the computed "-noop" sibling as a fallback. All whoop-family ids bucket to "whoop", so intra-era
+        // precedence only picks which value represents a shared WHOOP-era day; Oura owns its own era.
+        var ordered = importedReadIds
+        ordered.append(contentsOf: Self.wearableImportSources)
+        ordered.append(contentsOf: computedReadIds)
+        var seen = Set<String>()
+        let ids = ordered.filter { seen.insert($0).inserted }
+
+        var winnerByDay: [String: (rank: Int, sourceId: String, hrv: Double)] = [:]
+        for (rank, id) in ids.enumerated() {
+            let rows = (try? await store.dailyMetrics(deviceId: id, from: from, to: to)) ?? []
+            for r in rows {
+                guard let hrv = r.avgHrv, hrv > 0 else { continue }
+                if let cur = winnerByDay[r.day], cur.rank <= rank { continue }
+                winnerByDay[r.day] = (rank, id, hrv)
+            }
+        }
+        return winnerByDay
+            .map { (day: $0.key, sourceId: $0.value.sourceId, hrv: $0.value.hrv) }
+            .sorted { $0.day < $1.day }
+    }
+
     func hrSamples(from: Int, to: Int, limit: Int = 8000) async -> [HRSample] {
         guard let store = await ensureStore() else { return [] }
         // UNION the active strap + canonical so the HR trend renders whether the landed day's raw sits under

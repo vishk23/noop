@@ -339,6 +339,7 @@ struct RootTabView: View {
                     MoreRow("Insights", "lightbulb.fill", .insights)
                     MoreRow("Explore", "square.grid.2x2.fill", .explore)
                     MoreRow("Compare", "rectangle.split.2x1.fill", .compare)
+                    MoreRow("Cross-Device HRV", "waveform.path.ecg.rectangle", .crossDeviceHRV)
                 }
                 moreSection("Body") {
                     MoreRow("Live", "waveform.path.ecg", .live)
@@ -462,7 +463,7 @@ struct RootTabView: View {
 /// registration in `moreTab`.
 private enum MoreDestination: Hashable {
     case insightsHub, intelligence, coach, insights, explore, compare
-    case live, workouts, health, labBook, stress, breathe, intervals, rhythm
+    case live, workouts, health, labBook, stress, breathe, intervals, rhythm, crossDeviceHRV
     case fusedRecord, appleHealth, miBand, dataSources, backupSync, shortcutsExport
     case alarms, automations, testCentre, siriShortcuts, settings
 
@@ -479,6 +480,7 @@ private enum MoreDestination: Hashable {
         case .health:          HealthView()
         case .labBook:         LabBookView()
         case .stress:          StressView()
+        case .crossDeviceHRV:  CrossDeviceHRVView()
         case .breathe:         BreathingView()
         case .intervals:       IntervalTimerView()
         case .rhythm:          RhythmHost()
