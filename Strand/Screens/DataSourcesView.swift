@@ -471,6 +471,14 @@ struct DataSourcesView: View {
             } else if let last = CloudSyncModel.lastPersistedStatus {
                 Text("Last sync: \(last)").font(StrandFont.subhead).foregroundStyle(StrandPalette.textSecondary)
             }
+            // An upload iOS is carrying for us finishes with the app suspended or closed, so neither
+            // line above moves while it runs — and the "Last sync" line still shows the PREVIOUS
+            // sync's outcome, which reads as "nothing is happening" when in fact a ~80MB transfer is
+            // in flight. Say so plainly, with the time it started: a marker that has sat here for
+            // hours is itself the diagnosis.
+            if let inFlight = CloudSyncModel.inFlightUploadDescription {
+                Text(inFlight).font(StrandFont.subhead).foregroundStyle(StrandPalette.textSecondary)
+            }
         }
     }
     #endif // CLOUD_SYNC

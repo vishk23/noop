@@ -193,4 +193,110 @@ final class CloudSyncModelAutoSyncGateTests: XCTestCase {
         XCTAssertTrue(CloudSyncModel.isRunningUnderXCTest)
     }
 }
+
+/// The lastStatus/lastAutoSync/lastUploadToken contract as honoured by a background upload that
+/// finished with NO in-process awaiter — the app was suspended or killed mid-transfer and iOS carried
+/// the upload to completion on its own (`CloudSyncBackgroundSession`'s detached branch).
+///
+/// This is the half of the fix that is decidable without a device: `recordDetachedUploadCompletion` is
+/// a pure UserDefaults transform, and it is the ONLY other writer of keys whose contract `performSync`
+/// has always owned. The transfer itself (a real background `URLSession`) is iOS-owned and can only be
+/// proven on hardware — but the rule it must obey is pinned right here.
+///
+/// The original bug's signature was `lastStatus` FROZEN while syncs silently died, so the load-bearing
+/// assertion in every case below is simply: something truthful got written.
+final class CloudSyncDetachedUploadContractTests: XCTestCase {
+    private let statusKey = "cloudsync.lastStatus"
+    private let autoSyncKey = "cloudsync.lastAutoSync"
+    private let uploadTokenKey = "cloudsync.lastUploadToken"
+    private let inFlightKey = "cloudsync.inFlightUpload"
+
+    override func setUp() {
+        super.setUp()
+        for k in [statusKey, autoSyncKey, uploadTokenKey, inFlightKey] {
+            UserDefaults.standard.removeObject(forKey: k)
+        }
+    }
+
+    override func tearDown() {
+        for k in [statusKey, autoSyncKey, uploadTokenKey, inFlightKey] {
+            UserDefaults.standard.removeObject(forKey: k)
+        }
+        super.tearDown()
+    }
+
+    // MARK: - Success stamps everything
+
+    func testDetachedSuccessWritesStatusStampsAutoSyncAndSavesUploadToken() {
+        CloudSyncModel.recordDetachedUploadCompletion(
+            statusPrefix: "Applied 0 · skipped 0",
+            outcome: .success(bytes: 85_458_944),
+            contentToken: "tok-content-1")
+
+        let status = try! XCTUnwrap(UserDefaults.standard.string(forKey: statusKey))
+        // The prefix survives, and the size is formatted exactly as performSync formats it.
+        XCTAssertTrue(status.hasPrefix("Applied 0 · skipped 0 · Uploaded 81.5 MB"), status)
+        XCTAssertNotEqual(UserDefaults.standard.double(forKey: autoSyncKey), 0, "success must stamp lastAutoSync")
+        XCTAssertEqual(UserDefaults.standard.string(forKey: uploadTokenKey), "tok-content-1")
+    }
+
+    // MARK: - Failure writes a status but must NOT stamp success
+
+    /// The contract's sharpest edge: a failed upload that stamped `lastAutoSync` would silence the
+    /// >20h retry gate for another 20h — turning one failure into a day of silence.
+    func testDetachedFailureWritesStatusButNeverStampsAutoSyncOrToken() {
+        CloudSyncModel.recordDetachedUploadCompletion(
+            statusPrefix: "Applied 2 · skipped 1",
+            outcome: .failure("Network problem talking to the cloud sync server: lost connection"),
+            contentToken: "tok-content-2")
+
+        let status = try! XCTUnwrap(UserDefaults.standard.string(forKey: statusKey))
+        XCTAssertTrue(status.contains("Applied 2 · skipped 1"), status)
+        XCTAssertTrue(status.contains("lost connection"), status)
+        XCTAssertEqual(UserDefaults.standard.double(forKey: autoSyncKey), 0,
+                       "a failed upload must NOT stamp the success clock")
+        XCTAssertNil(UserDefaults.standard.string(forKey: uploadTokenKey),
+                     "a failed upload never shipped its content, so lastUploadToken must not advance")
+    }
+
+    /// A success whose content token couldn't be computed still stamps the clock — mirroring
+    /// `performSync`'s `if let freshToken` (a token failure must not fail an otherwise-good sync).
+    func testDetachedSuccessWithoutTokenStillStampsAutoSync() {
+        CloudSyncModel.recordDetachedUploadCompletion(
+            statusPrefix: "Applied 0 · skipped 0", outcome: .success(bytes: 1_048_576), contentToken: nil)
+
+        XCTAssertNotEqual(UserDefaults.standard.double(forKey: autoSyncKey), 0)
+        XCTAssertNil(UserDefaults.standard.string(forKey: uploadTokenKey))
+    }
+
+    /// A relaunch may find no in-flight record at all (force-quit, or an upgrade across the record
+    /// format). The status line must still be written — degraded, never absent, because a frozen
+    /// `lastStatus` is the exact symptom this whole change exists to eliminate.
+    func testDetachedCompletionWithEmptyPrefixStillWritesALegibleStatus() {
+        CloudSyncModel.recordDetachedUploadCompletion(
+            statusPrefix: "", outcome: .success(bytes: 2_097_152), contentToken: nil)
+
+        let status = try! XCTUnwrap(UserDefaults.standard.string(forKey: statusKey))
+        XCTAssertTrue(status.hasPrefix("Uploaded 2.0 MB"), status)
+        XCTAssertFalse(status.hasPrefix(" · "), "an empty prefix must not leave a dangling separator")
+    }
+
+    // MARK: - The in-flight record round-trips
+
+    func testInFlightUploadRecordRoundTripsAndClears() {
+        let record = CloudSyncInFlightUpload(filePath: "/tmp/cloudsync-upload-abc.noopbak",
+                                             statusPrefix: "Applied 0 · skipped 0",
+                                             contentToken: "tok-9",
+                                             startedAt: 1_784_056_874)
+        CloudSyncModel.saveInFlightUpload(record)
+        XCTAssertEqual(CloudSyncModel.loadInFlightUpload(), record)
+
+        // Surfaced to the user while iOS carries the upload (Data Sources → Cloud Sync).
+        XCTAssertNotNil(CloudSyncModel.inFlightUploadDescription)
+
+        CloudSyncModel.clearInFlightUpload()
+        XCTAssertNil(CloudSyncModel.loadInFlightUpload())
+        XCTAssertNil(CloudSyncModel.inFlightUploadDescription)
+    }
+}
 #endif // CLOUD_SYNC

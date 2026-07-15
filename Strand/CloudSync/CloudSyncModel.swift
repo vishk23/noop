@@ -124,6 +124,68 @@ final class CloudSyncGate: @unchecked Sendable {
     }
 }
 
+#if os(iOS)
+/// A scoped `beginBackgroundTask`/`endBackgroundTask` pair — the app had ZERO background-task
+/// assertions anywhere before this, so any foreground-initiated sync was suspended mid-flight the
+/// moment the user swiped away.
+///
+/// Ends EXACTLY ONCE however it finishes: normally via `end()`, or via iOS's expiration handler if the
+/// grant runs out first. Letting an assertion expire un-ended gets the app killed, so the expiration
+/// handler is mandatory, not optional. `@MainActor` because `UIApplication` is — and because that makes
+/// the `ended` flag's single-writer discipline free (both `end()` and the expiration handler, which
+/// UIKit invokes on the main thread, are already isolated to it).
+@MainActor
+final class CloudSyncBackgroundActivity {
+    private var id: UIBackgroundTaskIdentifier = .invalid
+
+    init(_ name: String) {
+        id = UIApplication.shared.beginBackgroundTask(withName: name) { [weak self] in
+            // Out of time. Release the assertion so iOS doesn't kill the app for holding it. Any
+            // background-session upload already handed off is unaffected — iOS owns that transfer, and
+            // it is not what this assertion was keeping alive.
+            self?.end()
+        }
+    }
+
+    func end() {
+        guard id != .invalid else { return }
+        UIApplication.shared.endBackgroundTask(id)
+        id = .invalid
+    }
+}
+#endif
+
+/// A `/ingest` upload that has been handed to iOS's background `URLSession` and has not reported
+/// completion yet. Persisted (see `CloudSyncModel.saveInFlightUpload`) because the process that
+/// started the upload frequently does NOT survive it — iOS owns the transfer, and the app may be
+/// suspended or killed mid-flight and relaunched only to deliver the completion. Everything the
+/// completion needs to honour the lastStatus/lastAutoSync contract, and to clean up after itself, has
+/// to be on disk before the first byte moves.
+///
+/// Cross-platform (not `#if os(iOS)`) so `DataSourcesView` — one file, both platforms — can read it
+/// without a per-platform branch, and so its contract stays unit-testable from the macOS-only
+/// `StrandTests` bundle. Only iOS ever WRITES one; on macOS it is always nil.
+struct CloudSyncInFlightUpload: Codable, Equatable {
+    /// The temp `.noopbak` iOS is streaming from. Deleted when the transfer completes — the file must
+    /// outlive the transfer, so no earlier.
+    var filePath: String
+    /// `performSync`'s status line as of the moment the upload started ("Applied 0 · skipped 0"), so a
+    /// detached completion can append its own result to the SAME line the in-process path would have.
+    var statusPrefix: String
+    /// The `WhoopStore.contentToken()` this upload is shipping, saved as `lastUploadToken` only if it
+    /// actually succeeds (see `CloudSyncModel.lastUploadTokenKey`'s contract).
+    var contentToken: String?
+    var startedAt: TimeInterval
+}
+
+/// How a background upload finished, as seen by a completion with no in-process awaiter left.
+/// `bytes` is the server's own count (`/ingest`'s `{bytes}`), the same number `performSync` formats
+/// into "Uploaded %.1f MB".
+enum CloudSyncDetachedUploadOutcome: Equatable {
+    case success(bytes: Int)
+    case failure(String)
+}
+
 /// Drives the Data Sources "Cloud Sync" card: save the noop-cloud server URL + token → pull confirmed
 /// edits → apply them locally → (iOS) re-export whatever changed into Apple Health. @MainActor so every
 /// `@Published` mutation is main-thread; the network/apply/write-back work hops off-main.
@@ -248,6 +310,18 @@ final class CloudSyncModel: ObservableObject {
             if claim.reclaimed, let abandoned = claim.previousHoldS {
                 Self.noteGateReclaimed(afterS: abandoned)
             }
+            // Ask iOS for a few extra minutes if the user backgrounds the app mid-sync. WITHOUT this, the
+            // pull/apply/recompute/export work is suspended the instant the app leaves the foreground and
+            // simply stops — no status, no error. This is NOT what rescues the big upload (a whole-DB ZIP
+            // is far too slow for the minutes this buys; only `CloudSyncBackgroundSession` survives
+            // suspension), but it does keep the CHEAP half — pull, apply, recompute, and handing the
+            // upload to the background session — from being killed on its way out. Taken INSIDE the gate
+            // so it covers exactly the run that holds it, and released on the same unwind `withGate`
+            // releases the gate on.
+            #if os(iOS)
+            let assertion = CloudSyncBackgroundActivity("CloudSync")
+            defer { assertion.end() }
+            #endif
             await performSync(repo: repo, url: url, token: token)
         }
         if ran == nil { statusText = "Sync already in progress" }
@@ -295,8 +369,12 @@ final class CloudSyncModel: ObservableObject {
         defer { setBusy(false) }
         // Hoisted out of the `if let store` below (where it used to be built) so the deep-buffer drain
         // at the end of this method can reach it: that drain reads a FILE, not the store, so it must
-        // still run on a device whose store handle is unavailable.
-        let client = CloudSyncClient(baseURL: url, token: token)
+        // still run on a device whose store handle is unavailable. `fileUploader` routes ONLY `ingest`'s
+        // whole-DB byte transfer onto the iOS background session (nil on macOS, so that path is
+        // untouched); every other call on this client — including the deep-buffer drain, which uploads
+        // an in-memory `Data` rather than a file — still runs on `CloudSyncClient.syncSession`.
+        let client = CloudSyncClient(baseURL: url, token: token,
+                                     fileUploader: Self.productionFileUploader)
         var line: String
         var succeeded = false
         if let store = await repo.storeHandle() {
@@ -342,6 +420,14 @@ final class CloudSyncModel: ObservableObject {
                     line = parts.joined(separator: " · ")
                 } else {
                     statusText = "Uploading…"
+                    // Publish what a completion arriving WITHOUT this call frame would need to write a
+                    // truthful status line (see `CloudSyncBackgroundSession.stage`). MUST happen before
+                    // the transfer starts: from the first byte onward iOS may suspend or kill this
+                    // process at any instant, and the upload outlives it either way.
+                    #if os(iOS)
+                    CloudSyncBackgroundSession.shared.stage(statusPrefix: parts.joined(separator: " · "),
+                                                             contentToken: freshToken)
+                    #endif
                     let uploaded = try await CloudSyncUploader.upload(store: store, client: client)
                     let mb = Double(uploaded.bytes) / 1_048_576.0
                     parts.append(String(format: "Uploaded %.1f MB", mb))
@@ -401,7 +487,12 @@ final class CloudSyncModel: ObservableObject {
 
     /// UserDefaults key for the last successful `syncNow` (manual or automatic) — read by
     /// `autoSyncIfDue`, written by `performSync` on success only.
-    private static let lastAutoSyncKey = "cloudsync.lastAutoSync"
+    ///
+    /// `nonisolated` (as are the three keys below): `recordDetachedUploadCompletion` writes this
+    /// contract from the background session's delegate queue, and a `static` member of a `@MainActor`
+    /// type is MainActor-isolated by default — which is a hard error in Swift 6. These are immutable
+    /// `String`s, so there is nothing for isolation to protect.
+    nonisolated private static let lastAutoSyncKey = "cloudsync.lastAutoSync"
 
     /// UserDefaults key for the `WhoopStore.contentToken()` value as of the last successful upload
     /// FROM THIS DEVICE (Cloud Sync v2 skip-unchanged upload) — written by `performSync` only when an
@@ -411,13 +502,13 @@ final class CloudSyncModel: ObservableObject {
     /// key, like `lastAutoSyncKey`/`lastStatusKey` above, not a `WhoopStore` cursor: it is per-device
     /// sync bookkeeping about an UPLOAD this device performed, not data the store itself owns, and
     /// `cursors` only stores `Int` values anyway (this token is a composite string).
-    private static let lastUploadTokenKey = "cloudsync.lastUploadToken"
+    nonisolated private static let lastUploadTokenKey = "cloudsync.lastUploadToken"
 
     /// UserDefaults key for the outcome of the last sync attempt, success OR failure, persisted by
     /// `performSync` on EVERY completion (Finding 2). Read directly by the Data Sources card so an
     /// auto-sync that ran on a throwaway `CloudSyncModel` instance (see `CloudSyncGate`'s doc comment)
     /// is still visible on the card's own instance, whose `statusText` never saw it happen.
-    private static let lastStatusKey = "cloudsync.lastStatus"
+    nonisolated private static let lastStatusKey = "cloudsync.lastStatus"
 
     /// The last sync's outcome, formatted for display ("<line> · <short time>"), or nil if no sync
     /// has ever completed on this device. A plain synchronous UserDefaults read — deliberately not
@@ -428,7 +519,75 @@ final class CloudSyncModel: ObservableObject {
         UserDefaults.standard.string(forKey: lastStatusKey)
     }
 
-    private static let shortTimeFormatter: DateFormatter = {
+    /// One honest line for an upload iOS is still carrying, or nil when none is outstanding. Same
+    /// plain synchronous UserDefaults read as `lastPersistedStatus`, for the same reason.
+    ///
+    /// Worth surfacing precisely BECAUSE the interesting case is the pathological one: a background
+    /// upload that completes normally clears this within minutes, so a marker the user can actually
+    /// catch sitting here — "since 12:21 PM" yesterday — is telling them something true that no other
+    /// line on this screen can (`lastStatus` keeps showing the last COMPLETED sync throughout).
+    /// `nonisolated` like the accessors it composes (`loadInFlightUpload`, `shortTimeFormatter`):
+    /// it touches only thread-safe UserDefaults, so pinning it to the main actor would buy nothing
+    /// and would keep it out of reach of the background session's delegate queue.
+    nonisolated static var inFlightUploadDescription: String? {
+        guard let record = loadInFlightUpload() else { return nil }
+        let started = Date(timeIntervalSince1970: record.startedAt)
+        return "Uploading in the background since \(shortTimeFormatter.string(from: started))…"
+    }
+
+    /// UserDefaults key for the `CloudSyncInFlightUpload` record — an upload iOS's background session
+    /// has taken ownership of and not yet reported on. Present ⇒ bytes are (or were) moving without a
+    /// call frame to catch the result.
+    nonisolated private static let inFlightUploadKey = "cloudsync.inFlightUpload"
+
+    /// `nonisolated`, like `isAutoSyncDue`/`isRunningUnderXCTest`: the background session's delegate
+    /// runs on its own `OperationQueue`, not the main actor, and must reach these synchronously.
+    /// UserDefaults is thread-safe, so there is nothing to serialize.
+    nonisolated static func saveInFlightUpload(_ record: CloudSyncInFlightUpload) {
+        guard let data = try? JSONEncoder().encode(record) else { return }
+        UserDefaults.standard.set(data, forKey: inFlightUploadKey)
+    }
+
+    nonisolated static func loadInFlightUpload() -> CloudSyncInFlightUpload? {
+        guard let data = UserDefaults.standard.data(forKey: inFlightUploadKey) else { return nil }
+        return try? JSONDecoder().decode(CloudSyncInFlightUpload.self, from: data)
+    }
+
+    nonisolated static func clearInFlightUpload() {
+        UserDefaults.standard.removeObject(forKey: inFlightUploadKey)
+    }
+
+    /// Write the outcome of an upload that finished with NO in-process awaiter — iOS suspended or
+    /// killed the app mid-transfer, finished the upload itself, and delivered the completion to a
+    /// process whose `performSync` call frame is long gone (or never came back). Without this, exactly
+    /// the sync this whole change exists to rescue would complete successfully and still leave
+    /// `lastStatus` frozen at yesterday's line — the original bug's signature.
+    ///
+    /// Deliberately mirrors `performSync`'s tail rather than sharing code with it: that method's
+    /// contract is stated per-key in the doc comments below, and this is the only other place allowed
+    /// to write those keys. The contract, identically:
+    ///   • `lastStatus` on EVERY completion, success or failure;
+    ///   • `lastAutoSync` ONLY on success (a failure must never block the next 20h-gated retry);
+    ///   • `lastUploadToken` ONLY when an upload actually ran and succeeded.
+    /// `nonisolated` for the same reason as the accessors above.
+    nonisolated static func recordDetachedUploadCompletion(statusPrefix: String,
+                                                            outcome: CloudSyncDetachedUploadOutcome,
+                                                            contentToken: String?) {
+        var parts = statusPrefix.isEmpty ? [] : [statusPrefix]
+        switch outcome {
+        case .success(let bytes):
+            parts.append(String(format: "Uploaded %.1f MB", Double(bytes) / 1_048_576.0))
+            UserDefaults.standard.set(Date().timeIntervalSince1970, forKey: lastAutoSyncKey)
+            if let contentToken {
+                UserDefaults.standard.set(contentToken, forKey: lastUploadTokenKey)
+            }
+        case .failure(let message):
+            parts.append(message)
+        }
+        persistLastStatus(parts.joined(separator: " · "))
+    }
+
+    nonisolated private static let shortTimeFormatter: DateFormatter = {
         let f = DateFormatter()
         f.dateStyle = .none
         f.timeStyle = .short
@@ -439,8 +598,20 @@ final class CloudSyncModel: ObservableObject {
     /// time, so a later launch's Data Sources card can show "Last sync: …" even when ITS OWN
     /// `statusText` is nil — e.g. right after launch, before that screen's own `CloudSyncModel`
     /// `@StateObject` has run a sync itself.
-    private static func persistLastStatus(_ line: String) {
+    nonisolated private static func persistLastStatus(_ line: String) {
         UserDefaults.standard.set("\(line) · \(shortTimeFormatter.string(from: Date()))", forKey: lastStatusKey)
+    }
+
+    /// The transfer `CloudSyncClient` should use for the `/ingest` body in PRODUCTION. iOS hands it to
+    /// the background session so the upload survives suspension (`CloudSyncBackgroundSession`); macOS
+    /// has no such problem — its app is not suspended out from under an upload — so it keeps the
+    /// original in-process streamed upload. Tests inject their own client and never reach this.
+    private static var productionFileUploader: CloudSyncClient.FileUploading? {
+        #if os(iOS)
+        return CloudSyncBackgroundSession.shared.uploader
+        #else
+        return nil
+        #endif
     }
 
     /// Pure 20h gate, `(lastRun, now) -> Bool`, so the threshold is unit-testable without UserDefaults,

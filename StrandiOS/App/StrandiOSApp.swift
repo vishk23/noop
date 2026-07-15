@@ -221,6 +221,28 @@ struct StrandiOSApp: App {
                     // watch only ever holds placeholder data on a real device.
                     await watch.pushLatest(from: model)
                 }
+                #if CLOUD_SYNC
+                // Cloud Sync: WARM-RESUME catch-up. The on-launch catch-up lives in `RootTabView`'s
+                // `.task`, which runs once per root-view lifetime — and the root view stays alive
+                // across a background/foreground round trip, so `.task` never re-runs and a REOPENED
+                // app synced nothing at all. Found live: 22h with no completed sync despite the user
+                // opening the app. Every other resume-critical job is already re-driven from here
+                // (pending intents, smart alarm, BLE, HealthKit, widget, watch); cloud sync simply
+                // wasn't, so it belongs here too.
+                //
+                // Still gated by `autoSyncIfDue`'s own >20h check — NOT a sync on every foreground —
+                // so a user flicking in and out of the app triggers exactly nothing.
+                let cloudSync = CloudSyncModel()
+                let intelligence = model.intelligence
+                let repository = model.repo
+                cloudSync.postApplyRefresh = {
+                    await intelligence.analyzeRecent()
+                    await repository.refresh()
+                }
+                // Fire-and-forget by design: `autoSyncIfDue` spawns its own Task (which retains
+                // `cloudSync` past this scope) and returns immediately, so resume is never blocked.
+                cloudSync.autoSyncIfDue(repo: model.repo)
+                #endif
             } else if phase == .background {
                 // #114: capture the LAST in-app live state on the way out so the Home widget matches what
                 // the user just saw — its battery/HR/score otherwise lag to the last FOREGROUND refreshSeq
