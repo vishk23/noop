@@ -537,11 +537,13 @@ final class HealthKitBridge: ObservableObject {
                 add(.restingHeartRate, HKUnit.count().unitDivided(by: .minute()), Double(rhr), row.day, at)
             }
             // Export the GENUINE SDNN (v29) when present — the strap's `avgHrv` is RMSSD, which HealthKit
-            // has no field for, so writing it under `.heartRateVariabilitySDNN` mislabels it. WHOOP rows
-            // backfill `avgSdnn` from stored raw R-R on the next re-score; Apple rows' `avgHrv` already IS
-            // SDNN. The `avgHrv` fallback fires for those two before re-scoring, and permanently for
-            // summary-only sources (Oura) that give RMSSD with no raw R-R to derive SDNN from — HealthKit's
-            // single HRV type leaves no better label there.
+            // has no field for, so writing it under `.heartRateVariabilitySDNN` mislabels it. `avgSdnn` is the
+            // 5-min SDNN index, deliberately window-matched to Apple's own short-window SDNN samples so the
+            // written values sit consistently in the user's Health SDNN history (a whole-night SD would land
+            // 2-3× high). WHOOP rows backfill `avgSdnn` from stored raw R-R on the next re-score; Apple rows'
+            // `avgHrv` already IS SDNN. The `avgHrv` fallback fires for those two before re-scoring, and
+            // permanently for summary-only sources (Oura) that give RMSSD with no raw R-R to derive SDNN from
+            // — HealthKit's single HRV type leaves no better label there.
             if let sdnn = row.avgSdnn ?? row.avgHrv {
                 add(.heartRateVariabilitySDNN, .secondUnit(with: .milli), sdnn, row.day, at)
             }
