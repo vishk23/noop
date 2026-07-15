@@ -78,28 +78,22 @@ object RecoveryScorerTrace {
         // Per-term z * weight, built with the EXACT expressions recovery(...) uses, in the SAME append order.
         val terms = ArrayList<Pair<Double, Double>>() // (z, weight)
 
-        // Resting-HR z, computed up front (like recovery()) so the saturation guard can read the
-        // HRV<->RHR coupling before the HRV term is built. null when there is no RHR baseline.
+        // Resting-HR z, computed up front so the saturation guard can read the HRV<->RHR coupling before
+        // the HRV term is built. null when there is no RHR baseline. Numerically identical to the z
+        // recovery() builds for the RHR term (same expression, same inputs).
         val rhrZForGuard: Double? = rhrBaseline?.let { RecoveryScorer.zScore(it.baseline, rhr, it.spread) }
 
         // L9: every WEIGHT / SCALE / centre constant goes through r2() too (not just the z-scores), so a
         // future non-round weight (e.g. 0.333) renders identically on Swift and Kotlin and the parity
         // fixture cannot silently desync. The values render the same as before today.
         // HRV term: higher is better. (Always present once usable; the cold-start guard above returned.)
-        // The low-HRV penalty is eased when resting HR corroborates parasympathetic saturation, using the
-        // SAME guard recovery() applies — so the trace's HRV term matches the scored one exactly.
+        // This is the RAW z, exactly as recovery() scores it: the parasympathetic-saturation easing is
+        // detected and reported below but NOT applied, so the trace's HRV term matches the scored one.
+        // NOTE: the HRV term is always terms[0]; the counterfactual below relies on that.
         val hrvZRaw = RecoveryScorer.zScore(hrv, hrvBaseline.baseline, hrvBaseline.spread)
         val sat = RecoveryScorer.parasympatheticSaturation(hrvZ = hrvZRaw, rhrZ = rhrZForGuard)
-        terms.add(sat.effectiveHrvZ to RecoveryScorer.wHRV)
-        lines.add("charge term hrv z=${r2(sat.effectiveHrvZ)} w=${r2(RecoveryScorer.wHRV)} (higher HRV is better)")
-        // Name the eased penalty ONLY when the guard fired, so a "Charge looks high for low HRV" report
-        // shows exactly why: low HRV + low resting HR = benign vagal saturation, penalty eased.
-        if (sat.active) {
-            lines.add(
-                "charge saturation active hrvZraw=${r2(hrvZRaw)} rhrZ=${r2(rhrZForGuard ?: 0.0)} " +
-                    "damp=${r2(sat.dampFraction)} (low HRV + low resting HR: parasympathetic saturation, HRV penalty eased)",
-            )
-        }
+        terms.add(hrvZRaw to RecoveryScorer.wHRV)
+        lines.add("charge term hrv z=${r2(hrvZRaw)} w=${r2(RecoveryScorer.wHRV)} (higher HRV is better)")
 
         // RHR term: lower is better -> (mu - x) / sigma. (Reuses the z computed for the guard.)
         if (rhrZForGuard != null) {
@@ -165,6 +159,30 @@ object RecoveryScorerTrace {
             )
         } else {
             lines.add("charge nilScore reason=noValidTerms (no driver produced a usable term)")
+        }
+
+        // ── Parasympathetic-saturation guard: DETECTED, NOT APPLIED ────────────────────────────────
+        //
+        // Emitted ONLY when the signature fires. The score above is the UNGUARDED number; this line
+        // reports the counterfactual the guard WOULD have produced, so real low-HRV + low-RHR nights can
+        // be counted and checked against ground truth before the easing is ever allowed to move Charge.
+        // See the header in RecoveryScorer.kt for the validation gap and the contested benign-saturation
+        // / non-functional-overreaching ambiguity that keep it switched off.
+        //
+        // wouldRaiseCharge recomputes the composite with the eased HRV z swapped in (the HRV term is
+        // terms[0]) and runs it through RecoveryScorer.logisticScore -- the SAME curve recovery() uses --
+        // so the delta is exact, not estimated. Mirrors the Swift trace line exactly.
+        if (sat.active && score != null && totalWeight > 0.0) {
+            val easedZ = terms.withIndex()
+                .sumOf { (i, t) -> (if (i == 0) sat.easedHrvZ else t.first) * t.second } / totalWeight
+            val wouldBe = RecoveryScorer.logisticScore(easedZ)
+            lines.add(
+                "charge saturation active hrvZraw=${r2(hrvZRaw)} rhrZ=${r2(rhrZForGuard ?: 0.0)} " +
+                    "damp=${r2(sat.dampFraction)} wouldEaseHrvZTo=${r2(sat.easedHrvZ)} " +
+                    "wouldRaiseCharge=${r2(wouldBe - score)} wouldBand=${RecoveryScorer.band(wouldBe)} " +
+                    "(low HRV + low resting HR: candidate parasympathetic saturation. " +
+                    "Easing DETECTED ONLY, not applied: the score above is unchanged)",
+            )
         }
 
         return score to lines

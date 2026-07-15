@@ -86,19 +86,18 @@ object RecoveryDrivers {
         // Marginal-vs-neutral attribution: a term's deltaPoints is the full score minus the score
         // recomputed with THAT term held at its personal baseline (its z forced to 0) while every term,
         // including this one, keeps its weight. Routes through recovery(...) itself (same terms, same
-        // weighting, same logistic, SAME parasympathetic-saturation guard) so the points can never drift
-        // from the headline AND a neutralized RHR correctly re-evaluates the guard for the HRV term. A term
-        // reaches z = 0 at: HRV / resting HR / respiration = the baseline mean, Rest quality =
-        // sleepPerfCenter, skin-temp deviation = 0. Mirrors the Swift ChargeDrivers `points(...)` helper.
+        // weighting, same logistic) so the points can never drift from the headline. A term reaches
+        // z = 0 at: HRV / resting HR / respiration = the baseline mean, Rest quality = sleepPerfCenter,
+        // skin-temp deviation = 0. Mirrors the Swift ChargeDrivers `points(...)` helper.
         fun points(neutralised: Double?): Int = (full - (neutralised ?: full)).roundToInt()
 
-        // Was the low-HRV penalty eased by the parasympathetic-saturation guard on THIS night? Recompute the
-        // SAME HRV / resting-HR coupling the score used so the HRV verdict can honestly explain a lighter-
-        // than-usual penalty (its deltaPoints already reflect the easing, since points(...) routes through
-        // recovery(...), which applies the guard).
+        // Did the parasympathetic-saturation signature fire on THIS night (low HRV corroborated by a low,
+        // decoupled resting HR)? Detection ONLY: the guard's easing is not applied, so deltaPoints below is
+        // the full, unguarded HRV penalty. The verdict merely NAMES the detected pattern so the UI can
+        // surface it while real firings accumulate. See the header in RecoveryScorer.kt.
         val hrvZFull = RecoveryScorer.zScore(hrv, hrvBaseline.baseline, hrvBaseline.spread)
         val rhrZFull: Double? = rhrBaseline?.let { RecoveryScorer.zScore(it.baseline, rhr, it.spread) }
-        val hrvSaturationEased =
+        val hrvSaturationDetected =
             RecoveryScorer.parasympatheticSaturation(hrvZ = hrvZFull, rhrZ = rhrZFull).active
 
         // One row per present term, appended in the SAME order the iOS twin uses (HRV, resting HR, Sleep,
@@ -119,7 +118,11 @@ object RecoveryDrivers {
                 ),
                 valueText = "${hrv.roundToInt()} ms",
                 baselineText = "${hrvBaseline.baseline.roundToInt()} ms baseline",
-                verdict = hrvVerdict(value = hrv, baseline = hrvBaseline.baseline, saturationEased = hrvSaturationEased),
+                verdict = hrvVerdict(
+                    value = hrv,
+                    baseline = hrvBaseline.baseline,
+                    saturationDetected = hrvSaturationDetected,
+                ),
             ),
         )
         // Resting HR (lower vs baseline supports recovery). Neutral = resting HR at the baseline mean.
@@ -202,16 +205,20 @@ object RecoveryDrivers {
     }
 
     /**
-     * HRV verdict matching the Swift canonical `hrvVerdict(value:baseline:saturationEased:)`: above baseline
-     * supports recovery; below baseline normally limits it, UNLESS the parasympathetic-saturation guard fired
-     * (low HRV corroborated by a low, decoupled resting HR), in which case the eased penalty is named instead
-     * of the plain fatigue read; at baseline is neutral. Byte-for-byte the same strings as the iOS twin.
+     * HRV verdict matching the Swift canonical `hrvVerdict(value:baseline:saturationDetected:)`: above
+     * baseline supports recovery; below baseline limits it; at baseline is neutral. When the
+     * parasympathetic-saturation signature fired (low HRV corroborated by a low, decoupled resting HR) the
+     * pattern is NAMED, but the "limiting recovery" read stays, because that is what the score actually did:
+     * the easing is detected-only and did NOT change these points. The hedge is deliberate too, since the
+     * same low-HRV + low-RHR pattern is also reported for non-functional overreaching, which is the opposite
+     * of benign. Byte-for-byte the same strings as the iOS twin.
      */
-    private fun hrvVerdict(value: Double, baseline: Double, saturationEased: Boolean): String = when {
+    private fun hrvVerdict(value: Double, baseline: Double, saturationDetected: Boolean): String = when {
         value > baseline -> "above baseline, supporting recovery"
         value < baseline ->
-            if (saturationEased) {
-                "below baseline, but low resting HR signals parasympathetic saturation, so the penalty is eased"
+            if (saturationDetected) {
+                "below baseline, limiting recovery, though low resting HR suggests this may be " +
+                    "parasympathetic saturation rather than fatigue"
             } else {
                 "below baseline, limiting recovery"
             }
