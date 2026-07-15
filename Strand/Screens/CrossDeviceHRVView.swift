@@ -37,6 +37,58 @@ struct CrossDeviceHRVView: View {
     @State private var latestNight: Repository.NightHRV?   // dual-metric header + Apple cross-check
     @State private var loaded = false
 
+    /// One point on a smoothed trend line.
+    private struct Smoothed: Identifiable {
+        let id: String
+        let date: Date
+        let value: Double
+    }
+    /// The hero's readable trend (rolling median of the era-relative %), and the raw chart's per-era
+    /// equivalent. Precomputed in `load()` — never per body eval.
+    /// Smoothed trend split into CONTIGUOUS runs (see `breakAtGaps`) — one drawn line per run.
+    @State private var heroRuns: [[Smoothed]] = []
+    @State private var rawRuns: [(brand: String, pts: [Smoothed])] = []
+
+    /// A wearer takes the band off. Charts joins consecutive points, so without an explicit break a
+    /// months-long non-wear hole renders as a straight line — a trend that never happened (this history
+    /// has real holes: 2025-06-27→09-25, 2025-10-13→11-19). Any gap longer than this opens a new run, so
+    /// the line simply stops and restarts and the hole reads as absence, which is the truth.
+    private static let gapBreakDays = 14.0
+
+    private func breakAtGaps(_ pts: [Smoothed]) -> [[Smoothed]] {
+        guard let first = pts.first else { return [] }
+        var out: [[Smoothed]] = []
+        var cur: [Smoothed] = [first]
+        for p in pts.dropFirst() {
+            if let last = cur.last, p.date.timeIntervalSince(last.date) > Self.gapBreakDays * 86_400 {
+                out.append(cur); cur = []
+            }
+            cur.append(p)
+        }
+        if !cur.isEmpty { out.append(cur) }
+        return out
+    }
+
+    /// Nights per side of the rolling window. 420 raw nights across ~700 pt is ~1.7 pt/night — drawn as a
+    /// line that is a solid block of vertical strokes, not a trend. A 7-night CENTERED rolling median is
+    /// the standard fix: it strips night-to-night noise and (being a median, not a mean) refuses to let a
+    /// nap-fragment artifact drag the curve, leaving ~60 readable points across two years.
+    private static let smoothWindow = 7
+
+    /// Centered rolling median over (date, value) pairs, oldest→newest. Returns [] when there is less
+    /// history than the window — the caller then just shows the raw nights, which at that size are legible.
+    private func rollingMedian(_ pts: [(date: Date, value: Double)], window: Int = smoothWindow) -> [Smoothed] {
+        guard window > 1, pts.count >= window else { return [] }
+        let half = window / 2
+        return pts.indices.map { i in
+            let lo = max(0, i - half), hi = min(pts.count - 1, i + half)
+            let s = pts[lo...hi].map(\.value).sorted()
+            let mid = s.count / 2
+            let med = s.count % 2 == 1 ? s[mid] : (s[mid - 1] + s[mid]) / 2
+            return Smoothed(id: "\(i)", date: pts[i].date, value: med)
+        }
+    }
+
     var body: some View {
         ScreenScaffold(title: "Cross-Device HRV",
                        subtitle: "Your full HRV history, stitched across a device switch") {
@@ -136,12 +188,24 @@ struct CrossDeviceHRVView: View {
                         RuleMark(y: .value("Normal", 0))
                             .lineStyle(StrokeStyle(lineWidth: 1, dash: [4, 4]))
                             .foregroundStyle(StrandPalette.textTertiary.opacity(0.6))
+                        // Every real night, as a faint cloud — the honest spread stays visible…
                         ForEach(rows) { row in
-                            LineMark(x: .value("Date", row.date),
-                                     y: .value("Relative", row.pct))
-                                .interpolationMethod(.catmullRom)
-                                .lineStyle(StrokeStyle(lineWidth: 2, lineCap: .round, lineJoin: .round))
-                                .foregroundStyle(StrandPalette.metricPurple)
+                            PointMark(x: .value("Date", row.date),
+                                      y: .value("Night", row.pct))
+                                .symbolSize(4)
+                                .foregroundStyle(StrandPalette.metricPurple.opacity(0.16))
+                        }
+                        // …and the TREND is the rolling median riding through it, which is the only thing
+                        // legible at two years per screen.
+                        ForEach(Array(heroRuns.enumerated()), id: \.offset) { idx, run in
+                            ForEach(run) { s in
+                                LineMark(x: .value("Date", s.date),
+                                         y: .value("Trend", s.value),
+                                         series: .value("Run", idx))
+                                    .interpolationMethod(.monotone)
+                                    .lineStyle(StrokeStyle(lineWidth: 2.5, lineCap: .round, lineJoin: .round))
+                                    .foregroundStyle(StrandPalette.metricPurple)
+                            }
                         }
                         ForEach(boundaries) { b in
                             RuleMark(x: .value("Switch", b.date))
@@ -170,7 +234,7 @@ struct CrossDeviceHRVView: View {
                             .font(StrandFont.footnote)
                         }
                     }
-                    Text("Each sensor is compared to its own baseline, so the trend's shape carries across your switch even though the raw numbers differ. The dashed line is each era's normal.")
+                    Text("Dots are your actual nights; the line is their 7-night rolling median — the trend, without the night-to-night noise. It stops wherever you weren't wearing anything for a couple of weeks, rather than drawing across the gap. Each sensor is compared to its own baseline, so the shape carries across your switch even though the raw numbers differ. The dashed line is each era's normal.")
                         .font(StrandFont.footnote)
                         .foregroundStyle(StrandPalette.textTertiary)
                         .fixedSize(horizontal: false, vertical: true)
@@ -188,14 +252,26 @@ struct CrossDeviceHRVView: View {
                 VStack(alignment: .leading, spacing: NoopMetrics.cardInnerSpacing) {
                     Text("Actual milliseconds, never averaged").strandOverline()
                     Chart {
-                        ForEach(Array(segments.enumerated()), id: \.offset) { idx, seg in
+                        // Faint per-night cloud, coloured by its era…
+                        ForEach(Array(segments.enumerated()), id: \.offset) { _, seg in
                             ForEach(seg) { row in
-                                LineMark(x: .value("Date", row.date),
-                                         y: .value("HRV", row.raw),
-                                         series: .value("Era", idx))
-                                    .interpolationMethod(.catmullRom)
-                                    .lineStyle(StrokeStyle(lineWidth: 2, lineCap: .round, lineJoin: .round))
-                                    .foregroundStyle(brandColor(row.brand))
+                                PointMark(x: .value("Date", row.date),
+                                          y: .value("HRV", row.raw))
+                                    .symbolSize(4)
+                                    .foregroundStyle(brandColor(row.brand).opacity(0.16))
+                            }
+                        }
+                        // …with each era's own smoothed trend. Smoothed PER ERA and drawn as separate
+                        // series, so the median never blends the two incompatible scales and no line is
+                        // drawn across the switch — the step between eras stays visible, which is the point.
+                        ForEach(Array(rawRuns.enumerated()), id: \.offset) { idx, run in
+                            ForEach(run.pts) { s in
+                                LineMark(x: .value("Date", s.date),
+                                         y: .value("Trend", s.value),
+                                         series: .value("Run", idx))
+                                    .interpolationMethod(.monotone)
+                                    .lineStyle(StrokeStyle(lineWidth: 2.5, lineCap: .round, lineJoin: .round))
+                                    .foregroundStyle(brandColor(run.brand))
                             }
                         }
                     }
@@ -208,7 +284,7 @@ struct CrossDeviceHRVView: View {
                             AxisValueLabel().foregroundStyle(StrandPalette.textTertiary).font(StrandFont.footnote)
                         }
                     }
-                    Text("Oura and WHOOP measure HRV on different scales, so the two eras sit at different heights — that gap is real, not a change in you. We keep each sensor's true numbers instead of blending them.")
+                    Text("Oura and WHOOP measure HRV on different scales, so the two eras sit at different heights — that gap is real, not a change in you. Each era is smoothed on its own and never joined across the switch. We keep each sensor's true numbers instead of blending them.")
                         .font(StrandFont.footnote)
                         .foregroundStyle(StrandPalette.textTertiary)
                         .fixedSize(horizontal: false, vertical: true)
@@ -346,6 +422,16 @@ struct CrossDeviceHRVView: View {
         self.eras = result.eras
         self.rows = parsed
         self.segments = segs
+        // The era-relative % is cross-era comparable, so one median over the whole history is correct —
+        // then split at non-wear gaps so no line is drawn across a hole.
+        self.heroRuns = breakAtGaps(rollingMedian(parsed.map { (date: $0.date, value: $0.pct) }))
+        // The raw ms is NOT cross-era comparable — smooth each era separately, then gap-split within it,
+        // carrying the era's brand so each run keeps its colour.
+        self.rawRuns = segs.flatMap { seg -> [(brand: String, pts: [Smoothed])] in
+            let brand = seg.first?.brand ?? "whoop"
+            return breakAtGaps(rollingMedian(seg.map { (date: $0.date, value: $0.raw) }))
+                .map { (brand: brand, pts: $0) }
+        }
         self.latestNight = night
         self.loaded = true
     }
