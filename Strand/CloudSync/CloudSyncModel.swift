@@ -177,10 +177,13 @@ final class CloudSyncModel: ObservableObject {
     /// that synced an hour ago with no new samples and no applied edits has nothing new to ship.
     private func performSync(repo: Repository, url: URL, token: String) async {
         setBusy(true); statusText = "Pulling edits…"
+        // Hoisted out of the `if let store` below (where it used to be built) so the deep-buffer drain
+        // at the end of this method can reach it: that drain reads a FILE, not the store, so it must
+        // still run on a device whose store handle is unavailable.
+        let client = CloudSyncClient(baseURL: url, token: token)
         var line: String
         var succeeded = false
         if let store = await repo.storeHandle() {
-            let client = CloudSyncClient(baseURL: url, token: token)
             do {
                 let summary = try await CloudSyncCoordinator.pull(store: store, client: client)
                 var parts = ["Applied \(summary.applied)", "skipped \(summary.skipped)"]
@@ -238,6 +241,18 @@ final class CloudSyncModel: ObservableObject {
         } else {
             line = "No local store."
         }
+
+        // Deep-buffer drain (#423) — deliberately OUTSIDE the do/catch above, and NOT gated on
+        // `succeeded`. The edit-journal lane and the deep-buffer archive fail independently and are not
+        // equally recoverable: a pull that throws (server down, bad token, a 500 on /edits) costs
+        // nothing permanent — the edits are still on the server and the next sync gets them. The deep
+        // buffers are the ONLY copy of packets the strap's ack-trim has already freed, and the log
+        // destroys its own oldest generation on rotation, so bytes not shipped are eventually gone for
+        // good. Letting an unrelated /edits failure skip the drain would trade unrecoverable data for
+        // nothing. Cheap when idle: two `stat`s and a watermark compare, no network at all.
+        statusText = "Shipping deep buffers…"
+        if let deep = await drainDeepBuffers(client: client) { line += " · \(deep)" }
+
         statusText = line
         if succeeded {
             UserDefaults.standard.set(Date().timeIntervalSince1970, forKey: Self.lastAutoSyncKey)
@@ -245,6 +260,28 @@ final class CloudSyncModel: ObservableObject {
         Self.persistLastStatus(line)
         await repo.refresh()
         setBusy(false)
+    }
+
+    /// Ship whatever new bytes `PuffinDeepBufferLog` has appended since this device's last confirmed
+    /// chunk, returning a status-line SUFFIX (nil when there was nothing to do, so an idle drain adds
+    /// no noise to the card).
+    ///
+    /// UNGATED, unlike every other lane here — no 20h/4h staleness clock. The clock that matters is the
+    /// log's own: the strap banks ~40 KB/s of hex during an offload, so a generation fills the soft cap
+    /// in hours and the generation after that DELETES it. A staleness gate tuned for "has the user's
+    /// data changed" is the wrong instrument for "is the archive about to eat itself". Running every
+    /// sync costs two `stat` calls when there is nothing new (see `DeepBufferUploader.drain`), so
+    /// there is nothing to gate away.
+    private func drainDeepBuffers(client: CloudSyncClient) async -> String? {
+        let summary = await DeepBufferUploader.drain(client: client,
+                                                      watermarks: DeepBufferUserDefaultsWatermarks())
+        if let error = summary.error { return "Deep buffers: \(error)" }
+        guard !summary.isEmpty else { return nil }
+        let sentMB = Double(summary.sentBytes) / 1_048_576.0
+        let rawMB = Double(summary.rawBytes) / 1_048_576.0
+        var s = String(format: "Deep buffers %.1f→%.1f MB (%d chunks)", rawMB, sentMB, summary.chunks)
+        if summary.moreRemaining { s += " · more queued" }
+        return s
     }
 
     /// UserDefaults key for the last successful `syncNow` (manual or automatic) — read by

@@ -122,9 +122,58 @@ final class CloudSyncClient {
         }
     }
 
+    // MARK: - Deep buffers (#423: WHOOP 5/MG high-rate offload archive)
+
+    /// POST /deepbuf, Bearer-authed — one line-aligned, raw-DEFLATE-compressed byte range of
+    /// `PuffinDeepBufferLog`'s append-only JSONL. See `DeepBufferUploadPlan` for why the unit of upload
+    /// is `(generation, byteStart, byteEnd)` rather than a whole file.
+    ///
+    /// `compressed` is passed as `Data`, NOT streamed from a file the way `ingest` above must be: a
+    /// chunk is ~4 MB and is ALREADY in memory (it was just read and deflated), so spilling it to a
+    /// temp file purely to hand `upload(for:fromFile:)` a path would add two disk round-trips to buy
+    /// nothing. `ingest`'s whole-DB body is 100-300 MB, which is a different problem.
+    ///
+    /// The compression is announced in a CUSTOM header rather than `Content-Encoding: deflate`
+    /// deliberately: `Content-Encoding` invites any proxy in the path (and Express itself) to helpfully
+    /// decode the body, which would silently defeat the whole point of compressing on the phone and
+    /// leave the server parsing bytes it thinks are plaintext. A header nothing but this endpoint reads
+    /// cannot be helpfully misinterpreted by anything in between.
+    func uploadDeepBuffer(generation: String, byteStart: Int, byteEnd: Int,
+                          compressed: Data) async throws -> DeepBufferUploadReceipt {
+        var req = URLRequest(url: url(path: "deepbuf"))
+        req.httpMethod = "POST"
+        req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        req.setValue("application/octet-stream", forHTTPHeaderField: "Content-Type")
+        req.setValue("deflate-raw", forHTTPHeaderField: "X-Deepbuf-Compression")
+        req.setValue(generation, forHTTPHeaderField: "X-Deepbuf-Generation")
+        req.setValue(String(byteStart), forHTTPHeaderField: "X-Deepbuf-Byte-Start")
+        req.setValue(String(byteEnd), forHTTPHeaderField: "X-Deepbuf-Byte-End")
+        // Same #tz-upload convention as `ingest` above: every timestamp inside the payload is epoch-UTC,
+        // so the phone's current zone is only knowable if it says so.
+        req.setValue(TimeZone.current.identifier, forHTTPHeaderField: "X-Phone-Timezone")
+        let (data, status) = try await sendUpload(req, from: compressed)
+        guard (200..<300).contains(status) else {
+            throw CloudSyncError.badResponse(status, bodyPrefix(data))
+        }
+        guard let decoded = try? JSONDecoder().decode(DeepBufferResponse.self, from: data) else {
+            throw CloudSyncError.decode
+        }
+        return DeepBufferUploadReceipt(storedBytes: decoded.storedBytes, lines: decoded.lines,
+                                        duplicate: decoded.duplicate ?? false)
+    }
+
     private func sendUpload(_ req: URLRequest, fromFile fileURL: URL) async throws -> (Data, Int) {
         do {
             let (data, resp) = try await session.upload(for: req, fromFile: fileURL)
+            return (data, (resp as? HTTPURLResponse)?.statusCode ?? 0)
+        } catch {
+            throw CloudSyncError.network(error.localizedDescription)
+        }
+    }
+
+    private func sendUpload(_ req: URLRequest, from body: Data) async throws -> (Data, Int) {
+        do {
+            let (data, resp) = try await session.upload(for: req, from: body)
             return (data, (resp as? HTTPURLResponse)?.statusCode ?? 0)
         } catch {
             throw CloudSyncError.network(error.localizedDescription)
@@ -172,5 +221,13 @@ private struct RegisterDeviceRequest: Encodable {
 private struct IngestResponse: Decodable {
     let bytes: Int
     let latestDay: String?
+}
+
+/// `/deepbuf`'s reply. `duplicate` is optional because the server omits it on the normal path (it is
+/// only present, and true, when the chunk was already in the manifest) — see `DeepBufferUploadReceipt`.
+private struct DeepBufferResponse: Decodable {
+    let storedBytes: Int
+    let lines: Int
+    let duplicate: Bool?
 }
 #endif // CLOUD_SYNC
