@@ -536,6 +536,16 @@ public enum AnalyticsEngine {
             return weight > 0 ? total / weight : nil
         }()
 
+        // Daily SDNN (ms) = whole-night sample-SD (Task Force ddof=1) over the in-bed R-R across matched
+        // sessions — the BROAD autonomic-variability metric (both autonomic branches), the slow /
+        // accumulated-load twin of the vagal RMSSD `avgHRVDaily` above (which is fast, deep-window / vagal).
+        // Same in-sleep R-R the HRV trace uses; nil when too few clean beats (HRVAnalyzer's own gate).
+        let avgSDNNDaily: Double? = {
+            let inBed = rr.filter { r in matched.contains { r.ts >= $0.start && r.ts < $0.end } }
+                          .map { Double($0.rrMs) }
+            return inBed.isEmpty ? nil : HRVAnalyzer.analyze(rawRR: inBed).sdnn
+        }()
+
         // ── HRV & Autonomic nightly trace (#141) ──────────────────────────────
         // Per-5-min-window RMSSD tagged by the sleep stage at its center, then a night summary comparing
         // NOOP's whole-night mean (what it reports) against a deep-only mean and a WHOOP-style
@@ -725,7 +735,8 @@ public enum AnalyticsEngine {
             steps: stepsTotal,
             activeKcalEst: activeKcalEst,
             spo2Red: nightlySpo2Raw?.red,
-            spo2Ir: nightlySpo2Raw?.ir)
+            spo2Ir: nightlySpo2Raw?.ir,
+            avgSdnn: avgSDNNDaily)
         _ = sleepStart; _ = sleepEnd  // available for callers wiring sleep_start/end columns
 
         // ── Cache rows ────────────────────────────────────────────────────────

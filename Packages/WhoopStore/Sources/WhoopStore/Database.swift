@@ -525,6 +525,14 @@ extension WhoopStore {
                 WHERE efficiency > 1.5
                 """)
         }
+        // v29: persist nightly SDNN (the broad-variability HRV twin of avgHrv=RMSSD). Additive, nullable;
+        // the nightly analysis already computes SDNN (HRVAnalyzer) but only logged it — now stored.
+        // (Id kept as v29 to match the contributor's fork lineage so a future sync never double-applies.)
+        migrator.registerMigration("v29-daily-avg-sdnn") { db in
+            try db.alter(table: "dailyMetric") { t in
+                t.add(column: "avgSdnn", .double)
+            }
+        }
         return migrator
     }
 }
