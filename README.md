@@ -1,3 +1,27 @@
+> ### About this fork
+>
+> This is **Vishnu Kchittibhooma's** working fork of [NOOP](https://github.com/ryanbr/noop),
+> the offline WHOOP companion app by [@ryanbr](https://github.com/ryanbr) and contributors.
+> The base app is their work; this fork is where my contributions to it are developed.
+>
+> **What I've contributed upstream:** 13 pull requests merged into `ryanbr/noop`
+> ([see the merged PRs](https://github.com/ryanbr/noop/pulls?q=is%3Apr+author%3Avishk23+is%3Amerged)),
+> concentrated in the sensor-protocol and analytics layers:
+>
+> - **WHOOP 5.0/MG raw sensor decoding** — 6-axis IMU offload buffer + activity features (#455),
+>   high-rate R22 deep buffers (#454), and persisting the v26 raw PPG waveform (#415)
+> - **Sleep scoring** — motion-corroborated wake detection so elevated HR on a motionless
+>   wrist no longer scores WAKE (#465, #402)
+> - **Analytics** — Recovery Index + Activity Balance terms in Charge (#417), an opt-in
+>   coarse workout-type classifier (#414)
+> - **Import correctness** — Oura readiness/efficiency unit fixes across Swift + Kotlin
+>
+> This fork's `main` tracks upstream and carries my additional work in progress; see
+> [branches](https://github.com/vishk23/noop/branches) for active experiments.
+> The upstream README follows unchanged.
+
+---
+
 <p align="center">
   <img src="docs/assets/logo-v3.png" alt="NOOP" width="72">
 </p>
