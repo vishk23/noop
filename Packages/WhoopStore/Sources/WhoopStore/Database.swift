@@ -587,6 +587,13 @@ extension WhoopStore {
                 t.column("tzId", .text).notNull()      // IANA identifier, e.g. "America/Los_Angeles"
             }
         }
+        // v29: persist nightly SDNN (the broad-variability HRV twin of avgHrv=RMSSD). Additive, nullable;
+        // the nightly analysis already computes SDNN (HRVAnalyzer) but only logged it — now stored.
+        migrator.registerMigration("v29-daily-avg-sdnn") { db in
+            try db.alter(table: "dailyMetric") { t in
+                t.add(column: "avgSdnn", .double)
+            }
+        }
         return migrator
     }
 }
