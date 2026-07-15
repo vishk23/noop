@@ -74,21 +74,6 @@ public func rejectedHistoricalRecords(_ rawFrames: [[UInt8]], family: DeviceFami
         // different type byte, so they never pass this gate — they are excluded by construction.
         guard f.count > typeIndex, Int(f[typeIndex]) == 47 else { return false }
         if family == .whoop5, f.count > versionIndex, Int(f[versionIndex]) == 26 { return false }  // v26 PPG: has its own durable stream (ppgWaveform), not this reject archive
-        // v20 (2140 B) / v21 (1244 B) are KNOWN-AND-DECODED layouts, not undecodable ones:
-        // `decodeWhoop5HistoricalV2021` parses them into optical/IMU channels. They only LOOK undecodable
-        // to the predicate below because that test asks for `heart_rate`/`gravity_x`, which these layouts
-        // legitimately do not carry — the same reason v26 is exempted one line above.
-        //
-        // Archiving them is actively harmful, not merely redundant. The strap banks one v18 + one v21 +
-        // one v20 per SECOND of history (3508 B, of which only v18's 124 B is stored), so a real backlog
-        // sends ~34 of every 51 records down this path. Each one is hex-dumped to the strap log and
-        // appended to the 5 MB raw archive; once that archive hits its cap EVERY chunk pays a
-        // read-all → hex-decode-every-line → rewrite-5 MB-and-fsync cycle, synchronously, and the trim
-        // ack waits behind it. Measured on a real 16 h backlog: offload throughput collapsed from ~3.7x
-        // real-time (archive freshly rotated, cheap append path) to ~1.0x within two minutes of the cap
-        // being reached — turning a ~3 h drain into ~12 h. The archive exists to capture layouts we
-        // CANNOT decode so they can be mapped later; these two are already mapped.
-        if family == .whoop5, f.count > versionIndex, Int(f[versionIndex]) == 20 || Int(f[versionIndex]) == 21 { return false }
         let p = parseFrame(f, family: family)
         // Envelope/CRC reject: parse failed outright or the CRC32 trailer mismatched.
         if !p.ok || p.crcOK == false { return true }

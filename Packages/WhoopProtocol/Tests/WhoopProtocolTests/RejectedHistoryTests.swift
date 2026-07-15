@@ -77,27 +77,6 @@ final class RejectedHistoryTests: XCTestCase {
         XCTAssertTrue(rejectedHistoricalRecords([v26], family: .whoop5).isEmpty)
     }
 
-    func testWhoop5V20AndV21DeepBuffersExcluded() {
-        // Header bytes taken verbatim from a real 5/MG offload (fw 50.40.1.0): the strap banks one v18 +
-        // one v21 (1244 B) + one v20 (2140 B) per SECOND of history, so on a real backlog these are ~34
-        // of every 51 records. Both DECODE fine (`decodeWhoop5HistoricalV2021` → optical/IMU channels);
-        // they only LOOK undecodable to the unmapped-layout predicate because they carry no heart_rate
-        // and no gravity_x — exactly why v26 is exempted too. Archiving them hex-dumps ~3.4 KB/s of
-        // history into the 5 MB raw archive, whose at-cap rewrite then blocks the trim ack.
-        let v21 = bytes("aa01d40401005c702f1580c585af000ea4566a1e45046400640003005bfb53fb66fb5dfb")
-        let v20 = bytes("aa0154080100b5b32f1481c585af000ea4566a1e4504001900001901160d042c1a032000")
-        XCTAssertEqual(v21[8], 47)          // type-47 HISTORICAL_DATA…
-        XCTAssertEqual(v21[9], 21)          // …version 21 — a known, decoded layout
-        XCTAssertEqual(v20[8], 47)
-        XCTAssertEqual(v20[9], 20)          // …version 20 — likewise
-        XCTAssertTrue(rejectedHistoricalRecords([v21], family: .whoop5).isEmpty,
-                      "v21 deep buffer decodes — it must not be archived as undecodable")
-        XCTAssertTrue(rejectedHistoricalRecords([v20], family: .whoop5).isEmpty,
-                      "v20 deep buffer decodes — it must not be archived as undecodable")
-        // The whole batch shape a real offload delivers: nothing here belongs in the reject archive.
-        XCTAssertTrue(rejectedHistoricalRecords([v20, v21, v20, v21], family: .whoop5).isEmpty)
-    }
-
     func testNonHistoricalFrameExcluded() {
         // A REALTIME_DATA (type-40) frame is live, not offload — never a history-loss candidate.
         let realtime = frameFromPayload([0x01, 0x02, 0x03], type: 40, seq: 0, cmd: 0)
