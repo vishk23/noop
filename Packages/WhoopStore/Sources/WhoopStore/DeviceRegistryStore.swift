@@ -94,6 +94,11 @@ public struct DeviceRegistryStore: Sendable {
         // are real per-device recordings like appleDaily/stepSample, not tombstone-class bookkeeping —
         // a device-data wipe / "Remove Apple Health data" must clear them too.
         "appleStepHour",
+        // v27-ppg-waveform (issue #156 follow-up): the durable raw v26 optical PPG waveform is
+        // deviceId-keyed exactly like every other per-second stream above — must be cleared too, or a
+        // "delete all of this device's data" leaves the raw waveform behind (the same privacy defect
+        // this list exists to close).
+        "ppgWaveformSample",
     ]
 
     /// deviceId-keyed tables deliberately EXCLUDED from `deviceScopedTables` — a normal "delete this
