@@ -314,26 +314,25 @@ struct Whoop5EmptyOffloadTracker {
 /// its idle timeout — the reported ~15-min sync). The stale/PAST-epoch case 2b actually exists for (#451)
 /// reads BEHIND the frontier, never future-dated, so it is untouched.
 struct BackfillContinuation {
-    /// Hard cap on consecutive auto-continues per connection (resets on disconnect), as a LAST-RESORT
-    /// backstop only. Guards 2 and 3 are the real protection and they stop on *evidence*: 2 stops the
-    /// moment the strap is no longer ahead of our frontier, 3 stops the moment a session fails to move
-    /// the trim cursor. A strap that is both genuinely behind AND genuinely handing over data is not
-    /// pathological — it is working, and cutting it off is the bug.
+    /// Hard cap on consecutive auto-continues per connection (resets on disconnect). 6 × ~60s ≈ 6 min of
+    /// back-to-back draining, without letting a misbehaving strap monopolise Bluetooth.
     ///
-    /// The old value of 6 came with the rationale "6 × ~60s ≈ 6 min of back-to-back draining — enough to
-    /// chew through a multi-night backlog". That premise is arithmetically wrong. Offload runs at ~7x
-    /// real-time (airtime-limited at ~25.4 KB/s against the 3508 B the strap banks per second-of-history),
-    /// so six minutes of draining recovers ~42 minutes of history — not a multi-night backlog. Recovering
-    /// a single dead-strap night (~19 h) needs ~2.7 h of draining, i.e. ~50+ sessions. At 6 the cap fires
-    /// mid-recovery and drops to `backfillIntervalSeconds` (900 s) — a 6.7% duty cycle, turning a ~3 h
-    /// drain into ~12 h+. That is the "worst practical impact" recorded in
-    /// docs/bugs/2026-07-15-strap-battery-backfill-observability.md (A5), measured on a real 18 h backlog.
+    /// This was briefly raised to 120 on the theory that it severed a real recovery — a ~19 h backlog needs
+    /// ~2.6 h of draining, so the cap fires mid-recovery and drops to the 900 s floor. That reasoning was
+    /// based on a CONTAMINATED measurement: the strap it was taken from had been switched into deep-data
+    /// (R22) banking by an experimental probe, so it was banking 3508 B/s of history instead of the default
+    /// 124 B/s. A default strap banks 28x less, one session recovers ~28x more history, and an 18 h backlog
+    /// drains in ~2 sessions — well inside 6. The cap was never the problem for a default user.
     ///
-    /// 120 covers a full night's recovery with ~2x margin while still bounding a truly runaway loop that
-    /// somehow satisfies guards 2 and 3 forever. The cap resets on disconnect, so it was never a battery
-    /// ceiling across a day — only a ceiling on one continuous recovery, which is exactly when we want to
-    /// keep going.
-    static let defaultMaxAutoContinues = 120
+    /// Raising it is also not free: #928 and #1012 (below) are both cases where guard 2 did NOT stop and
+    /// the strap "reported backlog forever", burning the cap in EMPTY offloads. The cap was the only thing
+    /// that bounded them, so a 20x raise is a 20x blast radius on the next guard-2 bug. And
+    /// `maybeAutoContinueBackfill` has no family gating, so it would apply to WHOOP 4.0, where a long drain
+    /// starves the realtime keep-alive.
+    ///
+    /// If a genuine deep-backlog case is ever demonstrated on a DEFAULT strap, the fix is a conditional
+    /// bypass while provably behind and advancing — not a flat raise.
+    static let defaultMaxAutoContinues = 6
     /// How far ahead the strap must be (seconds) before "more backlog remains" is real, not clock noise.
     /// Matches StuckStrapDetector.behindGapSeconds (5 min) so the two agree on "behind".
     static let defaultBehindGapSeconds = 300

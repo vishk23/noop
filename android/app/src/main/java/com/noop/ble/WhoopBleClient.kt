@@ -548,9 +548,21 @@ class WhoopBleClient(
         /**
          * Idle watchdog: if no genuine offload frame arrives for this long mid-session, end the
          * session (the durable strap_trim cursor means the next session resumes where we left off).
-         * Generous (60s, not 20s) because the type-43 raw flood eats BLE airtime between chunks.
+         * Must clear the real inter-frame tail: the type-43 raw flood eats BLE airtime between chunks, so
+         * a watchdog shorter than the tail cuts sessions short mid-drain.
+         *
+         * 60s was set without measuring that tail; it is ~24x the real worst case, and every session pays
+         * it in full as dead air on exit. A 3,018-buffer arrival trace from a real 19 h drain puts
+         * inter-frame gaps at p50 64 ms / p90 106 ms / p99 273 ms / max 2,520 ms, with the tail at chunk
+         * boundaries (~51 records, where decode + insert + cursor + ack happen), not mid-chunk. 15s is ~6x
+         * that measured max and still clears the flood.
+         *
+         * Deliberately NOT the ~5s the tail alone would justify: that tail is one drain on one firmware,
+         * and the risk is asymmetric — firing early is safe but wasteful (the in-memory chunk is dropped
+         * un-acked, so the strap keeps it and the next session refetches), while firing late only costs
+         * idle seconds. Mirrors Swift BLEManager.backfillIdleTimeoutSeconds.
          */
-        private const val BACKFILL_IDLE_TIMEOUT_MS = 60_000L
+        private const val BACKFILL_IDLE_TIMEOUT_MS = 15_000L
         /** Deferral before the first connect-time offload, so SET_CLOCK/GET_DATA_RANGE round-trip first. */
         private const val INITIAL_BACKFILL_DELAY_MS = 1_500L
         /** 5/MG fail-open gate: how long to wait for a GET_DATA_RANGE SUCCESS before requesting
@@ -905,7 +917,12 @@ class WhoopBleClient(
 
         /** #364 auto-continue cap: consecutive immediate re-kicks per connection before falling back to
          *  the 900s periodic timer. 6 × ~60s ≈ 6 min of back-to-back draining without letting a
-         *  misbehaving strap monopolise Bluetooth. Mirrors Swift BackfillContinuation.defaultMaxAutoContinues. */
+         *  misbehaving strap monopolise Bluetooth. Mirrors Swift BackfillContinuation.defaultMaxAutoContinues.
+         *
+         *  Briefly raised to 120 on iOS on the theory that it severed a real recovery; reverted. That
+         *  measurement came from a strap an experimental probe had switched into deep-data (R22) banking —
+         *  3508 B/s of history instead of the default 124 B/s. A default strap banks 28x less, so an 18 h
+         *  backlog drains in ~2 sessions, well inside 6. See the Swift twin for the full reasoning. */
         const val MAX_AUTO_CONTINUES = 6
 
         /** #364 "more backlog remains" margin (seconds): how far ahead the strap must be of our persisted

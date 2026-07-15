@@ -51,12 +51,14 @@ final class PuffinDeepBufferLog {
     /// Skip the ~124-B ≈1 Hz record; keep the 1244-/2140-B high-rate buffers.
     private static let minBufferBytes = 1000
 
-    /// Lowercase hex, table-driven. NOT cosmetic: this runs on the MainActor inside the offload ack path,
-    /// and the obvious `frame.map { String(format: "%02x", $0) }.joined()` costs one Foundation formatter
-    /// call + one String allocation PER BYTE — ~3 ms for a 2140-B buffer. The strap banks one 1244-B and
-    /// one 2140-B buffer per second of history, so draining a backlog at 5x real-time formats ~170
-    /// buffers/sec ≈ 400 ms of every second, and the strap sits idle waiting for the ack behind it. A
-    /// nibble lookup into a byte array is ~80x cheaper and allocates once.
+    /// Lowercase hex, table-driven. Runs on the MainActor in the frame-delivery path, so it avoids the
+    /// obvious `frame.map { String(format: "%02x", $0) }.joined()`, which costs one Foundation formatter
+    /// call + one String allocation PER BYTE. A nibble lookup into a byte array is materially cheaper and
+    /// allocates once. The two properties that matter are pinned by tests rather than asserted here:
+    /// `testHexStringMatchesFormatterForEveryByteValue` (byte-for-byte parity with the encoding it
+    /// replaces, across the whole domain) and `testHexStringIsFastEnoughForTheAckPath` (sub-millisecond
+    /// per buffer). NOTE: this path only runs when the capture toggle (`PuffinFrameRecorder.enabledKey`)
+    /// is ON — it is off by default, so this is research-capture cost, not a cost every user pays.
     private static let hexDigits: [UInt8] = Array("0123456789abcdef".utf8)
     nonisolated static func hexString(_ bytes: [UInt8]) -> String {
         var out = [UInt8]()
@@ -130,25 +132,17 @@ final class PuffinDeepBufferLog {
         // device captures and makes each JSONL line self-checking (raw ↔ decode) with NO stored table,
         // migration, or downstream gate. Instrumentation only, per the derived-signal rule; the 2140-B
         // optical buffer stays raw-only (its layout isn't decoded yet).
-        // LIVE frames only — a hygiene measure, NOT a throughput fix. Keeping the honest numbers here so
-        // nobody re-derives the wrong conclusion from this file a third time:
+        // LIVE frames only — a hygiene measure, and deliberately carrying NO measured throughput claim.
+        // An earlier version of this comment derived a link-rate model ("the link is a metronome") from
+        // the inter-frame gap asymmetry in a single 208 s window; that model did not survive
+        // re-measurement across more windows and has been removed rather than restated. Do not re-derive
+        // a link-rate or throughput conclusion from this file — it logs frames, it does not time them.
         //
-        // A real 19 h drain (3,018 buffers / 208 s) shows a mean gap of 89.1 ms after a 1244-B buffer vs
-        // 49.0 ms after a 2140-B one. That asymmetry is NOT this decode — it is pure airtime, and reading
-        // it as a stall is an off-by-one. A gap is the time for the NEXT frame(s) to arrive, not the
-        // previous frame's processing, and the ~124-B v18 record sits between the two logged buffers
-        // (it's below `minBufferBytes`, so it is invisible here). So the gap after the 1244-B spans
-        // 124+2140 = 2264 B and the gap after the 2140-B spans only 1244 B. One free parameter — the link
-        // rate — fixed by the total (3508 B / 138.1 ms = 25.4 KB/s) then predicts the SPLIT with zero
-        // further freedom: 89.13 ms and 48.97 ms, against 89.1 and 49.0 observed. The two gaps
-        // independently agree on the byte rate to 0.09%. The link is a metronome; there is no stall.
-        // Removing this decode measured 7.2x -> 7.7x, consistent with its true ~7 ms cost, not 40 ms.
-        //
-        // It is still right to skip during offload: it is per-frame work on the MainActor in the delivery
-        // path, it buys nothing there, and the raw `hex` on this very line is the decoder's own input — so
-        // the summary is recomputable offline from the archive at any time. Live frames arrive ~1/s, where
-        // the inline summary is free and makes each line self-checking. Capture captures; analysis is
-        // downstream. The real duty-cycle costs are the idle watchdog and the auto-continue cap.
+        // The reason to skip during offload stands on its own, independent of any rate: it is per-frame
+        // work on the MainActor in the delivery path, it buys nothing there, and the raw `hex` on this
+        // very line is the decoder's own input — so the summary is recomputable offline from the archive
+        // at any time. Live frames arrive ~1/s, where the inline summary is free and makes each line
+        // self-checking. Capture captures; analysis is downstream.
         let imu = isOffload ? "" : Self.decodedImuField(frame)
         let line = "{\"ts_ms\":\(tsMs),\"strap_ts\":\(strapTs),\"size\":\(frame.count),"
             + "\"offload\":\(isOffload),\"char\":\"\(char.uuidString.lowercased())\",\"hex\":\"\(hex)\"\(imu)}\n"
