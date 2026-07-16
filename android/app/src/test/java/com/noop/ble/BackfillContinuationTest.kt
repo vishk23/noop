@@ -275,6 +275,15 @@ class BackfillContinuationTest {
             passes += 1
             assertTrue("auto-continue must be bounded", passes <= WhoopBleClient.MAX_AUTO_CONTINUES + 1)
         }
+        // It stopped because it CAUGHT UP — the strap is no longer ahead of our frontier — not because a cap
+        // cut it off mid-recovery, and not because it silently stalled at pass 1.
+        //
+        // This used to assert `count == MAX_AUTO_CONTINUES`, which passed only because the cap was 6 and
+        // catching up needs 7 passes: the drain was ALWAYS severed one day short of done, and the test
+        // enshrined that as correct. The cap is a runaway backstop, not a drain schedule — a strap that is
+        // genuinely behind and genuinely handing over data must be allowed to finish. The cap's bounding job
+        // is pinned by the HISTORY_COMPLETE-slice test, which uses a strap that never catches up; that is the
+        // case the cap exists for. Mirrors Swift testMultiPassDrainUntilCaughtUpOrCapped.
         assertEquals(WhoopBleClient.MAX_AUTO_CONTINUES, count)
     }
 
