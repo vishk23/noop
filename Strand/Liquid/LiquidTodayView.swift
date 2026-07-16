@@ -718,7 +718,12 @@ struct LiquidTodayView: View {
                             Text(synthesisExpanded ? "hide" : "show").font(StrandFont.caption)
                                 .foregroundStyle(StrandPalette.textTertiary)
                         }
-                        Text(synthLine).font(StrandFont.body).foregroundStyle(StrandPalette.textPrimary)
+                        // While the baseline calibrates, the honest "N of 4 nights" progress replaces the
+                        // readiness one-liner here — the same swap classic makes (`calibrationDetail ??
+                        // synthesisCardDetail`), so the count the short greeting pill can't carry lands in
+                        // the card and both Today screens read identically.
+                        Text(chargeDisplay.calibrationDetail ?? synthLine)
+                            .font(StrandFont.body).foregroundStyle(StrandPalette.textPrimary)
                             .fixedSize(horizontal: false, vertical: true)
                         if synthesisExpanded {
                             Text(LocalizedStringKey(readiness.summary)).font(StrandFont.caption)
@@ -1626,6 +1631,18 @@ extension LiquidTodayView {
             case .calibrating: return String(localized: "Calibrating")
             case .noData: return String(localized: "No data")
             }
+        }
+
+        /// The synthesis-card detail line while the baseline is still forming — the same "N of
+        /// `Baselines.minNightsSeed` nights" progress classic `TodayView.calibrationDetail` surfaces, so a
+        /// wearer in their first few nights reads identical calibration copy on both Today screens (before
+        /// this, Liquid dropped the count and showed a bare "Calibrating"). Non-nil ONLY for `.calibrating`:
+        /// the compact greeting pill stays short ("Calibrating") because it shares a `fixedSize` row with
+        /// the greeting, so the count lives here in the card, exactly as classic keeps it out of its
+        /// `ScoreStatePill`. Reuses classic's String Catalog key verbatim — one entry serves both screens.
+        var calibrationDetail: String? {
+            guard case .calibrating(let nights) = self else { return nil }
+            return String(localized: "Learning your baseline, \(nights) of \(Baselines.minNightsSeed) nights.")
         }
 
         static func resolve(todayRecovery: Double?, priorScored: DailyMetric?,
