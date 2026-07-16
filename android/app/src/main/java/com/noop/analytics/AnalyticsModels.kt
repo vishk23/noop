@@ -176,7 +176,14 @@ enum class BaselineStatus(val raw: String) {
     PROVISIONAL("provisional"),
     /** At least MIN_NIGHTS_TRUST valid nights. */
     TRUSTED("trusted"),
-    /** Usable but no update for > STALE_DAYS nights. */
+    /**
+     * Seeded (nValid ≥ MIN_NIGHTS_SEED) but not updated for > STALE_DAYS nights — so NOT [BaselineState.usable],
+     * and consumers fall back to population norms. This doc used to read "Usable but no update for >
+     * STALE_DAYS nights", which collides with the `usable` property (it excludes STALE) and reads as a
+     * code/comment contradiction. The CODE is the correct half: a personal baseline nobody has confirmed in
+     * over two weeks is exactly one not to trust. Pinned by `VitalBandsTest.staleBaseline_fallsBackToPopulation`
+     * on both platforms. (F1, docs/bugs/2026-07-15-strap-battery-backfill-observability.md)
+     */
     STALE("stale"),
 }
 
@@ -202,7 +209,12 @@ data class BaselineState(
     /** True iff fully trusted (not calibrating or stale). */
     val trusted: Boolean get() = status == BaselineStatus.TRUSTED
 
-    /** True iff at least provisionally usable (nValid ≥ MIN_NIGHTS_SEED). */
+    /**
+     * True iff this personal baseline should be trusted at all. NOT simply "nValid ≥ MIN_NIGHTS_SEED":
+     * [BaselineStatus.STALE] also clears that bar and is still excluded, because it has gone > STALE_DAYS
+     * nights with no confirming value. Callers that get `false` here fall back to population norms rather
+     * than score off a baseline that may no longer describe this person.
+     */
     val usable: Boolean
         get() = status == BaselineStatus.PROVISIONAL || status == BaselineStatus.TRUSTED
 }

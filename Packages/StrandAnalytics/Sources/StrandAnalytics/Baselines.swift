@@ -37,7 +37,14 @@ public enum BaselineStatus: String, Equatable, Sendable {
     case calibrating  // fewer than MIN_NIGHTS_SEED valid nights; no score yet
     case provisional  // between seed and trust thresholds; usable, higher uncertainty
     case trusted      // at least MIN_NIGHTS_TRUST valid nights
-    case stale        // usable but no update for > STALE_DAYS nights
+    /// Seeded (nValid ≥ MIN_NIGHTS_SEED) but not updated for > STALE_DAYS nights — so NOT `usable`, and
+    /// consumers fall back to population norms. This comment used to read "usable but no update for >
+    /// STALE_DAYS nights", which collides with the `usable` property below (it excludes `.stale`) and
+    /// reads as a code/comment contradiction. The CODE is the correct half: a personal baseline nobody has
+    /// confirmed in over two weeks is exactly one not to trust. Pinned by
+    /// `VitalBandsTests.testStaleBaselineFallsBackToPopulation` on both platforms.
+    /// (F1, docs/bugs/2026-07-15-strap-battery-backfill-observability.md)
+    case stale
 }
 
 /// Immutable snapshot of a personal baseline for one metric after N nights.
@@ -65,7 +72,10 @@ public struct BaselineState: Equatable, Sendable {
 
     /// True iff fully trusted (not calibrating or stale).
     public var trusted: Bool { status == .trusted }
-    /// True iff at least provisionally usable (nValid ≥ MIN_NIGHTS_SEED).
+    /// True iff this personal baseline should be trusted at all. NOT simply "nValid ≥ MIN_NIGHTS_SEED":
+    /// `.stale` also clears that bar and is still excluded, because it has gone > STALE_DAYS nights with
+    /// no confirming value. Callers that get `false` here fall back to population norms rather than score
+    /// off a baseline that may no longer describe this person.
     public var usable: Bool { status == .provisional || status == .trusted }
 }
 
