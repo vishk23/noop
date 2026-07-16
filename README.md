@@ -1,6 +1,6 @@
 > ### About this fork
 >
-> This is **Vishnu Kchittibhooma's** working fork of [NOOP](https://github.com/ryanbr/noop),
+> This is **Vishnu Kchitti's** working fork of [NOOP](https://github.com/ryanbr/noop),
 > the offline WHOOP companion app by [@ryanbr](https://github.com/ryanbr) and contributors.
 > The base app is their work; this fork is where my contributions to it are developed.
 >
