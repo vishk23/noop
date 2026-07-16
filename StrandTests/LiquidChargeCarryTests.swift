@@ -1,5 +1,6 @@
 import XCTest
 import WhoopStore
+import StrandAnalytics
 @testable import Strand
 
 /// Pins the Liquid Today Charge hero's carry-over truth table.
@@ -116,5 +117,29 @@ final class LiquidChargeCarryTests: XCTestCase {
         XCTAssertEqual(Display.scored(pct: 61).stateLabel, "Solid")
         XCTAssertEqual(Display.carried(pct: 82.3, caption: "Last night · 4 Jul").stateLabel, "Last night",
                        "the pill labels the carry as prior — the number beside it is not today's")
+    }
+
+    // MARK: - Calibration surfaces its "N of 4" progress (parity with classic TodayView)
+
+    /// The greeting pill is deliberately short ("Calibrating") because it shares a `fixedSize` row with the
+    /// greeting, so the honest "N of 4 nights" progress that classic `TodayView.calibrationDetail` shows must
+    /// live in Liquid's synthesis detail instead. `calibrationDetail` carries that copy verbatim so a wearer
+    /// in their first `Baselines.minNightsSeed` nights reads identical calibration progress on both Today
+    /// screens — before this, Liquid dropped the count and showed a bare "Calibrating".
+    func testCalibratingCarriesTheClassicNightCountCopy() {
+        XCTAssertEqual(Display.calibrating(nights: 2).calibrationDetail,
+                       "Learning your baseline, 2 of 4 nights.",
+                       "Liquid must mirror TodayView.calibrationDetail's copy verbatim (\(Baselines.minNightsSeed)-night seed)")
+        XCTAssertEqual(Display.calibrating(nights: 0).calibrationDetail,
+                       "Learning your baseline, 0 of 4 nights.",
+                       "night zero still reads honestly with its count, never a bare 'Calibrating'")
+    }
+
+    /// Only the calibrating state owns a synthesis detail line. A scored / carried / no-data day leaves the
+    /// readiness one-liner (`synthLine`) untouched — no stray "N of 4" appears once the baseline is trusted.
+    func testOnlyCalibratingStateHasASynthesisDetailLine() {
+        XCTAssertNil(Display.scored(pct: 61).calibrationDetail)
+        XCTAssertNil(Display.carried(pct: 82.3, caption: "Last night · 4 Jul").calibrationDetail)
+        XCTAssertNil(Display.noData.calibrationDetail)
     }
 }
