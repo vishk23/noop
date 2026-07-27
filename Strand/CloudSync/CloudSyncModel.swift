@@ -15,22 +15,112 @@ import UIKit
 /// two different `busy` flags: a manual "Sync now" tap on the Data Sources card can't see that the
 /// launch-time auto-sync (on its own throwaway instance) is already mid-upload, and vice versa — both
 /// would happily run `CloudSyncUploader.upload` concurrently against the same on-disk store and the
-/// same server. An `actor` serializes access to its own state automatically, making it the natural
-/// process-wide singleton shape here — `shared` is the one gate for the whole process.
-actor CloudSyncGate {
+/// same server. `shared` is the one gate for the whole process.
+///
+/// DELIBERATELY NOT AN ACTOR (it was one, and that shape caused a 10-day silent sync outage on a real
+/// device — see `withGate`). An actor forces `begin`/`end` to be `await`ed, and `defer` cannot contain
+/// an `await`, so every caller had to release the gate as a plain trailing statement that only runs if
+/// the work before it actually returns. `NSLock` around the state instead makes both operations
+/// synchronous and callable from any thread, which is what lets `withGate`'s `defer` be a real
+/// guaranteed release. Same reasoning, and the same idiom, as `BGTaskCompletion` in
+/// `CloudSyncBackgroundRefresh.swift`. `@unchecked Sendable` because the lock — not the compiler —
+/// is what makes the mutable state safe to touch concurrently.
+final class CloudSyncGate: @unchecked Sendable {
     static let shared = CloudSyncGate()
-    private var inFlight = false
 
-    /// Claims the gate if it's free. Returns false (and claims nothing) if a sync is already running.
-    func begin() -> Bool {
-        if inFlight { return false }
-        inFlight = true
-        return true
+    /// How long a single hold may last before the NEXT claimant is allowed to take the gate anyway.
+    ///
+    /// This is the self-heal, and it is the only thing that can rescue a process whose sync task will
+    /// never resume at all: `withGate`'s `defer` covers a normal return, a throw, and a cancellation
+    /// unwind, but a task that iOS suspends mid-`await` and never wakes runs no `defer` either — its
+    /// continuation simply never fires. Without a time bound the gate stays held for the life of the
+    /// process, and a phone that keeps NOOP resident for days never syncs again (observed: 10 days, with
+    /// "Sync now" answering "Sync already in progress" every time).
+    ///
+    /// Two hours is chosen to sit comfortably ABOVE the worst legitimate sync — the `.noopbak` upload is
+    /// 100-300MB and `CloudSyncClient.syncSession` already caps any single request at one hour — so a
+    /// slow-but-live sync is never robbed of its gate, while a genuinely wedged one is reclaimed within
+    /// one foreground launch rather than never.
+    static let staleHoldS: TimeInterval = 2 * 3600
+
+    /// What a `begin()` call did. `ticket` is the only proof of holding: non-nil means this caller now
+    /// holds the gate and must pass it back to `end(_:)`; nil means the claim was denied.
+    struct Claim: Equatable {
+        let ticket: UInt64?
+        /// How long the PREVIOUS holder had been holding when this call arrived — nil when the gate was
+        /// simply free. Set on both outcomes: on a denial it says how long the incumbent has had it, and
+        /// on a reclaim it says how long the abandoned hold had lasted (what the breadcrumb records).
+        let previousHoldS: TimeInterval?
+
+        var granted: Bool { ticket != nil }
+        /// True only when this claim TOOK the gate from a holder that had blown past `staleHoldS`.
+        var reclaimed: Bool { ticket != nil && previousHoldS != nil }
     }
 
-    /// Releases the gate. Must be called exactly once for every `begin()` that returned true.
-    func end() {
-        inFlight = false
+    private let lock = NSLock()
+    private var heldSince: Date?
+    private var heldTicket: UInt64 = 0
+    private var nextTicket: UInt64 = 1
+
+    /// Claims the gate if it's free, or if the current hold has outlived `staleAfter`. Prefer
+    /// `withGate` — it pairs this with a guaranteed release; this is exposed for tests and for the
+    /// (currently none) caller that genuinely cannot use a scope.
+    func begin(now: Date = Date(), staleAfter: TimeInterval = CloudSyncGate.staleHoldS) -> Claim {
+        lock.lock()
+        defer { lock.unlock() }
+        if let since = heldSince {
+            let held = now.timeIntervalSince(since)
+            guard held >= staleAfter else { return Claim(ticket: nil, previousHoldS: held) }
+            return Claim(ticket: take(now), previousHoldS: held)
+        }
+        return Claim(ticket: take(now), previousHoldS: nil)
+    }
+
+    /// Releases the gate — but ONLY if `ticket` is the one currently holding it. A stale-reclaimed hold
+    /// can come back from the dead (a suspended URLSession continuation that finally resumes hours
+    /// later, long after `staleHoldS` handed the gate to someone else); its `end` must not yank the gate
+    /// out from under the sync that legitimately owns it now. A mismatched or already-released ticket is
+    /// a silent no-op, which also makes `end` idempotent.
+    func end(_ ticket: UInt64) {
+        lock.lock()
+        defer { lock.unlock() }
+        guard heldTicket == ticket else { return }
+        heldSince = nil
+        heldTicket = 0
+    }
+
+    /// Run `body` holding the gate, releasing it on EVERY exit path — normal return, thrown error, or
+    /// cancellation unwind — because the release rides a `defer` rather than a trailing statement.
+    /// Returns nil (without running `body`) when the gate is held by a claim that is not yet stale.
+    ///
+    /// This exists as one reusable scope rather than as acquire/release pairs at each call site because
+    /// the previous shape leaked exactly that way: `runGatedSync` acquired the gate, awaited the sync,
+    /// and released it on the line after — so any sync that failed to RETURN (a hung request, a task
+    /// suspended mid-flight by iOS and never resumed) held the gate forever, and every later sync from
+    /// every entry point bailed instantly with "Sync already in progress". A single scope means a future
+    /// call site cannot reintroduce the leak by forgetting the release.
+    @discardableResult
+    func withGate<T>(now: Date = Date(), staleAfter: TimeInterval = CloudSyncGate.staleHoldS,
+                     _ body: (Claim) async throws -> T) async rethrows -> T? {
+        let claim = begin(now: now, staleAfter: staleAfter)
+        guard let ticket = claim.ticket else { return nil }
+        defer { end(ticket) }
+        return try await body(claim)
+    }
+
+    /// Whether the gate is currently held, and since when — read-only, for tests and diagnostics.
+    var currentHoldStart: Date? {
+        lock.lock()
+        defer { lock.unlock() }
+        return heldSince
+    }
+
+    /// Caller must already hold `lock`.
+    private func take(_ now: Date) -> UInt64 {
+        heldSince = now
+        heldTicket = nextTicket
+        nextTicket &+= 1
+        return heldTicket
     }
 }
 
@@ -139,22 +229,42 @@ final class CloudSyncModel: ObservableObject {
         Task { await runGatedSync(repo: repo, url: url, token: token) }
     }
 
-    /// Acquires the process-wide `CloudSyncGate`, runs `performSync`, and always releases it —
-    /// written out as one linear sequence rather than `defer` (which can't `await`). This is safe
-    /// specifically because `performSync` never throws and never returns early once it starts: every
-    /// internal failure is caught inside it and folded into its own status-line string (see its
-    /// body), so falling off the end of this function really does mean "released on every exit path."
+    /// Runs `performSync` inside the process-wide `CloudSyncGate`, which releases on every exit path.
     /// Shared by `syncNow` and `autoSyncIfDue` — each spawns its own `Task` calling this — rather than
     /// having `autoSyncIfDue` acquire the gate and then call `syncNow` (which would try to acquire it
     /// again and immediately see it as already held by the very call chain it's part of, bailing with
     /// "Sync already in progress" on every auto-sync).
+    ///
+    /// The release used to be a plain statement AFTER the `await performSync(…)` line, justified by
+    /// "`performSync` never throws and never returns early." That reasoning covered the wrong hazard:
+    /// the danger was never an early RETURN, it was never returning at all. A sync task suspended
+    /// mid-`await` by iOS (or waiting on a request with no effective deadline) leaves the gate held with
+    /// no code left to run, and because every entry point here — manual "Sync now", the on-launch
+    /// catch-up, `BGAppRefreshTask`, the silent-push handler — funnels through this one function, ALL of
+    /// them then bail instantly. That is the 10-day outage this now guards two ways: `withGate`'s
+    /// `defer` for anything that unwinds, and `CloudSyncGate.staleHoldS` for anything that never does.
     private func runGatedSync(repo: Repository, url: URL, token: String) async {
-        guard await CloudSyncGate.shared.begin() else {
-            statusText = "Sync already in progress"
-            return
+        let ran = await CloudSyncGate.shared.withGate { claim in
+            if claim.reclaimed, let abandoned = claim.previousHoldS {
+                Self.noteGateReclaimed(afterS: abandoned)
+            }
+            await performSync(repo: repo, url: url, token: token)
         }
-        await performSync(repo: repo, url: url, token: token)
-        await CloudSyncGate.shared.end()
+        if ran == nil { statusText = "Sync already in progress" }
+    }
+
+    /// UserDefaults breadcrumb for the last stale-hold reclaim (`CloudSyncGate.staleHoldS`), readable
+    /// from the app container's preferences plist like `CloudSyncAppDelegate.registrationBreadcrumbKey`.
+    /// A reclaim is always a bug's fingerprint — some sync stopped without releasing — so it must leave
+    /// a durable trace rather than silently healing and hiding the evidence. Diagnosis-only: nothing
+    /// reads it back in code, and it deliberately does NOT touch `lastStatusKey`, which belongs to sync
+    /// OUTCOMES the Data Sources card shows the user.
+    static let gateReclaimBreadcrumbKey = "cloudsync.gateReclaimed"
+
+    private static func noteGateReclaimed(afterS: TimeInterval) {
+        let mins = Int((afterS / 60).rounded())
+        UserDefaults.standard.set("reclaimed a \(mins)m stale sync hold · \(Date())",
+                                  forKey: gateReclaimBreadcrumbKey)
     }
 
     /// The actual pull + upload work, gated by `runGatedSync` — never called directly. Byte-identical
@@ -177,6 +287,12 @@ final class CloudSyncModel: ObservableObject {
     /// that synced an hour ago with no new samples and no applied edits has nothing new to ship.
     private func performSync(repo: Repository, url: URL, token: String) async {
         setBusy(true); statusText = "Pulling edits…"
+        // Same class of leak the gate had, one scope down: `setBusy(false)` used to be the last
+        // statement of this method, so a sync that unwound early left `busy` stuck true — which on iOS
+        // also means `isIdleTimerDisabled` stays true and the screen never sleeps. `defer` can call it
+        // directly (no `await`) because `setBusy` is synchronous on this already-MainActor-isolated
+        // method; it still runs after `repo.refresh()` below, exactly where the old call site was.
+        defer { setBusy(false) }
         // Hoisted out of the `if let store` below (where it used to be built) so the deep-buffer drain
         // at the end of this method can reach it: that drain reads a FILE, not the store, so it must
         // still run on a device whose store handle is unavailable.
@@ -259,7 +375,6 @@ final class CloudSyncModel: ObservableObject {
         }
         Self.persistLastStatus(line)
         await repo.refresh()
-        setBusy(false)
     }
 
     /// Ship whatever new bytes `PuffinDeepBufferLog` has appended since this device's last confirmed
