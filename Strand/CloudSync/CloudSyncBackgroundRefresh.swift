@@ -83,6 +83,12 @@ enum CloudSyncBackgroundRefresh {
             // via `URLError.cancelled`/`CancellationError`, which `performSync`'s `catch` already folds
             // into a status line like any other failure — never crash-safe territory, just a sync that
             // reports "cancelled" instead of a result. `Task.cancel()` is safe to call from any thread.
+            //
+            // What this canNOT promise is that `work` finishes unwinding at all: `setTaskCompleted`
+            // below tells iOS it may suspend the process immediately, which can happen while the sync
+            // is still parked on an `await` that then never resumes. `CloudSyncGate` covers both
+            // outcomes — `withGate`'s `defer` releases if the task does unwind, and
+            // `CloudSyncGate.staleHoldS` reclaims the hold if it doesn't.
             work.cancel()
             completion.complete(success: false)
         }

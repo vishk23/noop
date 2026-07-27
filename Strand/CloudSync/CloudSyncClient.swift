@@ -27,11 +27,32 @@ enum CloudSyncError: LocalizedError, Equatable {
 /// The noop-cloud edit-journal client. Injected `session` makes it URLProtocol-testable.
 /// Networking lives here in the app target by design (mirrors Strand/Oura/OuraAPIClient.swift).
 final class CloudSyncClient {
+    /// The session every production cloud-sync call runs on. Exists because the default was
+    /// `URLSession.shared`, whose `timeoutIntervalForResource` is SEVEN DAYS — so a single stalled
+    /// `/ingest` upload could stay outstanding for a week, and (before `CloudSyncGate` learned to
+    /// self-heal) hold the sync gate shut for exactly that long. `URLSession.shared`'s configuration
+    /// cannot be adjusted after the fact — it hands back a copy — so bounding this requires a session
+    /// of our own.
+    ///
+    /// `timeoutIntervalForRequest` (60s) is the inactivity deadline and is the one that actually catches
+    /// a hung connection: it fires when no bytes move for a minute, regardless of how big the body is.
+    /// `timeoutIntervalForResource` (1h) is the wall-clock ceiling for one whole request, sized for the
+    /// worst legitimate case this client has — the 100-300MB `.noopbak` in `ingest` on a slow link — not
+    /// for the typical `/edits` round trip. Neither timer runs while iOS has the process suspended,
+    /// which is why they are a bound on hung REQUESTS only; the bound on a hung SYNC is
+    /// `CloudSyncGate.staleHoldS`.
+    static let syncSession: URLSession = {
+        let config = URLSessionConfiguration.default
+        config.timeoutIntervalForRequest = 60
+        config.timeoutIntervalForResource = 3600
+        return URLSession(configuration: config)
+    }()
+
     private let baseURL: URL
     private let token: String
     private let session: URLSession
 
-    init(baseURL: URL, token: String, session: URLSession = .shared) {
+    init(baseURL: URL, token: String, session: URLSession = CloudSyncClient.syncSession) {
         self.baseURL = baseURL
         self.token = token
         self.session = session
