@@ -165,21 +165,11 @@ and the risk is asymmetric — firing early is safe but wasteful, firing late on
 **REFUTED, do not re-derive:**
 - **There is no "~25.4 KB/s airtime ceiling"** and no "~7x real-time". That was a one-window fit; it did
   not survive re-measurement across a dozen windows. The absolute link rate is not a constant of this
-  system. Both figures are gone from the tree.
+  system. Both figures are gone from the tree — removed from the cap rationale on both platforms and
+  from `PuffinDeepBufferLog.swift`.
 - **The "~1.19x throughput" (and the "~3.7x → ~1.0x collapse") was never a bug.** The strap was **CAUGHT
   UP**. History cannot drain faster than the rate at which it is banked — with no backlog, **~1.0x is
   the floor**, not a symptom.
-
-Drain time is `(bytes banked per second-of-history) / (bytes the link moves per second)` and **both
-terms move**. Any single headline multiplier is a property of one capture.
-
-**REFUTED, do not re-derive:**
-- **There is no "~25.4 KB/s airtime ceiling"** and no "~7x real-time". That was a one-window fit; it did
-  not survive re-measurement across a dozen windows. The absolute link rate is not a constant of this
-  system. Both figures have been removed from the cap rationale on both platforms and from
-  `PuffinDeepBufferLog.swift`.
-- **The "~1.19x throughput" was never a bug.** The strap was **CAUGHT UP**. You cannot drain history
-  faster than it is generated — with no backlog, **~1.0x is the floor**, not a symptom.
 
 Drain time is `(bytes banked per second-of-history) / (bytes the link moves per second)` and **both
 terms move**. Any single headline multiplier is a property of one capture.
