@@ -29,4 +29,15 @@ Raw per-lens findings (science/medical, competitive Oura/WHOOP, NOOP code audit,
 
 ## Status
 
-The **Wave 0** slice ("wire the rigorous methodology that's already written but disconnected" + free honesty fixes) is the first implementation sub-project; see its spec under `docs/scoring-precision/wave-0-spec.md` once written.
+The **Wave 0** slice ("wire the rigorous methodology that's already written but disconnected" + free honesty fixes) is the first implementation sub-project; its spec is [wave-0-spec.md](wave-0-spec.md).
+
+The research was generated 2026-07-13 and describes the tree as it stood then; it is a **map, not a
+changelog**. Several Wave 0a items (SL1, T1, RD1, RD-confidence) have since been implemented, so those
+gap descriptions read as history rather than as open work. Wave 0b's two items remain gated on their
+upstream dependencies: R8 is unblocked (#417 merged 2026-07-14), S1 still waits on #413.
+
+## Related
+
+- [daily-stress-autonomic-redesign.md](daily-stress-autonomic-redesign.md) — the earlier, deeper
+  single-score redesign for Daily Stress that predates this program. `stress-methodology.md` here is
+  the program-shaped view of the same score; that file is the implementation-level design.
