@@ -39,7 +39,21 @@ Neither code commit needs a Kotlin twin, and both say why: Android already carri
 v20 historical decoder at all — `decodeWhoop5Historical` returns `null` for `version != 18`, so
 `9c70cd4c` has no counterpart to keep in step.
 
-## The uncommitted worktree — two classes, handled differently
+## The uncommitted worktree — snapshotted, then split in two
+
+Both classes below are frozen in the local branch
+**`snapshot/capture-deep-worktree-2026-07-26`** (`714df93f`), committed on top of `48d6ea12` before
+this session ended so nothing depends on the worktree staying dirty. That branch is **local to this
+clone and deliberately unpushed** — see the signing-config note below for why it must stay that way.
+It is a recovery point, not proposed work; do not merge it.
+
+Recover a single path from it without disturbing anything else:
+
+```bash
+git show snapshot/capture-deep-worktree-2026-07-26:project.yml > project.yml
+```
+
+The worktree itself was left dirty and unchanged, so an in-progress device build still works as-is.
 
 ### 1. Local signing configuration — never commit
 
@@ -53,9 +67,14 @@ These rewrite `DEVELOPMENT_TEAM` from empty to a personal Apple Developer team, 
 target from `NOOPiOS`'s dependencies.
 
 That is a free-Apple-ID sideload configuration for one developer's own device. Committing it breaks
-every other contributor's build, and it publishes a personal developer identity into a project whose
-stated scope is to stay anonymous. Keep these paths out of every commit — stage explicit paths, and
-never `git commit -a`.
+every other contributor's build, and `vishk23/noop` is a **public** repository — pushing it would
+put a personal Apple Developer identity into permanent git history, which a later edit cannot undo,
+in a project whose stated scope is to stay anonymous. Keep these paths out of every pushed commit —
+stage explicit paths, and never `git commit -a`.
+
+This is the sole reason `snapshot/capture-deep-worktree-2026-07-26` was not pushed. Splitting the
+snapshot so the harmless half could go to `origin` was not worth doing: that half is already public
+on `origin/main` verbatim.
 
 ### 2. Work that already exists on `origin/main` — safe to drop
 
