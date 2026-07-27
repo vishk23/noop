@@ -33,27 +33,27 @@ below. That is an integration decision, not a formality.
 | `24eb06cf` | `fix(liquid-today): carry SpO2 + skin-temp per-field like classic` — app-target Swift; adds the pure `LiquidTodayView.perFieldVital` and `StrandTests/LiquidVitalsCarryTests.swift` | Built the `Strand` (macOS) and `NOOPiOS` schemes and ran `StrandTests` locally — 1038 tests, 0 failures. App-target Swift is not covered by default CI. |
 | `9c70cd4c` | `WhoopProtocol: fix v20 (2140 B) historical decoder sample count 50 -> 25` — `Packages/WhoopProtocol` | `swift test`, 286 passing. Census over 29,203 captured buffers; instrumentation-only, zero production consumers. |
 | `196a3121` | `docs(bug-sweep)`: merges the duplicated A5 "REFUTED, do not re-derive" block in `docs/bugs/2026-07-15-strap-battery-backfill-observability.md` into one | Docs-only. |
+| `a1c7d1fd` | `fix(liquid-today): surface the "N of 4 nights" calibration count` — app-target Swift; adds `ChargeDisplay.calibrationDetail` and two tests. Was uncommitted in the worktree until 2026-07-26 | Built the `Strand` (macOS) scheme — `** BUILD SUCCEEDED **`. Duplicates `origin/main`'s `7770324a`; see below. |
 
-Neither code commit needs a Kotlin twin, and both say why: Android already carries
-`lastSpo2`/`lastSkinTempRow` (so `24eb06cf` is UI wiring, no analytics change), and Android has no
-v20 historical decoder at all — `decodeWhoop5Historical` returns `null` for `version != 18`, so
-`9c70cd4c` has no counterpart to keep in step.
+No code commit here needs a Kotlin twin, and each says why: Android already carries
+`lastSpo2`/`lastSkinTempRow` (so `24eb06cf` is UI wiring, no analytics change); Android has no v20
+historical decoder at all — `decodeWhoop5Historical` returns `null` for `version != 18`, so
+`9c70cd4c` has no counterpart to keep in step; and `a1c7d1fd` is UI wiring over an existing state,
+with no analytics or stored value.
 
-## The uncommitted worktree — snapshotted, then split in two
+## What was uncommitted — the code landed, the private config did not
 
-Both classes below are frozen in the local branch
-**`snapshot/capture-deep-worktree-2026-07-26`** (`714df93f`), committed on top of `48d6ea12` before
-this session ended so nothing depends on the worktree staying dirty. That branch is **local to this
-clone and deliberately unpushed** — see the signing-config note below for why it must stay that way.
-It is a recovery point, not proposed work; do not merge it.
+The worktree's pending work split cleanly along a publishable / not-publishable line, and each half
+was handled on its own terms.
 
-Recover a single path from it without disturbing anything else:
+Everything in both halves is also frozen in the local branch
+**`snapshot/capture-deep-worktree-2026-07-26`** (`714df93f`), taken on top of `48d6ea12` as a
+recovery point before this session ended. It is not proposed work; do not merge it. Recover a single
+path from it without disturbing anything else:
 
 ```bash
 git show snapshot/capture-deep-worktree-2026-07-26:project.yml > project.yml
 ```
-
-The worktree itself was left dirty and unchanged, so an in-progress device build still works as-is.
 
 ### 1. Local signing configuration — never commit
 
@@ -72,30 +72,30 @@ put a personal Apple Developer identity into permanent git history, which a late
 in a project whose stated scope is to stay anonymous. Keep these paths out of every pushed commit —
 stage explicit paths, and never `git commit -a`.
 
-This is the sole reason `snapshot/capture-deep-worktree-2026-07-26` was not pushed. Splitting the
-snapshot so the harmless half could go to `origin` was not worth doing: that half is already public
-on `origin/main` verbatim.
+These five paths are the only thing this session left unpushed, and they remain deliberately dirty
+in the worktree so an in-progress device build still works as-is.
 
-### 2. Work that already exists on `origin/main` — safe to drop
+### 2. The calibration count — committed as `a1c7d1fd`, pushed
 
 `Strand/Liquid/LiquidTodayView.swift` (+19/−1) and `StrandTests/LiquidChargeCarryTests.swift` (+25)
-carry the `ChargeDisplay.calibrationDetail` port — the "N of 4 nights" calibration count.
+carried the `ChargeDisplay.calibrationDetail` work — the "N of 4 nights" count Liquid Today dropped
+while the baseline formed. It holds no personal data, so it landed on the branch normally.
 
-`origin/main` already has exactly this as `7770324a` (merged via PR #3, `e5a03661`), same +19/−1 and
-+25 shape. `StrandTests/LiquidChargeCarryTests.swift` in this worktree is byte-identical to
-`origin/main`'s copy. Nothing is lost by discarding these hunks; the merge brings them in.
+It is the same change `origin/main` already carries as `7770324a` (merged via PR #3, `e5a03661`),
+and `capture-deep` had no copy — `HEAD` before this commit had zero `calibrationDetail` occurrences.
+After it, both branches have four, and `StrandTests/LiquidChargeCarryTests.swift` is byte-identical
+across the two. The merge back should therefore be a no-op on these files rather than a conflict.
 
-One caveat when discarding: `Strand/Liquid/LiquidTodayView.swift` as a whole is **not** identical to
-`origin/main` — the committed file also holds this branch's pull-to-sync `ble` property, the
-per-field vitals carry from `24eb06cf`, and the sky-behind-cards default. Restoring it to `HEAD`
-keeps all of that and drops only the duplicate calibration hunks; restoring it to `origin/main`
-would destroy committed branch work.
+Verified by building the `Strand` (macOS) scheme — `** BUILD SUCCEEDED **`, no errors. That check is
+not optional here: `swift-packages.yml` does not compile app targets and `app-build.yml` is disabled,
+so nothing in default CI would have caught a break in `Strand/Liquid/`.
 
 ## What the merge session has to decide
 
 1. **Upstream slab or cherry-pick.** Merging `capture-deep` into `origin/main` takes 22 upstream
    commits with it. Cherry-picking `24eb06cf`, `9c70cd4c`, `196a3121` onto a branch cut from
-   `origin/main` lands the fixes without that import.
+   `origin/main` lands the fixes without that import. Do **not** cherry-pick `a1c7d1fd` — `origin/main`
+   already has that change as `7770324a`.
 2. **The A5 dedup is not everywhere.** `196a3121` fixed the duplicated block on `capture-deep` only.
    `origin/main` and `origin/ble-link-recovery-port` still carry the block twice. Whichever branch
    lands the fix first, the other needs a rebase or its own dedup. The file is fork-local and does
