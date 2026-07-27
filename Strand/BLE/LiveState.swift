@@ -244,6 +244,19 @@ public final class LiveState: ObservableObject {
     /// #690: the body-location probe result (or the waiting sentinel), shown + copied in the Devices dialog.
     /// Cleared on disconnect and on dialog dismiss. Twin of the Android WhoopBleClient.bodyLocationProbe flow.
     @Published public var bodyLocationProbe: String? = nil
+
+    /// The WHOOP MG ECG ("Labrador") probe result (or the waiting sentinel), shown + copied in the Devices
+    /// dialog. Cleared on disconnect and on dialog dismiss. Instrumentation only — the text it carries is
+    /// explicitly not a medical measurement.
+    @Published public var ecgProbe: String? = nil
+
+    /// The 5-generation hardware variant resolved from the strap's Device Information Service
+    /// (`Whoop5Variant.label`: "MG" / "5.0" / "—"), nil before any DIS string has landed. Published so an
+    /// MG-only capability can gate on POSITIVELY identified hardware instead of guessing from a model
+    /// string; `.unknown` is not MG, so a feature stays off until the strap attests. Diagnostic + gating
+    /// only — it never changes how a frame is parsed (see the note on `Whoop5Variant`).
+    @Published public var whoop5Variant: String? = nil
+
     /// Wrist-wear state from WRIST_ON/WRIST_OFF events. Defaults true so wear-gated features work
     /// before the first event arrives; flipped by FrameRouter on a real event.
     @Published public var worn: Bool = true
