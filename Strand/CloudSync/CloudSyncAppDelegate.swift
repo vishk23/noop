@@ -72,8 +72,37 @@ final class CloudSyncAppDelegate: NSObject, UIApplicationDelegate {
         if CloudSyncSettings.effectiveURL != nil, CloudSyncSettings.effectiveToken != nil {
             UserDefaults.standard.set("requested \(Date())", forKey: Self.registrationBreadcrumbKey)
             application.registerForRemoteNotifications()
+            // Build the upload session HERE, at launch, while the app is (usually) foreground: iOS
+            // forces `isDiscretionary` on a background session CREATED while already backgrounded,
+            // which would let it park a push-triggered upload until Wi-Fi + power — the exact case
+            // this lane exists for. Constructing it now also re-associates any transfer that outlived
+            // the last process, so its completion can be delivered. See `prewarm()`.
+            //
+            // Gated on the same EFFECTIVE credentials as registration above: with no credentials no
+            // upload can ever start, so there is nothing to prewarm or reconcile. A relaunch purely to
+            // drain a session's events does not depend on this — `handleEventsForBackgroundURLSession`
+            // brings the session up itself.
+            CloudSyncBackgroundSession.shared.prewarm()
+            // Then clean up after the one exit iOS never reports: a force-quit mid-upload.
+            Task { await CloudSyncBackgroundSession.shared.reconcileInFlight() }
         }
         return true
+    }
+
+    /// iOS relaunched (or resumed) the app purely to hand over a background session's finished
+    /// business — the whole reason the `/ingest` upload can now complete without the user present.
+    /// Hand the completion handler to the session; it fires once the queued delegate callbacks are
+    /// drained (`urlSessionDidFinishEvents`), which is what tells iOS it is safe to suspend us again.
+    /// Failing to call it (or calling it late) gets the app killed for unresponsiveness.
+    func application(_ application: UIApplication,
+                      handleEventsForBackgroundURLSession identifier: String,
+                      completionHandler: @escaping () -> Void) {
+        guard identifier == CloudSyncBackgroundSession.sessionIdentifier else {
+            // Not ours — nothing to drain, but iOS still needs the handler called.
+            completionHandler()
+            return
+        }
+        CloudSyncBackgroundSession.shared.handleEvents(completionHandler: completionHandler)
     }
 
     /// Expected on EVERY launch of this branch (see the type's doc comment: no `aps-environment`

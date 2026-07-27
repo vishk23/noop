@@ -48,14 +48,33 @@ final class CloudSyncClient {
         return URLSession(configuration: config)
     }()
 
+    /// Performs `ingest`'s actual byte transfer: takes the fully-formed, Bearer-authed `URLRequest`
+    /// and the on-disk `.noopbak`, returns `(body, statusCode)` — the same pair `sendUpload` would
+    /// otherwise produce in-process. Returning `(Data, Int)` rather than a `URLResponse` keeps
+    /// `ingest`'s status/decode checks untouched whichever transfer ran.
+    ///
+    /// Injected so iOS production can hand the transfer to a BACKGROUND `URLSession`
+    /// (`CloudSyncBackgroundSession`), which iOS keeps running across app suspension and termination.
+    /// A default session's tasks are killed the moment the app suspends, and a whole-DB upload cannot
+    /// finish inside the ~30s a silent push grants — that combination is what left cloud sync dead for
+    /// 22h (see `CloudSyncBackgroundSession`'s doc comment). Implementations MUST throw
+    /// `CloudSyncError` so `ingest`'s error contract is identical on both transfers.
+    ///
+    /// nil (the default) = transfer in-process via `session.upload(for:fromFile:)`, the original
+    /// behaviour — which is what macOS and the `URLProtocol`-stubbed tests still use.
+    typealias FileUploading = @Sendable (URLRequest, URL) async throws -> (Data, Int)
+
     private let baseURL: URL
     private let token: String
     private let session: URLSession
+    private let fileUploader: FileUploading?
 
-    init(baseURL: URL, token: String, session: URLSession = CloudSyncClient.syncSession) {
+    init(baseURL: URL, token: String, session: URLSession = CloudSyncClient.syncSession,
+         fileUploader: FileUploading? = nil) {
         self.baseURL = baseURL
         self.token = token
         self.session = session
+        self.fileUploader = fileUploader
     }
 
     /// GET /edits?since=<cursor>, Bearer-authed. Returns the page of rows plus the server's latest seq.
@@ -183,7 +202,14 @@ final class CloudSyncClient {
                                         duplicate: decoded.duplicate ?? false)
     }
 
+    /// The injected `fileUploader` (iOS production: the background session) takes precedence; without
+    /// one this is the original in-process streamed upload. `req` is passed through UNTOUCHED either
+    /// way, so the Bearer token, `application/octet-stream` and `X-Phone-Timezone` headers `ingest`
+    /// set are identical on both transfers.
     private func sendUpload(_ req: URLRequest, fromFile fileURL: URL) async throws -> (Data, Int) {
+        if let fileUploader {
+            return try await fileUploader(req, fileURL)
+        }
         do {
             let (data, resp) = try await session.upload(for: req, fromFile: fileURL)
             return (data, (resp as? HTTPURLResponse)?.statusCode ?? 0)
@@ -239,7 +265,10 @@ private struct RegisterDeviceRequest: Encodable {
     let platform: String
 }
 
-private struct IngestResponse: Decodable {
+/// Internal (not `private`) so `CloudSyncBackgroundSession` can decode the SAME wire shape when it has
+/// to interpret an `/ingest` reply itself — a completion delivered after the app was suspended or
+/// relaunched has no `ingest` call frame left to parse it. One definition, one contract.
+struct IngestResponse: Decodable {
     let bytes: Int
     let latestDay: String?
 }
