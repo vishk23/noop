@@ -14,10 +14,23 @@ extension WhoopStore {
     /// `COALESCE(MAX(…), default)` aggregate over one table, computed entirely in SQLite with no row
     /// materialized into Swift. `workout` and `metricSeries` use `COUNT` alone: `workout` rows are
     /// rewritten IN PLACE by `fix_workout`/`delete_workout` (no column is a safe append-only max to key
-    /// on) and `metricSeries.day` is written far out of order by design — for both, a changed COUNT
-    /// already catches every insert/delete/tombstone, and an in-place correction that leaves a table's
-    /// own row count unchanged (e.g. `fix_workout`'s patch) still moves the `hrSample`/`dailyMetric`
-    /// segments in the same edit, so the composite token still changes.
+    /// on) and `metricSeries.day` is written far out of order by design.
+    ///
+    /// KNOWN RESIDUE — this token does NOT detect every equal-count in-place correction, and a caller
+    /// that already knows an edit landed must not read "token unchanged" as "nothing changed". An
+    /// earlier version of this comment claimed such a correction "still moves the `hrSample`/`dailyMetric`
+    /// segments in the same edit"; that is false. Two confirmed counterexamples, both routine:
+    /// - `fix_workout` tombstones the original row, upserts the corrected copy under the `noop-cloud`
+    ///   device, then deletes the original — +1 then -1, so `COUNT(*) FROM workout` is unchanged, and it
+    ///   writes to no other table this token reads.
+    /// - `adjust_sleep_bounds` / `edit_sleep_stages` UPDATE a `sleepSession` row in place; restaging any
+    ///   night that is not the most recent leaves both `COUNT(*)` and `MAX(endTs)` exactly as they were.
+    ///
+    /// Closing this at the fingerprint would mean content-hashing whole tables here, and would change the
+    /// token's format — forcing every device one full re-upload. The consumer instead treats a pull that
+    /// applied edits as unconditionally dirty: see `CloudSyncModel.performSync`'s `mustUpload`. This token
+    /// stays what it is good at — cheaply proving that a device with no new samples and no applied edits
+    /// has nothing to ship.
     ///
     /// Deliberately EXCLUDES `cursors`: that table is sync BOOKKEEPING (`cloud_edits`,
     /// `cloud_edits_recomputed`, `stagelock:…`, the `highwater:`/`read:` cursors) rather than user data.

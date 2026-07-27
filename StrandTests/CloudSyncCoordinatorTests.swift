@@ -118,4 +118,48 @@ final class CloudSyncCoordinatorTests: XCTestCase {
         XCTAssertNil(cursor)   // nothing processed, so the cursor is left alone
     }
 }
+
+/// What `UserDefaults["cloudsync.lastStatus"]` — the one durable, user-readable record of whether sync
+/// is working — actually says. `@MainActor` because `CloudSyncModel` is.
+@MainActor
+final class CloudSyncStatusLineTests: XCTestCase {
+
+    private let noon = Date(timeIntervalSince1970: 1_753_000_000)
+
+    /// A failure and a success used to produce the same shape of sentence with the same trailing
+    /// timestamp, so "…returned an error (507) · 4:12 PM" was easy to read at a glance as "it synced at
+    /// 4:12". During the ten-day outage this string and its timestamp were the only signals available.
+    func testAFailureIsMarkedAsOneAndASuccessIsNot() {
+        let failed = CloudSyncModel.statusLine("The server has no room", succeeded: false, at: noon)
+        XCTAssertTrue(failed.hasPrefix("Failed — "), failed)
+
+        let ok = CloudSyncModel.statusLine("Applied 2 · Uploaded 231.4 MB", succeeded: true, at: noon)
+        XCTAssertFalse(ok.contains("Failed"), ok)
+        XCTAssertTrue(ok.hasPrefix("Applied 2"), ok)
+    }
+
+    /// Both shapes still carry the local time — the card's "when did this last happen" answer.
+    func testBothOutcomesCarryATimestamp() {
+        for succeeded in [true, false] {
+            let line = CloudSyncModel.statusLine("something", succeeded: succeeded, at: noon)
+            XCTAssertTrue(line.contains(" · "), line)
+            XCTAssertNotEqual(line, "something")
+        }
+    }
+
+    /// The full path a real 507 takes to the card: server body → typed error → the sentence a human
+    /// reads. It has to say the backup survived and that this will be retried, because the actionable
+    /// answer to a 507 is "do nothing" and the old message ("returned an error (507)") did not say so.
+    func testAnOutOfSpaceServerReplyReachesTheCardAsSomethingActionable() throws {
+        let body = #"{"error":"insufficient_space","detail":"only 300 MB free"}"#
+        let error = CloudSyncError.from(status: 507, body: Data(body.utf8), lane: "ingest")
+        let line = CloudSyncModel.statusLine(try XCTUnwrap(error.errorDescription),
+                                              succeeded: false, at: noon)
+
+        XCTAssertTrue(line.hasPrefix("Failed — "), line)
+        XCTAssertTrue(line.contains("insufficient_space"), line)
+        XCTAssertTrue(line.contains("Nothing was lost"), line)
+        XCTAssertTrue(line.contains("only 300 MB free"), line)
+    }
+}
 #endif // CLOUD_SYNC

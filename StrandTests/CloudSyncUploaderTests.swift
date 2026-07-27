@@ -22,8 +22,14 @@ final class CloudSyncUploaderTests: XCTestCase {
 
     private let baseURL = URL(string: "https://cloud.example.com")!
 
+    /// `retry: .immediate` keeps `CloudSyncRetryPolicy`'s attempt COUNTS while removing the waits, so a
+    /// test that provokes a retryable failure doesn't spend real seconds in backoff. Tests that care
+    /// about the retry behaviour itself live in `CloudSyncRetryTests`/`CloudSyncClientTests`.
     private func makeClient() -> CloudSyncClient {
-        CloudSyncClient(baseURL: baseURL, token: "tok-upload", session: OuraURLProtocolStub.session())
+        CloudSyncClient(baseURL: baseURL, token: "tok-upload", session: OuraURLProtocolStub.session(),
+                        retry: .immediate,
+                        bulkRetry: CloudSyncRetryPolicy(maxAttempts: 2, baseDelayS: 0, multiplier: 1,
+                                                         maxDelayS: 0, jitterFraction: 0))
     }
 
     /// A fake exporter that writes canned bytes to `dest` without touching the real on-disk database or
@@ -84,17 +90,81 @@ final class CloudSyncUploaderTests: XCTestCase {
 
     // MARK: - Network failure
 
-    func testUploadNon2xxThrowsBadResponse() async throws {
+    /// A 401 is TERMINAL, so it must surface as `unauthorized` and must NOT be retried — the same
+    /// rejected token would be sent again for nothing. The request count is the assertion that matters.
+    func testUploadNon2xxThrowsTypedErrorAndDoesNotRetryATerminalOne() async throws {
         OuraURLProtocolStub.queue = [.init(status: 401, body: "nope".data(using: .utf8)!)]
         let store = try await nonEmptyStore()
         let client = makeClient()
 
         do {
             _ = try await CloudSyncUploader.upload(store: store, client: client, exporter: fakeExporter())
-            XCTFail("expected badResponse to be thrown")
+            XCTFail("expected unauthorized to be thrown")
         } catch {
-            XCTAssertEqual(error as? CloudSyncError, CloudSyncError.badResponse(401, "nope"))
+            XCTAssertEqual(error as? CloudSyncError, CloudSyncError.unauthorized(status: 401, detail: "nope"))
         }
+        XCTAssertEqual(OuraURLProtocolStub.requestedURLs.count, 1)
+    }
+
+    /// The 507 the server answers when its volume is full. This is the case the flat `badResponse`
+    /// collapse got most wrong: the backup was VALID and the right response is to keep it and try again,
+    /// which is the opposite of what a 4xx means. Pinned as its own typed case, and as retryable.
+    func testUpload507SurfacesAsOutOfSpaceAndIsRetried() async throws {
+        let body = #"{"error":"insufficient_space","detail":"need 1.2 GB, only 300 MB free"}"#
+        OuraURLProtocolStub.queue = [.init(status: 507, body: Data(body.utf8)),
+                                     .init(status: 507, body: Data(body.utf8))]
+        let store = try await nonEmptyStore()
+        let client = makeClient()
+
+        do {
+            _ = try await CloudSyncUploader.upload(store: store, client: client, exporter: fakeExporter())
+            XCTFail("expected serverOutOfSpace to be thrown")
+        } catch {
+            XCTAssertEqual(error as? CloudSyncError,
+                           .serverOutOfSpace(code: "insufficient_space",
+                                             detail: "need 1.2 GB, only 300 MB free"))
+        }
+        // bulkUpload's budget: the first attempt plus exactly one retry — never more, because this body
+        // is the whole database.
+        XCTAssertEqual(OuraURLProtocolStub.requestedURLs.count, 2)
+    }
+
+    /// `400 corrupt_sqlite` means "these bytes are unreadable, don't send them again". Resending a
+    /// 100-300MB body that the server already told us it cannot parse is the one thing that must not
+    /// happen, so this pins exactly one request.
+    func testUploadCorruptSqliteIsTerminalAndNeverResendsTheBody() async throws {
+        OuraURLProtocolStub.queue = [
+            .init(status: 400, body: Data(#"{"error":"corrupt_sqlite"}"#.utf8)),
+            .init(status: 200, body: Data(#"{"ok":true,"bytes":10,"latestDay":"2026-07-26"}"#.utf8)),
+        ]
+        let store = try await nonEmptyStore()
+        let client = makeClient()
+
+        do {
+            _ = try await CloudSyncUploader.upload(store: store, client: client, exporter: fakeExporter())
+            XCTFail("expected rejected to be thrown")
+        } catch {
+            XCTAssertEqual(error as? CloudSyncError,
+                           .rejected(status: 400, code: "corrupt_sqlite", detail: ""))
+        }
+        XCTAssertEqual(OuraURLProtocolStub.requestedURLs.count, 1)
+    }
+
+    /// The payoff of retrying at all: a server that faults once and recovers costs the user nothing,
+    /// where before it cost a whole sync — and the next attempt was the next launch, not seconds later.
+    func testUploadRetriesAFiveHundredAndSucceedsOnTheSecondAttempt() async throws {
+        OuraURLProtocolStub.queue = [
+            .init(status: 500, body: Data(#"{"error":"ingest_failed"}"#.utf8)),
+            .init(status: 200, body: Data(#"{"ok":true,"bytes":4242,"latestDay":"2026-07-26"}"#.utf8)),
+        ]
+        let store = try await nonEmptyStore()
+        let client = makeClient()
+
+        let result = try await CloudSyncUploader.upload(store: store, client: client,
+                                                          exporter: fakeExporter())
+
+        XCTAssertEqual(result.bytes, 4242)
+        XCTAssertEqual(OuraURLProtocolStub.requestedURLs.count, 2)
     }
 
     func testUploadCleansUpTempFileEvenOnNetworkFailure() async throws {
@@ -106,7 +176,7 @@ final class CloudSyncUploaderTests: XCTestCase {
         do {
             _ = try await CloudSyncUploader.upload(store: store, client: client,
                                                      exporter: fakeExporter(capture: { capturedDest = $0 }))
-            XCTFail("expected badResponse to be thrown")
+            XCTFail("expected a server error to be thrown")
         } catch {
             // expected — asserted below via the cleaned-up temp file
         }

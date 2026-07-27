@@ -322,6 +322,7 @@ final class CloudSyncModel: ObservableObject {
                         line = parts.joined(separator: " · ")
                     }
                 }
+                let mustUpload = summary.applied > 0 || didRecompute
                 #if os(iOS) && canImport(HealthKit)
                 // force after a recompute: the vitals the write-back exports read dailyMetric, so a
                 // rollup rebuild needs a re-export even when THIS pull itself applied nothing.
@@ -329,15 +330,31 @@ final class CloudSyncModel: ObservableObject {
                                                             force: didRecompute)
                 #endif
 
-                // Skip-unchanged upload (Cloud Sync v2): computed AFTER pull/recompute above, so an
-                // edit this device just applied already makes the token differ from the last upload's
-                // — the corrected state uploads THIS sync, matching the pull-first reorder's whole
-                // point (see this method's doc comment). `try?`: a token-computation failure must not
-                // abort an otherwise-successful sync — it just falls through to "upload anyway", the
-                // same safe default as a first-ever sync (no saved token to compare against).
+                // An edit landed (or a rollup rebuild ran) this sync, so the local data provably
+                // changed and the mirror is stale by definition — upload regardless of what the
+                // fingerprint says.
+                //
+                // This is NOT belt-and-braces. `contentToken()` keys `workout` and `metricSeries` on
+                // COUNT alone, and `sleepSession` on (count, MAX(endTs)), so an EQUAL-COUNT in-place
+                // correction can leave the token byte-identical and the gate below can then silently
+                // decline to upload a real correction. Two confirmed ways, both routine here:
+                //   - `fix_workout` tombstones the original, upserts the corrected copy under the
+                //     `noop-cloud` device, then deletes the original: +1 then -1, so `COUNT(*) FROM
+                //     workout` is unchanged, and it touches no other table in the token.
+                //   - `adjust_sleep_bounds`/`edit_sleep_stages` UPDATE a `sleepSession` row in place;
+                //     restaging any night that is not the most recent leaves both the count and
+                //     `MAX(endTs)` exactly where they were.
+                // Fixing that at the fingerprint would mean content-hashing tables in an
+                // upstream-shared package (and forcing every device one full re-upload to change the
+                // token's format). `summary.applied > 0` is the same fact, already computed, exactly
+                // where the decision is made. `ContentToken.swift`'s doc comment records the residue.
+                //
+                // `try?` on the token: a token-computation failure must not abort an otherwise-
+                // successful sync — it just falls through to "upload anyway", the same safe default as
+                // a first-ever sync (no saved token to compare against).
                 let freshToken = try? await store.contentToken()
                 let lastUploadToken = UserDefaults.standard.string(forKey: Self.lastUploadTokenKey)
-                if let freshToken, freshToken == lastUploadToken {
+                if let freshToken, freshToken == lastUploadToken, !mustUpload {
                     parts.append("Up to date (nothing new to upload)")
                     line = parts.joined(separator: " · ")
                 } else {
@@ -373,7 +390,7 @@ final class CloudSyncModel: ObservableObject {
         if succeeded {
             UserDefaults.standard.set(Date().timeIntervalSince1970, forKey: Self.lastAutoSyncKey)
         }
-        Self.persistLastStatus(line)
+        Self.persistLastStatus(line, succeeded: succeeded)
         await repo.refresh()
     }
 
@@ -388,8 +405,22 @@ final class CloudSyncModel: ObservableObject {
     /// sync costs two `stat` calls when there is nothing new (see `DeepBufferUploader.drain`), so
     /// there is nothing to gate away.
     private func drainDeepBuffers(client: CloudSyncClient) async -> String? {
+        // Don't pay for a lane the server told us is switched off. `503 storage_not_configured` is
+        // answered only AFTER the chunk body has been sent, so re-probing it every sync would upload
+        // megabytes per sync purely to be told "no" again — cheap when syncs were daily, not cheap at
+        // the target cadence of a sync every time the phone is unlocked. The suppression is time-bounded
+        // rather than sticky so provisioning a bucket server-side heals on its own, with no reinstall
+        // and no setting to find, within `deepBufferOffProbeS`.
+        let now = Date().timeIntervalSince1970
+        if now < UserDefaults.standard.double(forKey: Self.deepBufferOffUntilKey) { return nil }
+
         let summary = await DeepBufferUploader.drain(client: client,
                                                       watermarks: DeepBufferUserDefaultsWatermarks())
+        if summary.skippedNotConfigured {
+            UserDefaults.standard.set(now + Self.deepBufferOffProbeS, forKey: Self.deepBufferOffUntilKey)
+            return nil   // not a failure — see DeepBufferDrainSummary.skippedNotConfigured
+        }
+        UserDefaults.standard.removeObject(forKey: Self.deepBufferOffUntilKey)
         if let error = summary.error { return "Deep buffers: \(error)" }
         guard !summary.isEmpty else { return nil }
         let sentMB = Double(summary.sentBytes) / 1_048_576.0
@@ -402,6 +433,17 @@ final class CloudSyncModel: ObservableObject {
     /// UserDefaults key for the last successful `syncNow` (manual or automatic) — read by
     /// `autoSyncIfDue`, written by `performSync` on success only.
     private static let lastAutoSyncKey = "cloudsync.lastAutoSync"
+
+    /// UserDefaults key holding the epoch second until which the deep-buffer lane is skipped without
+    /// probing, set when the server answers `503 storage_not_configured` (see `drainDeepBuffers`).
+    /// Removed on any drain that did NOT hit that case, so one successful chunk re-enables the lane
+    /// immediately.
+    static let deepBufferOffUntilKey = "cloudsync.deepbuf.notConfiguredUntil"
+
+    /// How long a `storage_not_configured` answer suppresses the deep-buffer lane. Six hours: long
+    /// enough that a phone unlocked dozens of times a day doesn't re-upload a chunk each time to be told
+    /// "no", short enough that provisioning a bucket takes effect the same day with no user action.
+    static let deepBufferOffProbeS: TimeInterval = 6 * 3600
 
     /// UserDefaults key for the `WhoopStore.contentToken()` value as of the last successful upload
     /// FROM THIS DEVICE (Cloud Sync v2 skip-unchanged upload) — written by `performSync` only when an
@@ -439,8 +481,20 @@ final class CloudSyncModel: ObservableObject {
     /// time, so a later launch's Data Sources card can show "Last sync: …" even when ITS OWN
     /// `statusText` is nil — e.g. right after launch, before that screen's own `CloudSyncModel`
     /// `@StateObject` has run a sync itself.
-    private static func persistLastStatus(_ line: String) {
-        UserDefaults.standard.set("\(line) · \(shortTimeFormatter.string(from: Date()))", forKey: lastStatusKey)
+    ///
+    /// A failure is PREFIXED rather than merely worded differently. A success and a failure used to
+    /// produce the same shape of sentence with the same trailing timestamp, so a card reading
+    /// "…returned an error (507) · 4:12 PM" was easy to read as "it synced at 4:12" at a glance — and
+    /// during the ten-day outage the only signals a human had were exactly this string and a timestamp.
+    /// `line` itself is already actionable: on any network failure it is a `CloudSyncError`'s
+    /// `errorDescription`, which says what happens next.
+    static func statusLine(_ line: String, succeeded: Bool, at date: Date) -> String {
+        let stamp = shortTimeFormatter.string(from: date)
+        return succeeded ? "\(line) · \(stamp)" : "Failed — \(line) · \(stamp)"
+    }
+
+    private static func persistLastStatus(_ line: String, succeeded: Bool) {
+        UserDefaults.standard.set(statusLine(line, succeeded: succeeded, at: Date()), forKey: lastStatusKey)
     }
 
     /// Pure 20h gate, `(lastRun, now) -> Bool`, so the threshold is unit-testable without UserDefaults,

@@ -45,7 +45,7 @@ final class CloudSyncAppDelegate: NSObject, UIApplicationDelegate {
             do {
                 try await client.registerDevice(token: hexToken)
                 UserDefaults.standard.set("registered \(Date())", forKey: Self.registrationBreadcrumbKey)
-            } catch CloudSyncError.badResponse(404, _) {
+            } catch let error as CloudSyncError where error.isEndpointMissing {
                 // Expected during rollout: the server's /register-device endpoint ships in parallel
                 // with this client. Benign — a fresh install, a token refresh (APNs rotates tokens
                 // occasionally), or simply the next relaunch after the server catches up will retry

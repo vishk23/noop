@@ -45,6 +45,17 @@ struct DeepBufferDrainSummary: Equatable {
     var moreRemaining = false
     var error: String?
 
+    /// The server answered `503 storage_not_configured`: object storage is not set up, so this OPTIONAL
+    /// lane is switched off server-side. DELIBERATELY NOT `error` — that field is what
+    /// `CloudSyncModel.drainDeepBuffers` turns into a user-visible " · Deep buffers: …" suffix, and a
+    /// feature that was never enabled must not read as a failure. That conflation is precisely what
+    /// made one real outage look like two: "The cloud sync server returned error 503" appeared beside a
+    /// genuine `/ingest` failure with nothing to tell them apart, so the message that mattered was
+    /// indistinguishable from the one that never did.
+    var skippedNotConfigured = false
+
+    /// Nothing worth saying to the user. A not-configured skip counts as empty on purpose: it is a
+    /// no-op, not an outcome.
     var isEmpty: Bool { chunks == 0 && error == nil }
 }
 
@@ -242,6 +253,15 @@ enum DeepBufferUploader {
                     summary.sentBytes += body.count
                     summary.lines += receipt.lines
                     if receipt.duplicate { summary.duplicates += 1 }
+                } catch let error as CloudSyncError where error.isFeatureNotConfigured {
+                    // The archive lane is switched off on this server (no object-storage bucket). Stop
+                    // immediately — every remaining chunk would get the identical answer — but record it
+                    // as a SKIP, not an error: nothing is wrong on the phone, nothing is lost, and the
+                    // whole-database `/ingest` backup is unaffected. The watermark deliberately does not
+                    // advance, so the moment a bucket IS configured the very same bytes ship.
+                    summary.skippedNotConfigured = true
+                    watermarks.setWatermarks(marks)
+                    return summary
                 } catch {
                     summary.error = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
                     watermarks.setWatermarks(marks)
