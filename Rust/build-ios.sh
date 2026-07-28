@@ -32,11 +32,11 @@ SIM_TARGETS=(aarch64-apple-ios-sim x86_64-apple-ios)
 MAC_TARGETS=(aarch64-apple-darwin x86_64-apple-darwin)
 
 # `--lib` on the cross-compiled targets skips the `uniffi-bindgen` BIN, which is a host developer
-# tool and has no business being linked for a phone. (It does not avoid *compiling* the
-# `uniffi_bindgen` crate: liters-ffi declares `uniffi = { features = ["cli"] }` among its normal
-# dependencies, and cargo feature unification means a downstream crate cannot turn that off. Moving
-# liters-ffi's own bindgen bin behind a `cli` feature would cut several minutes per target off this
-# script; that has to be fixed in liters-mobile, not here.)
+# tool and has no business being linked for a phone. It no longer has to carry the weight of the
+# generator either: both liters-ffi and this crate now gate `uniffi/cli` behind a `cli` feature that
+# is off by default, so `uniffi_bindgen` is not compiled for these targets at all. Measured on a
+# clean aarch64-apple-ios build: 344 s -> 25 s, and libnoop_liters.a 83.6 MB -> 25.9 MB. The shipped
+# app binary moved by 56 bytes, because the linker was already dead-stripping all of it.
 for t in "$DEVICE_TARGET" "${SIM_TARGETS[@]}" "${MAC_TARGETS[@]}"; do
   echo "==> building $t"
   cargo build -p noop-liters --release --target "$t" --lib
@@ -47,7 +47,9 @@ done
 echo "==> generating Swift bindings"
 cargo build -p noop-liters --release
 rm -rf "$BINDINGS" && mkdir -p "$BINDINGS"
-cargo run -p noop-liters --bin uniffi-bindgen -- generate \
+# `--features cli` is what builds the generator; it is off by default (see Cargo.toml). This is the
+# only invocation that needs it, and it runs on the host.
+cargo run -p noop-liters --features cli --bin uniffi-bindgen -- generate \
   --library target/release/libnoop_liters.dylib \
   --language swift --out-dir "$BINDINGS"
 

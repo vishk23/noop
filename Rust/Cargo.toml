@@ -15,6 +15,29 @@ crate-type = ["lib", "staticlib", "cdylib"]
 [[bin]]
 name = "uniffi-bindgen"
 path = "src/bin/uniffi-bindgen.rs"
+# Host-only, and gated so it stays that way. Without this the bin is built for
+# every target, and because it needs `uniffi/cli`, so is the whole
+# `uniffi_bindgen` code generator. See the `cli` feature below.
+required-features = ["cli"]
+
+[features]
+# Builds the `uniffi-bindgen` bin and the `uniffi/cli` feature it needs.
+#
+# OFF by default, and the measurement is why. `uniffi/cli` pulls in
+# `uniffi_bindgen` plus clap, askama, goblin, weedle2, textwrap and ~20 more --
+# a code generator -- and cargo unifies features across the graph, so with it
+# declared unconditionally all of that gets compiled INTO the phone library,
+# once per target, at opt-level 3. Measured on `cargo build -p noop-liters
+# --release --target aarch64-apple-ios --lib` from a clean target dir:
+#
+#           build time   libnoop_liters.a
+#   before      344 s      83,627,904 B
+#   after        25 s      25,895,616 B
+#
+# 13.8x faster, 69% smaller, and the shipped app binary changes by 56 bytes --
+# the linker was already dead-stripping every byte of it. The archive is
+# link-time input, not payload.
+cli = ["uniffi/cli"]
 
 [dependencies]
 # liters — Litestream v0.5-compatible SQLite replication, by Kurt Mackey.
@@ -43,7 +66,11 @@ liters-ffi = { git = "https://github.com/vishk23/liters-mobile.git", branch = "m
 
 # Must stay on the same major/minor as liters-ffi's uniffi, or the generated
 # bindings and the shipped scaffolding come from different versions.
-uniffi = { version = "0.32", features = ["cli"] }
+#
+# NO `features = ["cli"]` here — that is what the `cli` feature above exists to
+# gate. The library half of uniffi (the scaffolding macros the FFI is built
+# from) is in the default features and is what actually ships.
+uniffi = { version = "0.32" }
 
 [profile.release]
 lto = true
