@@ -3782,18 +3782,6 @@ public final class BLEManager: NSObject, ObservableObject {
         let prefix = (disSerial?.trimmingCharacters(in: .whitespacesAndNewlines).uppercased())
             .map { String($0.prefix(3)) } ?? "?"
         log("DIS: serialPrefix=\(prefix) hwRev=\(disHwRev ?? "?") -> variant=\(variant.label)")
-        // Publish it so an MG-only capability can gate on attested hardware. Still diagnostic for every
-        // existing consumer — nothing about framing or decode reads this.
-        state.whoop5Variant = variant.label
-    }
-
-    /// The connected strap's attested 5-generation hardware variant, re-derived from the DIS strings the
-    /// connection read rather than cached — so it is `.unknown` before DIS lands and after a disconnect
-    /// clears them, and `.unknown` is never MG. This is the gate an MG-only capability asks (#891); it is
-    /// deliberately independent of `DeviceFamily`, which describes the WIRE PROTOCOL and treats MG and 5.0
-    /// as one family.
-    public var whoop5Variant: Whoop5Variant {
-        Whoop5Variant.from(serial: disSerial, hardwareRevision: disHwRev)
     }
 
     private func requestNotify(_ c: CBCharacteristic, on p: CBPeripheral, reason: String) {
@@ -4439,8 +4427,8 @@ extension BLEManager: @preconcurrency CBCentralManagerDelegate {
         ecgProbeCandidates = []
         ecgProbePacketsSeen = 0
         // The DIS strings belong to the link that just dropped; a stale variant must not keep an MG-only
-        // capability unlocked for whatever connects next.
-        state.whoop5Variant = nil
+        // capability unlocked for whatever connects next. (Reset to `.unknown` below, with the other
+        // MG-gate teardown.)
         state.deviceConfigProbe = nil     // #103: drop a stale probe result on disconnect
         // …and abandon a plan the link interrupted, re-closing the 121/128 send() allowlist.
         deviceConfigReport = nil
