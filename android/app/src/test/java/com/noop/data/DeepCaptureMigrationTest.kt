@@ -192,6 +192,54 @@ class DeepCaptureMigrationTest {
         assertEquals("exactly one sweep — the counter must reset after it", 1, pruneCalls)
     }
 
+    /**
+     * The budget is per device, because the delete is — one strap must not spend another's. This is the
+     * invariant `v18AuxRowsSincePrune` is keyed by deviceId for; against a shared counter dev2's row would
+     * cross the threshold and sweep, evicting nothing from dev1 while zeroing dev1's budget. Twin of
+     * Swift's `testTheAmortisationBudgetIsNotSharedBetweenDevices`.
+     */
+    @Test
+    fun repositoryInsertV18Aux_theAmortisationBudgetIsNotSharedBetweenDevices(): Unit = runBlocking {
+        var pruneCalls = 0
+        var prunedDevice: String? = null
+        val dao = Proxy.newProxyInstance(
+            WhoopDao::class.java.classLoader,
+            arrayOf(WhoopDao::class.java),
+        ) { _, method, args ->
+            when (method.name) {
+                "insertV18Aux" -> listOf(1L)
+                "pruneV18Aux" -> { pruneCalls++; prunedDevice = args[0] as String; Unit }
+                else -> throw UnsupportedOperationException("v18-aux insert must not call ${method.name}")
+            }
+        } as WhoopDao
+
+        val repo = WhoopRepository(dao)
+        // dev1 banks three rows against a budget of four — one short, so no sweep is due for it.
+        repeat(3) { i ->
+            repo.insert(
+                StreamBatch(v18Aux = listOf(V18AuxRow(ts = 100L + i, statusWord = 1_792L))),
+                "dev1",
+                v18AuxPruneEveryRows = 4,
+            )
+        }
+        // dev2 banks one row. A SHARED counter would stand at four here and sweep on dev2's first batch.
+        repo.insert(
+            StreamBatch(v18Aux = listOf(V18AuxRow(ts = 200L, statusWord = 1_792L))),
+            "dev2",
+            v18AuxPruneEveryRows = 4,
+        )
+        assertEquals("dev2's first row must not spend dev1's budget", 0, pruneCalls)
+
+        // dev1's own fourth row is what crosses ITS OWN threshold.
+        repo.insert(
+            StreamBatch(v18Aux = listOf(V18AuxRow(ts = 103L, statusWord = 1_792L))),
+            "dev1",
+            v18AuxPruneEveryRows = 4,
+        )
+        assertEquals("dev1's own fourth row must trigger dev1's sweep", 1, pruneCalls)
+        assertEquals("dev1", prunedDevice)
+    }
+
     /** A batch whose aux rows all pack to nothing writes no row, so it must not sweep either. */
     @Test
     fun repositoryInsertV18Aux_allAbsentTouchesNoDao(): Unit = runBlocking {
