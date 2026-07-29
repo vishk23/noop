@@ -530,7 +530,8 @@ final class Whoop5EcgTests: XCTestCase {
     func testCandidateVerdictIsHedgedNotAssertedAsProof() {
         let text = Whoop5EcgProbe.report(
             steps: [sent(124, arg: 1, .success)],
-            ecgPacketsSeen: 3, candidateFrames: ["type=0x28 len=220"], windowSeconds: 30)
+            ecgPacketsSeen: 3, candidateFrames: ["type=0x28 len=220"],
+            census: .init(), windowSeconds: 30)
         XCTAssertTrue(text.contains("CANDIDATE, not proof"))
         // The old wording asserted the conclusion outright; it must not come back.
         XCTAssertFalse(text.contains("Not blocked"))
@@ -580,7 +581,7 @@ final class Whoop5EcgTests: XCTestCase {
         XCTAssertEqual(Whoop5EcgProbe.verdict(steps: steps, ecgPacketsSeen: 0, windowSeconds: 30),
                        .noDataRequested(commands: ["SELECT_WRIST(123)"]))
         let text = Whoop5EcgProbe.report(steps: steps, ecgPacketsSeen: 0,
-                                         candidateFrames: [], windowSeconds: 30)
+                                         candidateFrames: [], census: .init(), windowSeconds: 30)
         XCTAssertTrue(text.contains("NOT A TEST"))
         XCTAssertFalse(text.contains("device-flag block"))
         XCTAssertFalse(text.contains("Accepted but SILENT"))
@@ -598,7 +599,7 @@ final class Whoop5EcgTests: XCTestCase {
         XCTAssertEqual(Whoop5EcgProbe.verdict(steps: steps, ecgPacketsSeen: 0, windowSeconds: 30),
                        .commandRefused(commands: ["SELECT_WRIST(123)"]))
         let text = Whoop5EcgProbe.report(steps: steps, ecgPacketsSeen: 0,
-                                         candidateFrames: [], windowSeconds: 30)
+                                         candidateFrames: [], census: .init(), windowSeconds: 30)
         XCTAssertTrue(text.contains("REFUSED"))
         XCTAssertFalse(text.contains("blockedByDeviceFlags"))
     }
@@ -688,7 +689,8 @@ final class Whoop5EcgTests: XCTestCase {
             sent(124, arg: Whoop5Ecg.ControlSignal.start.rawValue, .failure, replyHex: "ccdd"),
         ]
         let text = Whoop5EcgProbe.report(steps: steps, ecgPacketsSeen: 0,
-                                         candidateFrames: ["type=0x28 len=220"], windowSeconds: 30)
+                                         candidateFrames: ["type=0x28 len=220"],
+                                         census: .init(), windowSeconds: 30)
         XCTAssertTrue(text.contains("blockedByDeviceFlags"))
         XCTAssertTrue(text.contains("SELECT_WRIST(123): SUCCESS(1)"))
         XCTAssertTrue(text.contains("TOGGLE_LABRADOR_DATA_GENERATION(124): FAILURE(0)"))
@@ -699,9 +701,144 @@ final class Whoop5EcgTests: XCTestCase {
 
     func testReportNeverPresentsAnArrhythmiaResultAsAFinding() {
         // The report is the only text the probe surfaces; it must not name a classifier verdict at all.
-        let text = Whoop5EcgProbe.report(steps: [], ecgPacketsSeen: 0, candidateFrames: [], windowSeconds: 30)
+        let text = Whoop5EcgProbe.report(steps: [], ecgPacketsSeen: 0, candidateFrames: [],
+                                         census: .init(), windowSeconds: 30)
         for token in EcgArrhythmiaCheckResult.allCases.map(\.token) {
             XCTAssertFalse(text.lowercased().contains(token.lowercased()), "report must not name \(token)")
+        }
+    }
+
+    // MARK: - Live frame census
+    //
+    // The blind spot these close: `ecgProbePacketsSeen` only counts frames that PASS
+    // `Whoop5Ecg.plausibleFilteredFrame`, a triage that assumes one payload start, one header layout and
+    // a tight length agreement. A window in which many unrecognised frames arrived rendered identically
+    // to one in which the strap said nothing at all — so "SUCCESS on every toggle, zero ECG packets"
+    // could not distinguish a silent no-op from ECG records arriving under a shape the triage rejects.
+
+    /// A CRC-irrelevant stand-in frame: the census reads only the type byte at offset 8 and the length,
+    /// and the CRC gate is BLEManager's job upstream of it.
+    private func censusFrame(type: UInt8, length: Int) -> [UInt8] {
+        var f = [UInt8](repeating: 0, count: max(length, 9))
+        f[8] = type
+        return f
+    }
+
+    func testCensusCountsEveryFrameByTypeAndLength() {
+        var census = Whoop5EcgProbe.FrameCensus()
+        for _ in 0..<3 { census.record(frame: censusFrame(type: 36, length: 20)) }
+        for _ in 0..<2 { census.record(frame: censusFrame(type: 40, length: 230)) }
+        XCTAssertEqual(census.totalFramesObserved, 5)
+        XCTAssertEqual(census.count(type: 36, length: 20), 3)
+        XCTAssertEqual(census.count(type: 40, length: 230), 2)
+        // Lengths inside one bucket collapse together; lengths across buckets do not.
+        census.record(frame: censusFrame(type: 40, length: 255))
+        XCTAssertEqual(census.count(type: 40, length: 230), 3)
+        census.record(frame: censusFrame(type: 40, length: 256))
+        XCTAssertEqual(census.count(type: 40, length: 230), 3)
+        XCTAssertEqual(census.count(type: 40, length: 256), 1)
+
+        // Names come from the schema's PacketType table, not a map local to this probe.
+        let table = census.table(schema: loadSchema())
+        XCTAssertTrue(table.contains("COMMAND_RESPONSE"), table)
+        XCTAssertTrue(table.contains("REALTIME_DATA"), table)
+        XCTAssertTrue(table.contains("0x24"), table)
+        XCTAssertTrue(table.contains("224-255"), table)
+    }
+
+    func testCensusNamesPuffinAliasThroughCanonicalTypeName() {
+        // 38 is the puffin COMMAND_RESPONSE alias. `canonicalTypeName` folds it onto the base name, so a
+        // strap answering on the alias is not rendered as an anonymous "type38".
+        var census = Whoop5EcgProbe.FrameCensus()
+        census.record(frame: censusFrame(type: 38, length: 20))
+        XCTAssertTrue(census.table(schema: loadSchema()).contains("COMMAND_RESPONSE"))
+    }
+
+    func testCensusCountsFramesTheEcgTriageRejected() {
+        // THE regression this feature exists for. A frame that fails the structural triage contributes
+        // nothing to `ecgPacketsSeen`, and previously left no trace at all. It must now be visible.
+        let rejected = censusFrame(type: 0x28, length: 200)
+        XCTAssertFalse(Whoop5Ecg.plausibleFilteredFrame(rejected),
+                       "fixture must be a frame the ECG triage rejects, or this test proves nothing")
+        var census = Whoop5EcgProbe.FrameCensus()
+        census.record(frame: rejected)
+        let text = Whoop5EcgProbe.report(steps: [sent(124, arg: 1, .success)],
+                                         ecgPacketsSeen: 0, candidateFrames: [],
+                                         census: census, windowSeconds: 30)
+        // The ECG tally still honestly reads zero...
+        XCTAssertTrue(text.contains("ECG-shaped packets seen in 30s: 0"))
+        // ...but the window is no longer indistinguishable from silence.
+        XCTAssertTrue(text.contains("REALTIME_DATA"), text)
+        XCTAssertFalse(text.contains("no live frames observed"), text)
+    }
+
+    func testCensusCapIsReportedRatherThanSilentlyTruncating() {
+        var census = Whoop5EcgProbe.FrameCensus()
+        // One frame each of 15 distinct types: 12 kinds fit, the remaining 3 frames are over the cap.
+        for type in UInt8(1)...UInt8(15) { census.record(frame: censusFrame(type: type, length: 20)) }
+        XCTAssertEqual(census.kindsRecorded, Whoop5EcgProbe.FrameCensus.maxKinds)
+        XCTAssertEqual(census.framesBeyondCap, 3)
+        // A frame in an already-dropped kind keeps counting toward the overflow rather than vanishing.
+        census.record(frame: censusFrame(type: 15, length: 20))
+        XCTAssertEqual(census.framesBeyondCap, 4)
+        // ...while a kind already in the table keeps counting normally even once the cap is reached.
+        census.record(frame: censusFrame(type: 1, length: 20))
+        XCTAssertEqual(census.count(type: 1, length: 20), 2)
+        // Every frame observed is accounted for somewhere: 15 + 1 + 1.
+        XCTAssertEqual(census.totalFramesObserved, 17)
+
+        let table = census.table(schema: loadSchema())
+        XCTAssertTrue(table.contains("4 further frame"), table)
+        XCTAssertTrue(table.contains("cap"), table)
+    }
+
+    func testEmptyCensusSaysNoLiveFramesRatherThanRenderingAnEmptyTable() {
+        let census = Whoop5EcgProbe.FrameCensus()
+        XCTAssertTrue(census.isEmpty)
+        XCTAssertEqual(census.totalFramesObserved, 0)
+        let table = census.table(schema: loadSchema())
+        XCTAssertTrue(table.contains("no live frames observed"), table)
+        // An empty table would render a bare header with nothing under it — the exact ambiguity the
+        // census exists to remove.
+        XCTAssertFalse(table.contains("count  type"), table)
+        XCTAssertTrue(Whoop5EcgProbe.report(steps: [], ecgPacketsSeen: 0, candidateFrames: [],
+                                            census: census, windowSeconds: 30)
+            .contains("no live frames observed"))
+    }
+
+    func testCensusIsAnObservationAndNeverEntersTheVerdict() {
+        // STRUCTURAL, not editorial: `verdict` takes no census argument, so no census can reach it. This
+        // test pins the rendered consequence — a busy census under a silent run still renders the run's
+        // own verdict, unchanged and un-upgraded.
+        let steps = [sent(124, arg: Whoop5Ecg.ControlSignal.start.rawValue, .success)]
+        var census = Whoop5EcgProbe.FrameCensus()
+        for _ in 0..<40 { census.record(frame: censusFrame(type: 40, length: 230)) }
+        let quiet = Whoop5EcgProbe.report(steps: steps, ecgPacketsSeen: 0, candidateFrames: [],
+                                          census: .init(), windowSeconds: 30)
+        let busy = Whoop5EcgProbe.report(steps: steps, ecgPacketsSeen: 0, candidateFrames: [],
+                                         census: census, windowSeconds: 30)
+        for text in [quiet, busy] {
+            XCTAssertTrue(text.contains("Accepted but SILENT"), text)
+        }
+        // The verdict LINE itself must be byte-identical across an empty and a busy census.
+        func verdictLine(_ s: String) -> String {
+            s.split(separator: "\n").first { $0.hasPrefix("Verdict:") }.map(String.init) ?? ""
+        }
+        XCTAssertFalse(verdictLine(quiet).isEmpty)
+        XCTAssertEqual(verdictLine(quiet), verdictLine(busy))
+        XCTAssertEqual(Whoop5EcgProbe.verdict(steps: steps, ecgPacketsSeen: 0, windowSeconds: 30),
+                       .acceptedButSilent(windowSeconds: 30))
+    }
+
+    func testCensusSectionMakesNoGateOrEntitlementClaim() {
+        // §9.8 of the investigation doc records a retraction for reading an observation as a gate. The
+        // census is a tally; it must not acquire a verdict vocabulary of its own.
+        var census = Whoop5EcgProbe.FrameCensus()
+        census.record(frame: censusFrame(type: 40, length: 230))
+        let table = census.table(schema: loadSchema())
+        for banned in ["block", "gate", "entitle", "unsupported", "refus", "evidence", "consistent with"] {
+            XCTAssertFalse(table.lowercased().contains(banned),
+                           "census table must not editorialise with '\(banned)': \(table)")
         }
     }
 }

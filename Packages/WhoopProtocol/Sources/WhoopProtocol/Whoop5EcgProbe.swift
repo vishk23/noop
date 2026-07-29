@@ -227,15 +227,146 @@ public enum Whoop5EcgProbe {
         return .inconclusive
     }
 
-    /// The full report: verdict, per-command outcomes, the ECG-packet tally, and the raw replies.
+    /// A tally of every CRC-valid live frame that reached the probe during the window, keyed by the
+    /// packet type byte and a coarse length bucket.
+    ///
+    /// ## Why this exists
+    ///
+    /// `ecgPacketsSeen` is incremented only after `Whoop5Ecg.plausibleFilteredFrame` passes, and that
+    /// triage assumes a fixed payload start (`Whoop5Ecg.puffinPayloadStart`), a 17-byte header, four
+    /// bytes at payload[2...5] that are all <= 1, and a tight length agreement. An ECG record arriving
+    /// under a different packet type or a different header layout fails it silently. The probe kept no
+    /// tally of frames that arrived and failed, so a 30-second window in which many unrecognised frames
+    /// arrived rendered **identically** to one in which nothing arrived at all — and a run's zero could
+    /// not separate "acknowledged, then not honoured" from "this was the wrong transport to watch".
+    ///
+    /// ## What it is not
+    ///
+    /// An OBSERVATION, and nothing else. It is deliberately **not** a parameter of `verdict`, so no
+    /// census can reach the classification — the report prints it beside the verdict, never inside it.
+    /// The table states what arrived and stops there; reading anything about gating, blocking or
+    /// entitlement out of a frame tally is the inference this type must not make on the reader's behalf.
+    public struct FrameCensus: Equatable, Sendable {
+        /// Lengths are bucketed rather than counted exactly: a live stream varies its payload length
+        /// frame to frame, and an exact-length key would pack the cap with near-duplicates of a single
+        /// kind and crowd out the distinct packet types the census exists to reveal.
+        public static let bucketWidth = 32
+
+        /// Distinct (type, length-bucket) kinds the table will hold, matching the probe's other caps
+        /// (`ecgProbeMaxCandidates` and `ecgProbeMaxSteps` are both 12): a chatty stream must not be
+        /// able to grow a report section without bound.
+        public static let maxKinds = 12
+
+        /// The 5/MG packet type byte — the same offset `noteEcgProbeFrame` reads to spot COMMAND_RESPONSE.
+        public static let typeOffset = 8
+
+        public struct Kind: Hashable, Sendable {
+            public let type: UInt8
+            /// Inclusive lower bound of the length bucket; always a multiple of `bucketWidth`.
+            public let lengthBucket: Int
+
+            public init(type: UInt8, length: Int) {
+                self.type = type
+                self.lengthBucket = max(0, length) / FrameCensus.bucketWidth * FrameCensus.bucketWidth
+            }
+
+            /// The bucket as a closed range, e.g. "224-255".
+            public var lengthRange: String {
+                "\(lengthBucket)-\(lengthBucket + FrameCensus.bucketWidth - 1)"
+            }
+        }
+
+        public private(set) var counts: [Kind: Int] = [:]
+
+        /// Frames whose kind did not fit under `maxKinds`. Counted, never itemised: tracking which
+        /// distinct kinds were dropped would need an unbounded set, which is the exact growth the cap
+        /// exists to prevent. A count is bounded and still says "the table below is not the whole story".
+        public private(set) var framesBeyondCap = 0
+
+        public init() {}
+
+        public var isEmpty: Bool { counts.isEmpty && framesBeyondCap == 0 }
+        public var kindsRecorded: Int { counts.count }
+        public var totalFramesObserved: Int { counts.values.reduce(0, +) + framesBeyondCap }
+
+        /// Count one frame. A kind already in the table keeps counting after the cap is reached; only a
+        /// NEW kind arriving at cap is diverted to `framesBeyondCap`.
+        public mutating func record(type: UInt8, length: Int) {
+            let kind = Kind(type: type, length: length)
+            if let existing = counts[kind] {
+                counts[kind] = existing + 1
+            } else if counts.count < FrameCensus.maxKinds {
+                counts[kind] = 1
+            } else {
+                framesBeyondCap += 1
+            }
+        }
+
+        /// Count one whole 5/MG frame, reading its type byte at `typeOffset`.
+        ///
+        /// A frame too short to carry that byte cannot be keyed and is not counted. Unreachable for real
+        /// traffic — a CRC-valid 5/MG frame is longer than its own envelope — but stated rather than
+        /// hidden, since an uncounted frame is the failure mode this whole type exists to remove.
+        public mutating func record(frame: [UInt8]) {
+            guard frame.count > FrameCensus.typeOffset else { return }
+            record(type: frame[FrameCensus.typeOffset], length: frame.count)
+        }
+
+        public func count(type: UInt8, length: Int) -> Int {
+            counts[Kind(type: type, length: length)] ?? 0
+        }
+
+        /// Render as a plain table.
+        ///
+        /// Type names come from the schema's own `PacketType` table via `canonicalTypeName`, so the
+        /// puffin aliases fold onto the base names and an unrecognised type renders with the schema's
+        /// `typeN` fallback rather than a name invented here. The raw byte is always printed beside the
+        /// name, so the table stays lossless if the schema is missing an entry.
+        public func table(schema: Schema) -> String {
+            guard !isEmpty else {
+                return "Live frame census: no live frames observed in the window.\n"
+            }
+            var sb = "Live frame census — every CRC-valid frame that reached the probe, counted by packet "
+            sb += "type and length, whether or not it passed the ECG triage:\n"
+            sb += "  count  type                             length\n"
+            // Deterministic order: busiest first, then by type and bucket, so a tie never reshuffles the
+            // table between two runs of the same capture.
+            let rows = counts.sorted {
+                if $0.value != $1.value { return $0.value > $1.value }
+                if $0.key.type != $1.key.type { return $0.key.type < $1.key.type }
+                return $0.key.lengthBucket < $1.key.lengthBucket
+            }
+            for (kind, n) in rows {
+                let name = String(format: "0x%02x ", Int(kind.type))
+                    + canonicalTypeName(Int(kind.type), schema: schema)
+                sb += "  " + censusPad(String(n), to: 5, left: true)
+                    + "  " + censusPad(name, to: 31, left: false)
+                    + "  " + kind.lengthRange + "\n"
+            }
+            if framesBeyondCap > 0 {
+                sb += "  + \(framesBeyondCap) further frame(s) in kinds past the "
+                    + "\(FrameCensus.maxKinds)-kind cap (counted, not itemised).\n"
+            }
+            return sb
+        }
+    }
+
+    /// The full report: verdict, per-command outcomes, the ECG-packet tally, the live frame census, and
+    /// the raw replies.
     ///
     /// `candidateFrames` are the type/length lines for frames that passed the structural triage in
     /// `Whoop5Ecg.plausibleFilteredPayload` — the empirical answer to "which packet type do these arrive
     /// under", which no table in this repo yet holds.
+    ///
+    /// `census` has NO default. An omitted census would render "no live frames observed" — manufacturing
+    /// the exact reassurance the census exists to remove — so, like `Step.requestsRealtimeData`, every
+    /// call site is made to state it.
     public static func report(steps: [Step],
                               ecgPacketsSeen: Int,
                               candidateFrames: [String],
-                              windowSeconds: Int) -> String {
+                              census: FrameCensus,
+                              windowSeconds: Int,
+                              schema: Schema = loadSchema()) -> String {
         var sb = ""
         sb += "WHOOP MG ECG (Labrador) TURN-ON PROBE\n"
         sb += "Verdict: \(verdict(steps: steps, ecgPacketsSeen: ecgPacketsSeen, windowSeconds: windowSeconds).headline)\n"
@@ -259,6 +390,8 @@ public enum Whoop5EcgProbe {
             sb += "Candidate packet types (structural triage only, NOT a confirmed mapping):\n"
             for line in candidateFrames { sb += "  \(line)\n" }
         }
+        // Printed BESIDE the verdict, never folded into it: `verdict` above takes no census argument.
+        sb += "\n" + census.table(schema: schema)
         let replies = steps.compactMap { step in step.replyHex.map { "  \(step.label): \($0)" } }
         if !replies.isEmpty {
             sb += "\nRaw replies:\n"
@@ -267,4 +400,12 @@ public enum Whoop5EcgProbe {
         sb += "\nThis is unvalidated instrumentation, not a medical measurement or a diagnosis.\n"
         return sb
     }
+}
+
+/// Column padding for the census table. Local to this file so it stays a formatting detail rather than
+/// a `String` extension the rest of the package can pick up.
+private func censusPad(_ s: String, to width: Int, left: Bool) -> String {
+    guard s.count < width else { return s }
+    let fill = String(repeating: " ", count: width - s.count)
+    return left ? fill + s : s + fill
 }

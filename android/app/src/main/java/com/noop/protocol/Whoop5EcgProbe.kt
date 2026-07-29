@@ -224,15 +224,159 @@ object Whoop5EcgProbe {
     }
 
     /**
-     * The full report: verdict, per-command outcomes, the ECG-packet tally, and the raw replies.
+     * A tally of every CRC-valid live frame that reached the probe during the window, keyed by the
+     * packet type byte and a coarse length bucket. Twin of Swift `Whoop5EcgProbe.FrameCensus`.
+     *
+     * ## Why this exists
+     *
+     * `ecgPacketsSeen` is incremented only after [Whoop5Ecg.plausibleFilteredFrame] passes, and that
+     * triage assumes a fixed payload start ([Whoop5Ecg.PUFFIN_PAYLOAD_START]), a 17-byte header, four
+     * bytes at `payload[2..5]` that are all <= 1, and a tight length agreement. An ECG record arriving
+     * under a different packet type or a different header layout fails it silently. The probe kept no
+     * tally of frames that arrived and failed, so a 30-second window in which many unrecognised frames
+     * arrived rendered **identically** to one in which nothing arrived at all — and a run's zero could
+     * not separate "acknowledged, then not honoured" from "this was the wrong transport to watch".
+     *
+     * ## What it is not
+     *
+     * An OBSERVATION, and nothing else. It is deliberately **not** a parameter of [verdict], so no
+     * census can reach the classification — the report prints it beside the verdict, never inside it.
+     * The table states what arrived and stops there.
+     *
+     * Unlike the Swift twin this takes no schema argument: Kotlin's [Framing.canonicalTypeName] reads
+     * the [PacketType] table directly, where Swift threads a loaded `Schema`. The rendered text matches.
+     */
+    class FrameCensus {
+
+        /** One census key: a packet type plus the length bucket the frame fell in. */
+        data class Kind(val type: Int, val lengthBucket: Int) {
+            /** The bucket as a closed range, e.g. "224-255". */
+            val lengthRange: String get() = "$lengthBucket-${lengthBucket + FrameCensus.BUCKET_WIDTH - 1}"
+
+            companion object {
+                fun of(type: Int, length: Int): Kind =
+                    Kind(type, maxOf(0, length) / FrameCensus.BUCKET_WIDTH * FrameCensus.BUCKET_WIDTH)
+            }
+        }
+
+        private val tally = LinkedHashMap<Kind, Int>()
+
+        val counts: Map<Kind, Int> get() = tally
+
+        /**
+         * Frames whose kind did not fit under [MAX_KINDS]. Counted, never itemised: tracking which
+         * distinct kinds were dropped would need an unbounded set, which is the exact growth the cap
+         * exists to prevent. A count is bounded and still says "the table below is not the whole story".
+         */
+        var framesBeyondCap = 0
+            private set
+
+        val isEmpty: Boolean get() = tally.isEmpty() && framesBeyondCap == 0
+        val kindsRecorded: Int get() = tally.size
+        val totalFramesObserved: Int get() = tally.values.sum() + framesBeyondCap
+
+        /**
+         * Count one frame. A kind already in the table keeps counting after the cap is reached; only a
+         * NEW kind arriving at cap is diverted to [framesBeyondCap].
+         */
+        fun record(type: Int, length: Int) {
+            val kind = Kind.of(type, length)
+            val existing = tally[kind]
+            when {
+                existing != null -> tally[kind] = existing + 1
+                tally.size < MAX_KINDS -> tally[kind] = 1
+                else -> framesBeyondCap += 1
+            }
+        }
+
+        /**
+         * Count one whole 5/MG frame, reading its type byte at [TYPE_OFFSET].
+         *
+         * A frame too short to carry that byte cannot be keyed and is not counted. Unreachable for real
+         * traffic — a CRC-valid 5/MG frame is longer than its own envelope — but stated rather than
+         * hidden, since an uncounted frame is the failure mode this whole type exists to remove.
+         */
+        fun record(frame: ByteArray) {
+            if (frame.size <= TYPE_OFFSET) return
+            record(frame[TYPE_OFFSET].toInt() and 0xFF, frame.size)
+        }
+
+        fun count(type: Int, length: Int): Int = tally[Kind.of(type, length)] ?: 0
+
+        /**
+         * Render as a plain table.
+         *
+         * Type names come from [Framing.canonicalTypeName], so the puffin aliases fold onto the base
+         * names and an unrecognised type renders with the shared `typeN` fallback rather than a name
+         * invented here. The raw byte is always printed beside the name, so the table stays lossless if
+         * the [PacketType] table is missing an entry.
+         */
+        fun table(): String {
+            if (isEmpty) return "Live frame census: no live frames observed in the window.\n"
+            val sb = StringBuilder()
+            sb.append("Live frame census — every CRC-valid frame that reached the probe, counted by packet ")
+            sb.append("type and length, whether or not it passed the ECG triage:\n")
+            sb.append("  count  type                             length\n")
+            // Deterministic order: busiest first, then by type and bucket, so a tie never reshuffles the
+            // table between two runs of the same capture.
+            val rows = tally.entries.sortedWith(
+                compareByDescending<Map.Entry<Kind, Int>> { it.value }
+                    .thenBy { it.key.type }
+                    .thenBy { it.key.lengthBucket }
+            )
+            for ((kind, n) in rows) {
+                val name = String.format("0x%02x ", kind.type) + Framing.canonicalTypeName(kind.type)
+                sb.append("  ")
+                sb.append(n.toString().padStart(5))
+                sb.append("  ")
+                sb.append(name.padEnd(31))
+                sb.append("  ")
+                sb.append(kind.lengthRange)
+                sb.append("\n")
+            }
+            if (framesBeyondCap > 0) {
+                sb.append("  + $framesBeyondCap further frame(s) in kinds past the ")
+                sb.append("$MAX_KINDS-kind cap (counted, not itemised).\n")
+            }
+            return sb.toString()
+        }
+
+        companion object {
+            /**
+             * Lengths are bucketed rather than counted exactly: a live stream varies its payload length
+             * frame to frame, and an exact-length key would pack the cap with near-duplicates of a
+             * single kind and crowd out the distinct packet types the census exists to reveal.
+             */
+            const val BUCKET_WIDTH = 32
+
+            /**
+             * Distinct (type, length-bucket) kinds the table will hold, matching the probe's other caps
+             * on the Apple side (`ecgProbeMaxCandidates` and `ecgProbeMaxSteps` are both 12): a chatty
+             * stream must not be able to grow a report section without bound.
+             */
+            const val MAX_KINDS = 12
+
+            /** The 5/MG packet type byte offset. */
+            const val TYPE_OFFSET = 8
+        }
+    }
+
+    /**
+     * The full report: verdict, per-command outcomes, the ECG-packet tally, the live frame census, and
+     * the raw replies.
      *
      * [candidateFrames] are the type/length lines for frames that passed the structural triage in
      * [Whoop5Ecg.plausibleFilteredPayload].
+     *
+     * [census] has NO default. An omitted census would render "no live frames observed" — manufacturing
+     * the exact reassurance the census exists to remove — so, like [Step.requestsRealtimeData], every
+     * call site is made to state it.
      */
     fun report(
         steps: List<Step>,
         ecgPacketsSeen: Int,
         candidateFrames: List<String>,
+        census: FrameCensus,
         windowSeconds: Int,
     ): String {
         val sb = StringBuilder()
@@ -258,6 +402,8 @@ object Whoop5EcgProbe {
             sb.append("Candidate packet types (structural triage only, NOT a confirmed mapping):\n")
             for (line in candidateFrames) sb.append("  $line\n")
         }
+        // Printed BESIDE the verdict, never folded into it: `verdict` above takes no census argument.
+        sb.append("\n").append(census.table())
         val replies = steps.mapNotNull { step -> step.replyHex?.let { "  ${step.label}: $it" } }
         if (replies.isNotEmpty()) {
             sb.append("\nRaw replies:\n")

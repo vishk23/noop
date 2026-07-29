@@ -162,7 +162,7 @@ class Whoop5EcgProbeTest {
             Whoop5EcgProbe.Verdict.NoDataRequested(listOf("SELECT_WRIST(123)")),
             Whoop5EcgProbe.verdict(steps, 0, 30),
         )
-        val text = Whoop5EcgProbe.report(steps, 0, emptyList(), 30)
+        val text = Whoop5EcgProbe.report(steps, 0, emptyList(), Whoop5EcgProbe.FrameCensus(), 30)
         assertTrue(text.contains("NOT A TEST"))
         assertFalse(text.contains("device-flag block"))
         assertFalse(text.contains("Accepted but SILENT"))
@@ -186,7 +186,7 @@ class Whoop5EcgProbeTest {
             Whoop5EcgProbe.Verdict.CommandRefused(listOf("SELECT_WRIST(123)")),
             Whoop5EcgProbe.verdict(steps, 0, 30),
         )
-        val text = Whoop5EcgProbe.report(steps, 0, emptyList(), 30)
+        val text = Whoop5EcgProbe.report(steps, 0, emptyList(), Whoop5EcgProbe.FrameCensus(), 30)
         assertTrue(text.contains("REFUSED"))
         assertFalse(text.contains("blockedByDeviceFlags"))
     }
@@ -303,7 +303,7 @@ class Whoop5EcgProbeTest {
             sent(123, Whoop5Ecg.WristSelection.LEFT.raw, Whoop5EcgProbe.CommandOutcome.Success, "aabb"),
             sent(124, Whoop5Ecg.ControlSignal.START.raw, Whoop5EcgProbe.CommandOutcome.Failure, "ccdd"),
         )
-        val text = Whoop5EcgProbe.report(steps, 0, listOf("type=0x28 len=220"), 30)
+        val text = Whoop5EcgProbe.report(steps, 0, listOf("type=0x28 len=220"), Whoop5EcgProbe.FrameCensus(), 30)
         assertTrue(text.contains("blockedByDeviceFlags"))
         assertTrue(text.contains("SELECT_WRIST(123): SUCCESS(1)"))
         assertTrue(text.contains("TOGGLE_LABRADOR_DATA_GENERATION(124): FAILURE(0)"))
@@ -315,9 +315,149 @@ class Whoop5EcgProbeTest {
     @Test
     fun reportNeverPresentsAnArrhythmiaResultAsAFinding() {
         // The report is the only text the probe surfaces; it must not name a classifier verdict at all.
-        val text = Whoop5EcgProbe.report(emptyList(), 0, emptyList(), 30)
+        val text = Whoop5EcgProbe.report(emptyList(), 0, emptyList(), Whoop5EcgProbe.FrameCensus(), 30)
         for (token in EcgArrhythmiaCheckResult.entries.map { it.token }) {
             assertFalse("report must not name $token", text.lowercase().contains(token.lowercase()))
+        }
+    }
+
+    // MARK: - Live frame census
+    //
+    // Twin of the Swift census suite. The blind spot these close: `ecgPacketsSeen` only counts frames
+    // that PASS `Whoop5Ecg.plausibleFilteredFrame`, a triage that assumes one payload start, one header
+    // layout and a tight length agreement. A window in which many unrecognised frames arrived rendered
+    // identically to one in which the strap said nothing at all.
+
+    /** A stand-in frame: the census reads only the type byte at offset 8 and the length. */
+    private fun censusFrame(type: Int, length: Int): ByteArray {
+        val f = ByteArray(maxOf(length, 9))
+        f[8] = type.toByte()
+        return f
+    }
+
+    @Test
+    fun censusCountsEveryFrameByTypeAndLength() {
+        val census = Whoop5EcgProbe.FrameCensus()
+        repeat(3) { census.record(censusFrame(36, 20)) }
+        repeat(2) { census.record(censusFrame(40, 230)) }
+        assertEquals(5, census.totalFramesObserved)
+        assertEquals(3, census.count(36, 20))
+        assertEquals(2, census.count(40, 230))
+        // Lengths inside one bucket collapse together; lengths across buckets do not.
+        census.record(censusFrame(40, 255))
+        assertEquals(3, census.count(40, 230))
+        census.record(censusFrame(40, 256))
+        assertEquals(3, census.count(40, 230))
+        assertEquals(1, census.count(40, 256))
+
+        // Names come from the shared PacketType table, not a map local to this probe.
+        val table = census.table()
+        assertTrue(table, table.contains("COMMAND_RESPONSE"))
+        assertTrue(table, table.contains("REALTIME_DATA"))
+        assertTrue(table, table.contains("0x24"))
+        assertTrue(table, table.contains("224-255"))
+    }
+
+    @Test
+    fun censusNamesPuffinAliasThroughCanonicalTypeName() {
+        // 38 is the puffin COMMAND_RESPONSE alias, folded onto the base name so a strap answering on the
+        // alias is not rendered as an anonymous "type38".
+        val census = Whoop5EcgProbe.FrameCensus()
+        census.record(censusFrame(38, 20))
+        assertTrue(census.table().contains("COMMAND_RESPONSE"))
+    }
+
+    @Test
+    fun censusCountsFramesTheEcgTriageRejected() {
+        // THE regression this feature exists for. A frame that fails the structural triage contributes
+        // nothing to `ecgPacketsSeen`, and previously left no trace at all. It must now be visible.
+        val rejected = censusFrame(0x28, 200)
+        assertFalse(
+            "fixture must be a frame the ECG triage rejects, or this test proves nothing",
+            Whoop5Ecg.plausibleFilteredFrame(rejected),
+        )
+        val census = Whoop5EcgProbe.FrameCensus()
+        census.record(rejected)
+        val text = Whoop5EcgProbe.report(
+            listOf(sent(124, 1, Whoop5EcgProbe.CommandOutcome.Success)),
+            0, emptyList(), census, 30,
+        )
+        // The ECG tally still honestly reads zero...
+        assertTrue(text.contains("ECG-shaped packets seen in 30s: 0"))
+        // ...but the window is no longer indistinguishable from silence.
+        assertTrue(text, text.contains("REALTIME_DATA"))
+        assertFalse(text, text.contains("no live frames observed"))
+    }
+
+    @Test
+    fun censusCapIsReportedRatherThanSilentlyTruncating() {
+        val census = Whoop5EcgProbe.FrameCensus()
+        // One frame each of 15 distinct types: 12 kinds fit, the remaining 3 frames are over the cap.
+        for (type in 1..15) census.record(censusFrame(type, 20))
+        assertEquals(Whoop5EcgProbe.FrameCensus.MAX_KINDS, census.kindsRecorded)
+        assertEquals(3, census.framesBeyondCap)
+        // A frame in an already-dropped kind keeps counting toward the overflow rather than vanishing.
+        census.record(censusFrame(15, 20))
+        assertEquals(4, census.framesBeyondCap)
+        // ...while a kind already in the table keeps counting normally even once the cap is reached.
+        census.record(censusFrame(1, 20))
+        assertEquals(2, census.count(1, 20))
+        // Every frame observed is accounted for somewhere: 15 + 1 + 1.
+        assertEquals(17, census.totalFramesObserved)
+
+        val table = census.table()
+        assertTrue(table, table.contains("4 further frame"))
+        assertTrue(table, table.contains("cap"))
+    }
+
+    @Test
+    fun emptyCensusSaysNoLiveFramesRatherThanRenderingAnEmptyTable() {
+        val census = Whoop5EcgProbe.FrameCensus()
+        assertTrue(census.isEmpty)
+        assertEquals(0, census.totalFramesObserved)
+        val table = census.table()
+        assertTrue(table, table.contains("no live frames observed"))
+        // An empty table would render a bare header with nothing under it — the exact ambiguity the
+        // census exists to remove.
+        assertFalse(table, table.contains("count  type"))
+        assertTrue(
+            Whoop5EcgProbe.report(emptyList(), 0, emptyList(), census, 30)
+                .contains("no live frames observed"),
+        )
+    }
+
+    @Test
+    fun censusIsAnObservationAndNeverEntersTheVerdict() {
+        // STRUCTURAL, not editorial: `verdict` takes no census argument, so no census can reach it. This
+        // test pins the rendered consequence — a busy census under a silent run still renders the run's
+        // own verdict, unchanged and un-upgraded.
+        val steps = listOf(
+            sent(124, Whoop5Ecg.ControlSignal.START.raw, Whoop5EcgProbe.CommandOutcome.Success),
+        )
+        val census = Whoop5EcgProbe.FrameCensus()
+        repeat(40) { census.record(censusFrame(40, 230)) }
+        val quiet = Whoop5EcgProbe.report(steps, 0, emptyList(), Whoop5EcgProbe.FrameCensus(), 30)
+        val busy = Whoop5EcgProbe.report(steps, 0, emptyList(), census, 30)
+        for (text in listOf(quiet, busy)) assertTrue(text, text.contains("Accepted but SILENT"))
+        // The verdict LINE itself must be byte-identical across an empty and a busy census.
+        fun verdictLine(s: String): String =
+            s.split("\n").firstOrNull { it.startsWith("Verdict:") } ?: ""
+        assertFalse(verdictLine(quiet).isEmpty())
+        assertEquals(verdictLine(quiet), verdictLine(busy))
+    }
+
+    @Test
+    fun censusSectionMakesNoGateOrEntitlementClaim() {
+        // §9.8 of the investigation doc records a retraction for reading an observation as a gate. The
+        // census is a tally; it must not acquire a verdict vocabulary of its own.
+        val census = Whoop5EcgProbe.FrameCensus()
+        census.record(censusFrame(40, 230))
+        val table = census.table()
+        for (banned in listOf("block", "gate", "entitle", "unsupported", "refus", "evidence", "consistent with")) {
+            assertFalse(
+                "census table must not editorialise with '$banned': $table",
+                table.lowercase().contains(banned),
+            )
         }
     }
 }

@@ -804,6 +804,10 @@ public final class BLEManager: NSObject, ObservableObject {
     /// Structural-triage hits: the empirical search for the packet TYPE these records arrive under.
     private var ecgProbeCandidates: [String] = []
     private var ecgProbePacketsSeen = 0
+    /// Every CRC-valid live frame seen this run, by type + length bucket — including the ones the ECG
+    /// triage rejects, which `ecgProbePacketsSeen` cannot see by construction. Without it a window full
+    /// of unrecognised frames and a window of pure silence render the same.
+    private var ecgProbeCensus = Whoop5EcgProbe.FrameCensus()
     /// Non-nil while the listen window is open; drives `ecgProbeArmed`.
     private var ecgProbeDeadline: Date?
     /// Supersedes a previous run's pending verdict timer when the user taps again.
@@ -3268,6 +3272,7 @@ public final class BLEManager: NSObject, ObservableObject {
             ecgProbeSteps = []
             ecgProbeCandidates = []
             ecgProbePacketsSeen = 0
+            ecgProbeCensus = Whoop5EcgProbe.FrameCensus()
         }
         ecgProbeRunToken &+= 1
         ecgProbeDeadline = Date().addingTimeInterval(BLEManager.ecgProbeWindow)
@@ -3284,6 +3289,7 @@ public final class BLEManager: NSObject, ObservableObject {
             let text = Whoop5EcgProbe.report(steps: self.ecgProbeSteps,
                                              ecgPacketsSeen: self.ecgProbePacketsSeen,
                                              candidateFrames: self.ecgProbeCandidates,
+                                             census: self.ecgProbeCensus,
                                              windowSeconds: Int(BLEManager.ecgProbeWindow))
             self.log("ECG probe:\n\(text)")
             self.state.ecgProbe = text
@@ -3300,6 +3306,12 @@ public final class BLEManager: NSObject, ObservableObject {
         // SUCCESS into "LIKELY blockedByDeviceFlags" — the strongest claim the report can make. So no
         // byte of an unverified frame is read here, on either branch.
         guard verifyFrame(frame, family: .whoop5).ok else { return }
+        // Census FIRST, and unconditionally: every CRC-valid frame is counted before any triage can
+        // discard it. `ecgProbePacketsSeen` below only counts frames that pass
+        // `Whoop5Ecg.plausibleFilteredFrame`, so an ECG record arriving under another packet type or
+        // header layout leaves no trace in it. This is an OBSERVATION for the report — it feeds no
+        // verdict (`Whoop5EcgProbe.verdict` takes no census) and settles no step.
+        ecgProbeCensus.record(frame: frame)
         // Both COMMAND_RESPONSE spellings: 0x24 (36, what the #592/#690 handlers key on) and the puffin
         // alias 38, which `canonicalTypeName` folds onto the same name. Accepting both means a strap that
         // answers on the alias still settles its step instead of being silently triaged as a data packet.
@@ -4425,6 +4437,7 @@ extension BLEManager: @preconcurrency CBCentralManagerDelegate {
         ecgProbeRunToken &+= 1
         ecgProbeSteps = []
         ecgProbeCandidates = []
+        ecgProbeCensus = Whoop5EcgProbe.FrameCensus()
         ecgProbePacketsSeen = 0
         // The DIS strings belong to the link that just dropped; a stale variant must not keep an MG-only
         // capability unlocked for whatever connects next. (Reset to `.unknown` below, with the other

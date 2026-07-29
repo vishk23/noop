@@ -219,8 +219,14 @@ object Framing {
 
     // MARK: - type / enum naming
 
-    /** Canonical packet-type name, aliasing the Whoop 5.0 "puffin" types onto their base names. */
-    private fun typeName(t: Int): String = when (t) {
+    /**
+     * Canonical packet-type name, aliasing the Whoop 5.0 "puffin" types onto their base names.
+     *
+     * The Kotlin twin of Swift's `canonicalTypeName(_:schema:)`, and named to match it. Public so a
+     * decoder outside this object names a type through the one [PacketType] table (itself the mirror of
+     * the schema's `PacketType` enum) instead of standing up a second hardcoded map that can drift.
+     */
+    fun canonicalTypeName(t: Int): String = when (t) {
         PuffinPacketType.PUFFIN_COMMAND_RESPONSE -> "COMMAND_RESPONSE"
         PuffinPacketType.PUFFIN_METADATA -> "METADATA"
         else -> PacketType.fromRaw(t)?.name ?: "type$t"
@@ -274,7 +280,7 @@ object Framing {
         val crcOk = check.crc32Ok
 
         val t = frame[4].toInt() and 0xFF
-        val name = typeName(t)
+        val name = canonicalTypeName(t)
         val parsed = LinkedHashMap<String, Any?>()
 
         when (name) {
@@ -294,7 +300,7 @@ object Framing {
         val check = verifyWhoop5(frame)
         val innerStart = 8
         val t = frame[innerStart].toInt() and 0xFF
-        val name = typeName(t)
+        val name = canonicalTypeName(t)
         val parsed = LinkedHashMap<String, Any?>()
         // WHOOP 5.0 field offsets are the 4.0 layout shifted by +4 (inner record starts at byte 8 vs 4).
         // REALTIME_DATA is hardware-verified at +4 (HR matched the 0x2A37 profile to ~0.4 bpm over 96
