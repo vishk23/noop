@@ -800,13 +800,26 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                 // signals hiccup kill the collector.
                 runCatching {
                     lastCircadianBins = circadianActivityBins()
-                    _v5Signals.value = V5HealthSignals.evaluate(
+                    // GATED on the illness-watch preference, matching the Swift twin
+                    // (AppModel.evaluateIllness returns early and clears every published illness value
+                    // when `behavior.illnessWatch` is off). Until this gate existed the toggle was
+                    // INVERTED in effect: switching "Illness heads-up" off silenced the Today banner and
+                    // the notification but left `V5HealthSignals.evaluate` running unconditionally, so
+                    // the Health hub's Heads-Up card kept rendering an illness verdict for a user who had
+                    // explicitly turned the feature off. Cycle + body-clock are separate opt-ins and must
+                    // keep running, so the gate clears only the illness half of the snapshot.
+                    val signals = V5HealthSignals.evaluate(
                         days = days,
                         cycleOptedIn = _cycleTrackingEnabled.value,
                         journalContext = illnessJournalContext(days),
                         activityBins = lastCircadianBins.first,
                         daysObserved = lastCircadianBins.second,
                     )
+                    _v5Signals.value = if (_illnessWatchEnabled.value) {
+                        signals
+                    } else {
+                        signals.copy(illness = illnessWatchOffResult, illnessDistance = null)
+                    }
                 }
                 // Keep the home-screen widget fresh while the app is open — covers users who turned
                 // the background service off (the service is the widget's heartbeat otherwise).
@@ -2264,14 +2277,24 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         _cycleTrackingEnabled.value = enabled
         NoopPrefs.setCycleTracking(appContext, enabled)
         val days = recentDays.value
-        runCatching {
-            _v5Signals.value = V5HealthSignals.evaluate(
-                days = days,
-                cycleOptedIn = enabled,
-                journalContext = illnessJournalContext(days),
-                activityBins = lastCircadianBins.first,
-                daysObserved = lastCircadianBins.second,
-            )
+        // `illnessJournalContext` now reads the journal (a DAO call), so this recompute moved onto the
+        // view-model scope. Same illness gate as the collector: flipping cycle awareness must not
+        // resurrect an illness verdict the user switched off.
+        viewModelScope.launch {
+            runCatching {
+                val signals = V5HealthSignals.evaluate(
+                    days = days,
+                    cycleOptedIn = enabled,
+                    journalContext = illnessJournalContext(days),
+                    activityBins = lastCircadianBins.first,
+                    daysObserved = lastCircadianBins.second,
+                )
+                _v5Signals.value = if (_illnessWatchEnabled.value) {
+                    signals
+                } else {
+                    signals.copy(illness = illnessWatchOffResult, illnessDistance = null)
+                }
+            }
         }
     }
 
@@ -2281,14 +2304,48 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
      * Lightweight: derived from the latest day's exercise count + the cached "unwell" flag we can see here.
      * (A fuller journal-tag read lands with the Mind pillar; this keeps the v5 pass honest without new I/O.)
      */
-    private fun illnessJournalContext(days: List<DailyMetric>): IllnessSignalEngine.Context {
+    private suspend fun illnessJournalContext(days: List<DailyMetric>): IllnessSignalEngine.Context {
         val latest = days.lastOrNull()
         val hardOrLate = (latest?.exerciseCount ?: 0) >= 2
+        // Read the SAME journal tags the Swift twin reads (AppModel.evaluateIllness), over the same
+        // recent window: an entry answered yes on one of the last 2 days. The doc above previously
+        // promised alcohol / "feeling unwell" suppression, but the body hardcoded `alreadyUnwell = false`
+        // and never passed `alcohol` at all — so on Android the confounder machinery the engine's own
+        // header calls "the differentiating part" had no input, and a hangover read exactly like early
+        // illness. The DAO (WhoopRepository.journal) already existed; it was simply never called here.
+        val recentDays = days.takeLast(2).map { it.day }.toSet()
+        var alcohol = false
+        var alreadyUnwell = false
+        var journalWorkout = false
+        runCatching {
+            val from = recentDays.minOrNull() ?: return@runCatching
+            val to = recentDays.maxOrNull() ?: return@runCatching
+            for (e in repository.journal(deviceId, from, to)) {
+                if (!e.answeredYes || e.day !in recentDays) continue
+                val q = e.question.lowercase()
+                if (q.contains("alcohol") || q.contains("drink")) alcohol = true
+                if (q.contains("workout") || q.contains("train") || q.contains("exercise")) journalWorkout = true
+                if (q.contains("sick") || q.contains("ill") || q.contains("unwell")) alreadyUnwell = true
+            }
+        }
         return IllnessSignalEngine.Context(
-            hardOrLateWorkout = hardOrLate,
-            alreadyUnwell = false,
+            alcohol = alcohol,
+            hardOrLateWorkout = hardOrLate || journalWorkout,
+            alreadyUnwell = alreadyUnwell,
         )
     }
+
+    /** The illness half of a [V5HealthSignals.Snapshot] when the illness watch is switched OFF: a
+     *  QUIET result, so every consumer's `level != QUIET` check renders nothing, without needing the
+     *  non-null `Snapshot.illness` field to become nullable. */
+    private val illnessWatchOffResult = IllnessSignalEngine.Result(
+        score = 0.0,
+        level = IllnessSignalEngine.Level.QUIET,
+        firedSignals = emptyList(),
+        suppressedBy = emptyList(),
+        signalCount = 0,
+        copy = "",
+    )
 
     /** Build today's fused multi-device record for [FusedRecordScreen] (v5 Local Multi-Device Fusion).
      *  Reads each source's banked row for the logical day and runs the pure FusionResolver per metric;

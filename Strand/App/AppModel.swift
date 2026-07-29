@@ -129,6 +129,11 @@ final class AppModel: ObservableObject {
     /// sole fire gate; this only surfaces a "how strong" confidence readout in the Heads-Up card when
     /// the engine has already raised. nil = not computed this pass. (Augment-only, Option A.)
     @Published var illnessDistance: IllnessDistance.Result?
+    /// The SINGLE-SIGNAL resting-HR tier (`RestingHRWatch`) that runs ALONGSIDE `illnessSignal`, never
+    /// replacing it. A streaming-median baseline + an absolute bpm offset + two-night persistence, so it
+    /// reaches a verdict on ~9 nights where the corroborated engine needs ~17, and it does not suppress
+    /// its own evidence as an elevation sustains. Either tier raising surfaces the banner.
+    @Published var illnessRhrWatch: RestingHRWatch.Result?
     /// Cycle-phase awareness (only computed when the user has opted in; else nil). Awareness only.
     @Published var cyclePhase: CyclePhaseEngine.Result?
     /// The nightly fused-index curve (oldest→newest) feeding the cycle card's sparkline.
@@ -1416,14 +1421,31 @@ final class AppModel: ObservableObject {
     }
 
     private func evaluateIllness(_ days: [DailyMetric]) {
-        guard behavior.illnessWatch, days.count >= 14 else {
-            healthAlert = nil; illnessSignal = nil; illnessDistance = nil; return
+        // The 14-night floor moved INTO the corroborated tier. The outer gate now only needs enough
+        // history for the cheapest tier (`RestingHRWatch`, ~9 nights), so a user who just switched straps
+        // is not blind for ~17 nights before anything at all can speak.
+        guard behavior.illnessWatch else {
+            healthAlert = nil; illnessSignal = nil; illnessDistance = nil; illnessRhrWatch = nil; return
         }
         Task { [weak self] in
             guard let self else { return }
+            // History for the watch is NOT `repo.days` (which reads only the WHOOP-family ids, so an Oura
+            // era , or an Oura-only install , is invisible to it). Take the brand-TAGGED cross-device read
+            // and cut it to the CURRENT device era before anything is folded: an absolute-bpm threshold
+            // and a personal spread are both only meaningful within ONE measurement scale. Falls back to
+            // the passed `days` when the store is unavailable.
+            let tagged = await self.repo.crossDeviceDailyHistory()
+            let eraDays = Self.currentDeviceEraDays(tagged, fallback: days)
+            guard eraDays.count > RestingHRWatch.minHistoryNights else {
+                await MainActor.run {
+                    self.healthAlert = nil; self.illnessSignal = nil
+                    self.illnessDistance = nil; self.illnessRhrWatch = nil
+                }
+                return
+            }
             // Confounder tags from the recent journal (within the last ~2 days). Read once, off the
             // engine's hot path , the engine only needs presence flags, not the rows.
-            let recentDays = Set(days.suffix(2).map(\.day))
+            let recentDays = Set(eraDays.suffix(2).map(\.day))
             let journal = await self.repo.journalEntries(days: 7)
             var ctxAlcohol = false, ctxHardWorkout = false, ctxAlreadyUnwell = false
             for e in journal where e.answeredYes && recentDays.contains(e.day) {
@@ -1432,9 +1454,34 @@ final class AppModel: ObservableObject {
                 if q.contains("workout") || q.contains("train") || q.contains("exercise") { ctxHardWorkout = true }
                 if q.contains("sick") || q.contains("ill") || q.contains("unwell") { ctxAlreadyUnwell = true }
             }
-            self.applyIllnessSignal(days, alcohol: ctxAlcohol, hardOrLateWorkout: ctxHardWorkout,
+            self.applyIllnessSignal(eraDays, alcohol: ctxAlcohol, hardOrLateWorkout: ctxHardWorkout,
                                     alreadyUnwell: ctxAlreadyUnwell)
         }
+    }
+
+    /// Cut a brand-TAGGED cross-device history down to the CURRENT device era, using the same
+    /// `Baselines.deviceEraEpoch` segmentation the cross-device HRV trend uses. A single-brand history
+    /// returns an epoch of 0 and is passed through WHOLE, so the overwhelmingly common single-device
+    /// install reads its entire history — including, for an Oura-only install, an Oura history that
+    /// `repo.days` never surfaced at all.
+    ///
+    /// A brand SWITCH deliberately truncates to the new era rather than fusing. Measured on a real
+    /// Oura→WHOOP switch, fusing shifts nightly HRV −1.83 SD and resting HR +4.0 bpm across the
+    /// boundary, which a single baseline reads as a sustained illness-ward anomaly caused purely by
+    /// changing hardware. Truncating is the honest cost — and it is exactly why the `RestingHRWatch`
+    /// tier, which reaches a verdict on ~9 nights, carries the post-switch window.
+    static func currentDeviceEraDays(_ tagged: [(day: String, sourceId: String, metric: DailyMetric)],
+                                     fallback: [DailyMetric]) -> [DailyMetric] {
+        guard !tagged.isEmpty else { return fallback }
+        let epoch = Baselines.deviceEraEpoch(tagged.map { (day: $0.day, sourceId: $0.sourceId) })
+        guard epoch > 0 else { return tagged.map(\.metric) }
+        let fmt = DateFormatter()
+        fmt.calendar = Calendar(identifier: .gregorian)
+        fmt.timeZone = TimeZone(secondsFromGMT: 0)
+        fmt.dateFormat = "yyyy-MM-dd"
+        let eraStart = fmt.string(from: Date(timeIntervalSince1970: epoch))
+        // Day keys are ISO "yyyy-MM-dd", so a lexical compare IS a chronological one.
+        return tagged.filter { $0.day >= eraStart }.map(\.metric)
     }
 
     /// Run the `IllnessSignalEngine` from the day history + the journal-derived confounder context, then
@@ -1463,12 +1510,37 @@ final class AppModel: ObservableObject {
         let rhr = signal({ $0.restingHr.map(Double.init) }, cfgKey: "resting_hr", illnessUp: true)
         let hrv = signal({ $0.avgHrv }, cfgKey: "hrv", illnessUp: false)
         let resp = signal({ $0.respRateBpm }, cfgKey: "resp", illnessUp: true)
-        // Skin-temp deviation: a stored °C delta. Build a small zero-centred state from its own recent
-        // spread so a +0.6 °C reads as a meaningful z without needing a separate baseline column.
+        // Skin temp goes through the SAME Baselines.foldHistory → Baselines.deviation path as the other
+        // three, over the same `base` window, reporting the same real `state.trusted`.
+        //
+        // It previously divided by the literal 0.3, commented as "one personal spread". It is not one:
+        // 0.3 is `skin_temp`'s **floorSpread** — a LOWER BOUND `Baselines.update` applies via
+        // `max(cfg.floorSpread, …)` — not the spread itself. Measured on real nights the personal SD is
+        // 0.521 °C on a WHOOP strap and 0.262 °C on an Oura ring, so the constant was ~1.74x too TIGHT on
+        // one device and ~1.15x too LOOSE on the other. On a 26-night WHOOP history that made skin temp
+        // clear `signalZThreshold` on 12.0% of nights against a ~2.3% design intent — the most
+        // trigger-happy of the four inputs, purely as an artifact of a misread constant. A personal fold
+        // is self-calibrating and has no device-dependent constant left to get wrong.
+        //
+        // It also hardcoded its trust flag `true`, bypassing the baseline-trust machinery the other three
+        // respect, so a cold-start skin baseline could corroborate a raise the engine would have gated.
+        //
+        // The fold MUST use the config matching the value's SEMANTICS: the column is bimodal (CSV imports
+        // store ABSOLUTE °C, the on-device pipeline a ±°C DEVIATION), and the absolute `skin_temp` config's
+        // 20…42 °C sanity gate rejects every ±°C deviation outright (`nValid` stays 0, `usable` never turns
+        // true). `skinTempHistory` partitions the history to one scale so the spread is a real one.
         var skin: (IllnessSignalEngine.SignalReading, Bool)? = nil
         if let recentSkin = rm({ $0.skinTempDevC }) {
-            let z = recentSkin / 0.3     // ~0.3 °C ≈ one personal spread (matches skin_temp floorSpread)
-            skin = (IllnessSignalEngine.SignalReading(zIllnessward: z), true)
+            let cfg = VitalBands.isAbsoluteSkinTemp(recentSkin)
+                ? Baselines.metricCfg["skin_temp"]! : VitalBands.skinTempDeviationCfg
+            let matched = VitalBands.skinTempHistory(matching: recentSkin, in: base.map { $0.skinTempDevC })
+            let state = Baselines.foldHistory(matched, cfg: cfg)
+            if state.usable {
+                let z = Baselines.deviation(recentSkin, state: state).z   // warmer is illness-ward
+                skin = (IllnessSignalEngine.SignalReading(zIllnessward: z), state.trusted)
+            } else {
+                skin = (IllnessSignalEngine.SignalReading(zIllnessward: 0, present: false), false)
+            }
         }
 
         let inputs = IllnessSignalEngine.Inputs(
@@ -1511,11 +1583,31 @@ final class AppModel: ObservableObject {
             labels["respiration"] = "respiration up"
         }
 
-        let result = IllnessSignalEngine.evaluate(inputs, context: context, firedLabels: labels)
+        // The corroborated tier keeps its own 14-night floor (it was the outer gate until the cheaper
+        // single-signal tier below started running on shorter histories). Below it, stay silent rather
+        // than raise off a history too short to have a personal baseline at all.
+        let result = days.count >= 14
+            ? IllnessSignalEngine.evaluate(inputs, context: context, firedLabels: labels)
+            : nil
         illnessSignal = result
+
+        // SECOND, INDEPENDENT TIER. One signal (resting HR), a streaming-median baseline, an absolute
+        // bpm threshold and two-night persistence — the opposite choice to the corroborated tier on every
+        // axis, so the two fail differently. It reaches a verdict on ~9 nights rather than ~17, and a
+        // median baseline does not widen as an anomaly folds into it, so a SUSTAINED elevation keeps
+        // reading as one instead of progressively suppressing its own evidence.
+        //
+        // Its input is the same era-segmented history, oldest→newest. It NEVER downgrades the
+        // corroborated tier: the two are OR'd, and the corroborated copy wins when both raise, because it
+        // can name which signals fired.
+        let rhrWatch = RestingHRWatch.evaluate(days.map { $0.restingHr.map(Double.init) })
+        illnessRhrWatch = rhrWatch
+
         // The amber banner string reflects the raised / already-unwell levels only (the calmer levels
         // surface in the Health hub's Heads-Up card, never as a scary banner).
-        healthAlert = (result.level == .raised || result.level == .alreadyUnwell) ? result.copy : nil
+        let corroboratedCopy = (result?.level == .raised || result?.level == .alreadyUnwell)
+            ? result?.copy : nil
+        healthAlert = corroboratedCopy ?? RestingHRWatch.copy(for: rhrWatch)
         if let alert = healthAlert, previous == nil {
             IllnessNotifier.post(alert)
         }

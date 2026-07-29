@@ -98,7 +98,11 @@ final class BehaviorStore: ObservableObject {
         // Stored as a plain [Int]; only valid weekday numbers (1…7) are kept so a corrupted defaults
         // entry can never schedule against a bogus day. Empty (or all 7) = every day.
         smartAlarmWeekdays = Set((d.array(forKey: K.alarmWeekdays) as? [Int] ?? []).filter { (1...7).contains($0) })
-        illnessWatch = d.object(forKey: K.illness) as? Bool ?? false
+        // Default ON, matching the Android twin (NoopPrefs.illnessWatch defaults true), so this is an
+        // opt-OUT on both platforms. It was opt-IN here while onboarding never surfaced it, which meant
+        // the watch shipped switched off and, in practice, never ran for anyone who did not go hunting in
+        // Settings — the neighbouring `batteryAlerts` on the next line has always defaulted true.
+        illnessWatch = d.object(forKey: K.illness) as? Bool ?? true
         batteryAlerts = d.object(forKey: K.batteryAlerts) as? Bool ?? true
         batteryPredictiveAlerts = d.object(forKey: K.batteryPredictiveAlerts) as? Bool ?? true
         strainTargetNudge = d.object(forKey: K.strainTargetNudge) as? Bool ?? false

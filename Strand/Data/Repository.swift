@@ -982,6 +982,56 @@ final class Repository: ObservableObject {
             .sorted { $0.day < $1.day }
     }
 
+    /// Full-history nightly daily-metric rows tagged by their WINNING source id, for the illness watch.
+    ///
+    /// WHY THIS EXISTS RATHER THAN WIDENING `days`. `days` is built from `importedReadIds` ∪
+    /// `computedReadIds`, and `oura-api` is in neither — so an Oura-only install has NO illness history at
+    /// all, and a WHOOP user's earlier Oura era is invisible to the watch. The obvious fix (adding
+    /// `oura-api` to the shared read ids) is the WRONG one twice over:
+    ///
+    ///   * BLAST RADIUS. ~58 call sites read `days`. Eight of them NAME the device — `DataSourcesView`'s
+    ///     "WHOOP Export · Imported" pill and its "N days · M sleeps stored" caption, `TodayView`'s "Whoop"
+    ///     source row, the "no new nights from your strap" staleness copy — and would become factually
+    ///     FALSE for an Oura user. A dozen more are numerically load-bearing (streaks, sleep-need means,
+    ///     percentile bands, calibration-night counts), and three fire notifications or write persisted
+    ///     state off a `days` change, so a first Oura sync would post a real "N new days of history
+    ///     landed" inbox item.
+    ///   * METHOD MIXING (#696). Fusing brands into ONE baseline does not merely blur precision, it
+    ///     MANUFACTURES a signal. Measured on a real Oura→WHOOP switch: nightly HRV shifts −1.83 SD and
+    ///     resting HR +4.0 bpm across the boundary. Folded into one baseline that reads as a sustained
+    ///     illness-ward HRV depression for weeks after a switch that was purely a change of hardware.
+    ///
+    /// So the illness path gets its OWN read: every source, deduped one winner per day, with the real
+    /// source id PRESERVED so `Baselines.deviceEraEpoch` can segment eras BEFORE anything is folded. The
+    /// ~58 existing `days` consumers stay byte-identical.
+    ///
+    /// Same precedence as `crossDeviceHrvHistory`: live strap + canonical import, then the wearable
+    /// imports (Oura/Fitbit/Garmin), then the computed "-noop" sibling. `apple-health` is deliberately
+    /// EXCLUDED — its HRV is SDNN, method-incompatible with the strap/Oura RMSSD, and its `brandBucket`
+    /// "whoop" tag would fragment a wearable era on any day it backfilled. Oldest→newest.
+    func crossDeviceDailyHistory(from: String = "2018-01-01",
+                                 to: String = "9999-12-31") async
+        -> [(day: String, sourceId: String, metric: DailyMetric)] {
+        guard let store = await ensureStore() else { return [] }
+        var ordered = importedReadIds
+        ordered.append(contentsOf: Self.wearableImportSources)
+        ordered.append(contentsOf: computedReadIds)
+        var seen = Set<String>()
+        let ids = ordered.filter { seen.insert($0).inserted }
+
+        var winnerByDay: [String: (rank: Int, sourceId: String, metric: DailyMetric)] = [:]
+        for (rank, id) in ids.enumerated() {
+            let rows = (try? await store.dailyMetrics(deviceId: id, from: from, to: to)) ?? []
+            for r in rows {
+                if let cur = winnerByDay[r.day], cur.rank <= rank { continue }
+                winnerByDay[r.day] = (rank, id, r)
+            }
+        }
+        return winnerByDay
+            .map { (day: $0.key, sourceId: $0.value.sourceId, metric: $0.value.metric) }
+            .sorted { $0.day < $1.day }
+    }
+
     /// #856: the same dedup over an EXPLICIT id list, so a workout's zone minutes bin the rows its own
     /// recording strap banked rather than the day-level active ∪ canonical. Order is precedence.
     func hrSamples(deviceIds: [String], from: Int, to: Int, limit: Int = 8000) async -> [HRSample] {

@@ -267,6 +267,14 @@ struct LiquidTodayView: View {
 
                 VStack(alignment: .leading, spacing: 12) {
                     scene
+                    // The illness/strain early-warning banner. Liquid Today is the DEFAULT Today
+                    // (`noop.liquidTodayEnabled` ships true), and this screen carried no illness surface at
+                    // all — so a raised warning rendered only on the classic TodayView that most users
+                    // never see. Same self-hiding leaf the classic screen mounts (it renders nothing when
+                    // `healthAlert` is nil), pinned above the reorderable block exactly as
+                    // `ActiveWorkoutIndicatorSection` and for the same reason: a health heads-up must not
+                    // be something the user can accidentally reorder to the bottom of the feed.
+                    HealthAlertBanner()
                     // #105: the live "workout in progress" card, dropped in the liquid Home rewrite. Restored
                     // here as the SAME leaf the classic TodayView renders (and Android's WorkoutInProgressCard),
                     // pinned above the reorderable block so an active manual workout is immediately visible
