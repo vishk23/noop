@@ -1664,22 +1664,41 @@ final class AppModel: ObservableObject {
     private func computeCyclePhase() async {
         guard cycleAwarenessEnabled else { cyclePhase = nil; cycleCurve = []; return }
         let days = repo.days
-        guard let tempCfg = Baselines.metricCfg["skin_temp"],
-              let rhrCfg = Baselines.metricCfg["resting_hr"],
+        guard let rhrCfg = Baselines.metricCfg["resting_hr"],
               let hrvCfg = Baselines.metricCfg["hrv"] else { return }
 
         // The nightly absolute skin-temp mean isn't in repo.days (only the °C DEVIATION is), so z-score
         // the deviation against its own folded spread , a zero-centred personal baseline. RHR + HRV
         // z-score their raw columns. Oldest→newest.
+        //
+        // The skin fold MUST use the DEVIATION-semantics config, not the absolute `skin_temp` one. That
+        // config's 20…42 °C sanity gate rejects every ±°C deviation at `Baselines.update`, so replayed
+        // over a real history it produced nValid = 0, status .calibrating and `usable == false`
+        // PERMANENTLY: the `skinState.usable` branch below was unreachable dead code, every tempZ silently
+        // took the `/ 0.3` fallback, and `CyclePhaseEngine.classify` was always handed
+        // `baselineUsable: false`. The column is bimodal across import paths (CSV stores absolute °C, the
+        // on-device pipeline a deviation), so resolve the semantics from the most recent reading once and
+        // keep only same-kind rows — `skinMatched` then feeds BOTH the fold and every per-night z, so
+        // neither ever crosses the absolute/deviation scale boundary.
         let sorted = days.sorted { $0.day < $1.day }
-        let skinState = Baselines.foldHistory(sorted.map { $0.skinTempDevC }, cfg: tempCfg)
+        let skinSeries = sorted.map { $0.skinTempDevC }
+        let skinKind = skinSeries.compactMap { $0 }.last
+        let skinMatched = skinKind.map { VitalBands.skinTempHistory(matching: $0, in: skinSeries) } ?? skinSeries
+        let skinCfg = skinKind.map { VitalBands.isAbsoluteSkinTemp($0)
+            ? Baselines.metricCfg["skin_temp"]! : VitalBands.skinTempDeviationCfg }
+            ?? VitalBands.skinTempDeviationCfg
+        let skinState = Baselines.foldHistory(skinMatched, cfg: skinCfg)
         let rhrState = Baselines.foldHistory(sorted.map { $0.restingHr.map(Double.init) }, cfg: rhrCfg)
         let hrvState = Baselines.foldHistory(sorted.map { $0.avgHrv }, cfg: hrvCfg)
 
         var nights: [CyclePhaseEngine.Night] = []
         var curve: [Double] = []
-        for d in sorted {
-            let tempZ = d.skinTempDevC.map { skinState.usable ? Baselines.deviation($0, state: skinState).z : $0 / 0.3 }
+        for (i, d) in sorted.enumerated() {
+            // Honest-nil rather than a fabricated divisor: with no usable personal spread there is no z
+            // to report, and CyclePhaseEngine already reads `baselineUsable` to stay in LEARNING. The old
+            // `/ 0.3` fallback divided by a FLOOR SPREAD, and on a CSV-imported absolute ~33 °C row it
+            // produced a z of ~110.
+            let tempZ = skinState.usable ? skinMatched[i].map { Baselines.deviation($0, state: skinState).z } : nil
             let rhrZ = (rhrState.usable ? d.restingHr.map { Baselines.deviation(Double($0), state: rhrState).z } : nil)
             let hrvZ = (hrvState.usable ? d.avgHrv.map { Baselines.deviation($0, state: hrvState).z } : nil)
             nights.append(CyclePhaseEngine.Night(day: d.day, tempZ: tempZ, rhrZ: rhrZ, hrvZ: hrvZ))
