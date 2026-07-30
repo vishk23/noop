@@ -134,11 +134,12 @@ enum DataBackup {
     /// when the original data may be long gone; failing loudly NOW is the honest move. The read-only
     /// probe sits safely beside the app's open GRDB pool (WAL allows concurrent readers).
     /// `writeBackupForTesting` deliberately bypasses this so tests can build damaged containers.
-    private static func writeVerifiedBackupZip(dbURL: URL, to dest: URL, settingsJSON: Data?) throws {
+    private static func writeVerifiedBackupZip(dbURL: URL, to dest: URL, settingsJSON: Data?,
+                                               rawHistoryURL: URL? = RawHistoryArchive.defaultFileURL) throws {
         if let complaint = DatabaseIntegrity.quickCheckFailure(atPath: dbURL.path) {
             throw ExportIntegrityFailure(complaint: complaint)
         }
-        try writeBackupZip(dbURL: dbURL, to: dest, settingsJSON: settingsJSON)
+        try writeBackupZip(dbURL: dbURL, to: dest, settingsJSON: settingsJSON, rawHistoryURL: rawHistoryURL)
     }
 
     /// Write the live SQLite at `dbURL` into a fresh deflate ZIP at `dest`: the DB under the canonical
@@ -148,18 +149,36 @@ enum DataBackup {
     /// entry) and deflate compression match the Android exporter byte-for-byte at the container level,
     /// so a `.noopbak` produced on either platform imports on the other. `settingsJSON == nil` writes
     /// the legacy single-entry ZIP. Mirrors the `Archive` idiom in `WhoopCsvExporter`.
-    private static func writeBackupZip(dbURL: URL, to dest: URL, settingsJSON: Data?) throws {
+    ///
+    /// `rawHistoryURL` adds a third entry, `rejected_history.jsonl` — the append-only archive of
+    /// HISTORICAL_DATA frames that failed decode (`RawHistoryArchive`). It lives outside the store
+    /// directory and nothing else walks it, so before this entry existed the only durable copy of the
+    /// raw 2,140-byte optical buffers never left the device and was evicted on a rolling basis. It is
+    /// added LAST so the DB stays the first entry (older importers stop at the first `.sqlite`), and
+    /// `extractBackupZip` ignores it on restore by design: this is an upload-out artifact, not
+    /// something to write back over a live install.
+    private static func writeBackupZip(dbURL: URL, to dest: URL, settingsJSON: Data?,
+                                       rawHistoryURL: URL? = nil) throws {
         let archive = try Archive(url: dest, accessMode: .create)
         try archive.addEntry(with: backupEntryName, fileURL: dbURL, compressionMethod: .deflate)
-        guard let settingsJSON else { return }
-        // Stage the JSON through a temp file so the settings entry uses the exact same file-URL
-        // addEntry idiom as the DB entry (one container code path, no provider-API variant to drift).
         let fm = FileManager.default
-        let tmpJSON = fm.temporaryDirectory
-            .appendingPathComponent("noop-settings-\(UUID().uuidString).json")
-        try settingsJSON.write(to: tmpJSON)
-        defer { try? fm.removeItem(at: tmpJSON) }
-        try archive.addEntry(with: BackupSettings.entryName, fileURL: tmpJSON, compressionMethod: .deflate)
+        if let settingsJSON {
+            // Stage the JSON through a temp file so the settings entry uses the exact same file-URL
+            // addEntry idiom as the DB entry (one container code path, no provider-API variant to drift).
+            let tmpJSON = fm.temporaryDirectory
+                .appendingPathComponent("noop-settings-\(UUID().uuidString).json")
+            try settingsJSON.write(to: tmpJSON)
+            defer { try? fm.removeItem(at: tmpJSON) }
+            try archive.addEntry(with: BackupSettings.entryName, fileURL: tmpJSON, compressionMethod: .deflate)
+        }
+        guard let rawHistoryURL,
+              let size = (try? fm.attributesOfItem(atPath: rawHistoryURL.path))?[.size] as? Int,
+              size > 0 else { return }
+        // Best-effort, deliberately: the database is the payload that must not fail to export. An
+        // unreadable sidecar archive degrades to "the backup lacks the raw frames", never to "the
+        // user could not back up".
+        try? archive.addEntry(with: RawHistoryArchive.fileName, fileURL: rawHistoryURL,
+                              compressionMethod: .deflate)
     }
 
     /// This device's whitelisted profile/display settings (see `BackupSettings.whitelist`) as the
@@ -236,12 +255,24 @@ enum DataBackup {
     /// `settings` (canonical `BackupSettings` keys) adds the `settings.json` entry; nil writes the
     /// legacy single-entry ZIP — tests cover both shapes. Not used by app code; production goes
     /// through `writeBackup(checkpoint:to:)`.
+    /// `rawHistoryURL` defaults to nil here (NOT to the production archive) so every existing test
+    /// keeps building the exact container it asserted on, and the raw-history entry is exercised only
+    /// by the test that asks for it.
     static func writeBackupForTesting(databaseAt dbURL: URL, to dest: URL,
-                                      settings: [String: Any]? = nil) throws {
+                                      settings: [String: Any]? = nil,
+                                      rawHistoryURL: URL? = nil) throws {
         let fm = FileManager.default
         if fm.fileExists(atPath: dest.path) { try fm.removeItem(at: dest) }
         try writeBackupZip(dbURL: dbURL, to: dest,
-                           settingsJSON: settings.flatMap { BackupSettings.encode($0) })
+                           settingsJSON: settings.flatMap { BackupSettings.encode($0) },
+                           rawHistoryURL: rawHistoryURL)
+    }
+
+    /// Test seam: the entry names present in a `.noopbak`, so a test can assert the raw-history
+    /// archive actually rides along instead of inferring it from a restore that ignores the entry.
+    static func entryNamesForTesting(inBackupAt url: URL) throws -> [String] {
+        let archive = try Archive(url: url, accessMode: .read)
+        return archive.compactMap { $0.type == .file ? ($0.path as NSString).lastPathComponent : nil }
     }
 
     // MARK: - Import

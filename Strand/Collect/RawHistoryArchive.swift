@@ -16,14 +16,40 @@ import WhoopProtocol
 /// Frames carry sensor payloads, not identifiers — no serials/MACs land here. The companion Android
 /// archive uses the same record shape so one mapping toolchain reads both.
 struct RawHistoryArchive {
-    /// File name under `<AppSupport>/com.noopapp.noop/`.
+    /// File name under `<AppSupport>/com.noopapp.noop/`, and the ZIP entry name this file takes
+    /// inside a `.noopbak` (see `DataBackup.writeBackupZip`).
+    ///
+    /// NOTE the directory: this is `<AppSupport>/com.noopapp.noop/`, which is NOT where the SQLite
+    /// store lives (`StorePaths.defaultDatabasePath()` → `<AppSupport>/OpenWhoop/whoop.sqlite`).
+    /// Nothing walks this directory, so for as long as the archive was only a file on disk it had no
+    /// route off the device at all: `CloudSyncUploader` uploads a `.noopbak`, and a `.noopbak` used to
+    /// contain only the database (plus `settings.json`). Irreplaceable frames were therefore evicted
+    /// on a rolling basis and never left the phone. The fix is the ZIP entry, not a moved file — the
+    /// archive keeps its own directory (it must survive a database restore, which overwrites the
+    /// store path) and rides the existing upload as a third entry.
     static let fileName = "rejected_history.jsonl"
-    /// Soft cap (~5 MB). When appending would push the file past this, the archive EVICTS oldest
+    /// Soft cap. When appending would push the file past this, the archive EVICTS oldest
     /// surplus lines to make room rather than refusing the write — but only down to a per-version
     /// retention floor (see `perVersionFloor`), so a brand-new layout version is never binned merely
     /// because common versions filled the file. Only when the incoming frames alone can't fit even an
     /// empty archive does `archive` skip them (reported as unarchived). (#344)
-    static let maxBytes = 5 * 1024 * 1024
+    ///
+    /// SIZED, not guessed. Measured against the real v20 corpus (29,203 archived 2,140-byte records
+    /// spanning 49,379 s of strap wear): 4,408 bytes per JSONL line and 2,129 records per wear-hour,
+    /// i.e. ~9.4 MB per hour of capture. The former 5 MB cap therefore retained **34 minutes** of
+    /// wear — a full night's optical capture was always evicted before anything could read it, and
+    /// because the file never uploaded, evicted meant destroyed.
+    ///
+    /// 64 MB ≈ 6.8 wear-hours, chosen so one full night survives to the next successful upload. This
+    /// is a BUFFER, not the archive of record: once a `.noopbak` reaches the cloud the frames are
+    /// durable off-device, so the cap only has to outlast the gap between uploads. It is deliberately
+    /// finite — uploads have gone multi-day quiet before, and an uncapped hex archive would grow at
+    /// 225 MB/day of wear and fill the device instead.
+    static let maxBytes = 64 * 1024 * 1024
+
+    /// The production archive location, without constructing an archive to append with. This is the
+    /// file `DataBackup` folds into every `.noopbak`.
+    static var defaultFileURL: URL { RawHistoryArchive().fileURL }
 
     /// Per distinct layout VERSION, keep at least this many of the newest archived lines, immune to
     /// cap eviction. A never-seen version (WHOOP 4 v19, WHOOP 5 v20/v21 — `frame[5]` / `frame[9]`,

@@ -114,6 +114,64 @@ final class BackupSyncRoundTripTests: XCTestCase {
         XCTAssertNil(defaults.object(forKey: "units.system"))
     }
 
+    /// The raw-history archive lives OUTSIDE the store directory and nothing walks it, so until it
+    /// became a `.noopbak` entry it had no route off the device at all — the 2,140-byte optical frames
+    /// it holds were evicted on a rolling basis and never uploaded. Assert the entry is really in the
+    /// container (a restore can't prove it: `extractBackupZip` ignores the entry by design).
+    func testRejectedHistoryArchiveRidesAlongInTheBackup() throws {
+        let sourceDB = tmp.appendingPathComponent("source.sqlite")
+        try makeNoopDatabase(at: sourceDB, deviceRows: ["my-whoop"])
+        // Stage the source archive in its OWN directory: production keeps it outside the store
+        // directory, and keeping them apart here is what lets the restore assertion below mean
+        // something instead of just re-finding this fixture.
+        let archiveDir = tmp.appendingPathComponent("app-support-noop", isDirectory: true)
+        try FileManager.default.createDirectory(at: archiveDir, withIntermediateDirectories: true)
+        let rawHistory = archiveDir.appendingPathComponent(RawHistoryArchive.fileName)
+        let line = #"{"capturedAtMs":1784054551320,"trim":7,"family":"whoop5","frameHex":"aa0154080100"}"# + "\n"
+        try line.data(using: .utf8)!.write(to: rawHistory)
+
+        let backup = tmp.appendingPathComponent("with-archive.noopbak")
+        try DataBackup.writeBackupForTesting(databaseAt: sourceDB, to: backup,
+                                             settings: ["profile.age": 34],
+                                             rawHistoryURL: rawHistory)
+
+        let names = try DataBackup.entryNamesForTesting(inBackupAt: backup)
+        XCTAssertEqual(names.first, "noop-backup.sqlite",
+                       "DB must stay the FIRST entry — older importers stop at the first .sqlite")
+        XCTAssertTrue(names.contains(RawHistoryArchive.fileName),
+                      "rejected_history.jsonl must ride along, else the frames never leave the phone")
+        XCTAssertTrue(names.contains("settings.json"), "settings.json still rides along")
+
+        // And the container still restores exactly as before: the extra entry is ignored, not fatal.
+        let defaults = try freshDefaults()
+        let liveDB = tmp.appendingPathComponent("live.sqlite")
+        let result = DataBackup.restore(from: backup, toDatabaseAt: liveDB.path, settingsDefaults: defaults)
+        guard case .imported = result else {
+            return XCTFail("An unknown third entry must not break restore, got \(result)")
+        }
+        XCTAssertEqual(try deviceRows(in: liveDB), ["my-whoop"])
+        XCTAssertFalse(FileManager.default.fileExists(
+            atPath: liveDB.deletingLastPathComponent().appendingPathComponent(RawHistoryArchive.fileName).path),
+            "The archive entry is upload-out only — a restore must not write it back over the install")
+    }
+
+    /// An absent or empty archive must degrade to the previous container, never to a failed export.
+    func testBackupOmitsTheArchiveEntryWhenThereIsNothingToSend() throws {
+        let sourceDB = tmp.appendingPathComponent("source.sqlite")
+        try makeNoopDatabase(at: sourceDB, deviceRows: ["my-whoop"])
+        let missing = tmp.appendingPathComponent("nope").appendingPathComponent(RawHistoryArchive.fileName)
+        let empty = tmp.appendingPathComponent(RawHistoryArchive.fileName)
+        try Data().write(to: empty)
+
+        for candidate in [missing, empty] {
+            let backup = tmp.appendingPathComponent("no-archive.noopbak")
+            try DataBackup.writeBackupForTesting(databaseAt: sourceDB, to: backup, rawHistoryURL: candidate)
+            let names = try DataBackup.entryNamesForTesting(inBackupAt: backup)
+            XCTAssertEqual(names, ["noop-backup.sqlite"],
+                           "No frames to send → the legacy single-entry ZIP, not an empty entry")
+        }
+    }
+
     func testSettingsAreNotAppliedWhenTheRestoreIsRejected() throws {
         // A foreign (Room) DB zipped together WITH a settings payload: the origin gate refuses the
         // restore, so the settings must not leak through either ("apply AFTER the DB swap succeeds").
