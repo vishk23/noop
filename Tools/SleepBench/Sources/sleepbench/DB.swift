@@ -82,8 +82,16 @@ extension ReadOnlyDB {
         """
         try query(sql) { s in
             let stagesJSON = ReadOnlyDB.str(s, 5) ?? "[]"
-            let stages = (try? JSONDecoder().decode([StageSegment].self,
-                                                    from: Data(stagesJSON.utf8))) ?? []
+            // This column has several producers and they do NOT agree on how to spell wake: the on-device
+            // stager writes "wake", the noop-cloud stage-edit vocabulary "awake". A database assembled from
+            // the cloud mirror rather than pulled off a device therefore carries "awake" on exactly the
+            // stage-locked nights this harness uses as its human reference. Canonicalise HERE, at the one
+            // point rows enter the harness, so no downstream comparison has to know which producer wrote
+            // the row — see `SleepStageVocabulary`.
+            let stages = ((try? JSONDecoder().decode([StageSegment].self,
+                                                     from: Data(stagesJSON.utf8))) ?? [])
+                .map { StageSegment(start: $0.start, end: $0.end,
+                                    stage: SleepStageVocabulary.canonical($0.stage)) }
             var band: [Int] = []
             if let bj = ReadOnlyDB.str(s, 6) {
                 band = (try? JSONDecoder().decode([Int].self, from: Data(bj.utf8))) ?? []

@@ -2,7 +2,15 @@ import Foundation
 import StrandAnalytics
 
 /// The four scored classes, in a fixed order so every confusion matrix in the run is indexed alike.
+/// These are the CANONICAL spellings (`SleepStageVocabulary.canonicalStages`); a hypnogram that spells
+/// wake `"awake"` is folded onto `"wake"` before it reaches any metric below.
 let stageOrder = ["wake", "light", "deep", "rem"]
+
+/// Wake in either spelling, any case. Every stage comparison in the harness goes through this rather than
+/// a bare `== "wake"` literal: the labels can originate from a producer that spells wake `"awake"`, and a
+/// literal comparison silently files those epochs as SLEEP — biasing wake down and sleep up, which is the
+/// exact quantity this harness exists to measure.
+func isWake(_ label: String) -> Bool { SleepStageVocabulary.isWake(label) }
 
 /// 30 s epochs, matching `SleepStager.epochS` and the grid `stagesJSON` / `sleepStateJSON` are stored on.
 let epochSeconds = 30.0
@@ -24,28 +32,36 @@ func epochLabels(_ stages: [StageSegment], start: Int, end: Int) -> [String] {
         let t = start + Int(Double(i) * epochSeconds)
         while si + 1 < sorted.count && sorted[si].end <= t { si += 1 }
         let seg = sorted[si]
-        if seg.start <= t && t < seg.end { out[i] = seg.stage }
-        else if let hit = sorted.first(where: { $0.start <= t && t < $0.end }) { out[i] = hit.stage }
-        else if t >= sorted[sorted.count - 1].end { out[i] = sorted[sorted.count - 1].stage }
+        // Canonicalise on expansion as well as on load: this is the one place a `[StageSegment]` becomes a
+        // label array, so every label array in the harness is canonical by construction.
+        if seg.start <= t && t < seg.end { out[i] = SleepStageVocabulary.canonical(seg.stage) }
+        else if let hit = sorted.first(where: { $0.start <= t && t < $0.end }) {
+            out[i] = SleepStageVocabulary.canonical(hit.stage)
+        } else if t >= sorted[sorted.count - 1].end {
+            out[i] = SleepStageVocabulary.canonical(sorted[sorted.count - 1].stage)
+        }
     }
     return out
 }
 
-/// Minutes at each stage in a label array.
+/// Minutes at each stage in a label array, keyed by CANONICAL stage — so a night spelling wake `"awake"`
+/// adds to the same bucket as one spelling it `"wake"` rather than opening a fifth key no caller reads.
 func stageMinutes(_ labels: [String]) -> [String: Double] {
     var m: [String: Double] = [:]
-    for l in labels { m[l, default: 0] += epochSeconds / 60.0 }
+    for l in labels { m[SleepStageVocabulary.canonical(l), default: 0] += epochSeconds / 60.0 }
     return m
 }
 
 func wakeMinutes(_ labels: [String]) -> Double { stageMinutes(labels)["wake"] ?? 0 }
+/// Sleep is everything that is not wake. Sound only while the label set is closed
+/// (`SleepStageVocabulary.canonicalStages`), which the tests assert.
 func sleepMinutes(_ labels: [String]) -> Double {
-    Double(labels.filter { $0 != "wake" }.count) * epochSeconds / 60.0
+    Double(labels.filter { !isWake($0) }.count) * epochSeconds / 60.0
 }
 
 /// Index of the first and last non-wake epoch — sleep onset and final wake on this grid.
 func onsetAndFinalWake(_ labels: [String]) -> (onset: Int?, final: Int?) {
-    (labels.firstIndex(where: { $0 != "wake" }), labels.lastIndex(where: { $0 != "wake" }))
+    (labels.firstIndex(where: { !isWake($0) }), labels.lastIndex(where: { !isWake($0) }))
 }
 
 // MARK: - Stage-fraction calibration
@@ -62,7 +78,7 @@ func onsetAndFinalWake(_ labels: [String]) -> (onset: Int?, final: Int?) {
 func stagePercentages(_ labels: [String]) -> [String: Double] {
     var pct = [String: Double](uniqueKeysWithValues: stageOrder.map { ($0, 0.0) })
     guard !labels.isEmpty else { return pct }
-    for l in labels { pct[l, default: 0] += 1 }
+    for l in labels { pct[SleepStageVocabulary.canonical(l), default: 0] += 1 }
     for k in pct.keys { pct[k]! = pct[k]! / Double(labels.count) * 100 }
     return pct
 }
@@ -82,8 +98,9 @@ func stageBias(ref: [String], pred: [String]) -> [String: Double] {
 /// REM before onset cannot occur (REM is not wake, so onset is at or before it), but the guard is kept so
 /// a caller passing a hand-built label array cannot produce a negative latency.
 func firstRemLatencyMinutes(_ labels: [String]) -> Double? {
-    guard let onset = labels.firstIndex(where: { $0 != "wake" }),
-          let rem = labels.firstIndex(of: "rem"), rem >= onset else { return nil }
+    guard let onset = labels.firstIndex(where: { !isWake($0) }),
+          let rem = labels.firstIndex(where: { SleepStageVocabulary.canonical($0) == "rem" }),
+          rem >= onset else { return nil }
     return Double(rem - onset) * epochSeconds / 60.0
 }
 
@@ -97,8 +114,12 @@ struct Confusion {
         self.classes = classes
         m = Array(repeating: Array(repeating: 0, count: classes.count), count: classes.count)
     }
+    /// Labels are canonicalised before lookup. Without it an `"awake"` reference epoch matches no class and
+    /// is silently DROPPED from the matrix — not misfiled but absent, quietly shrinking the denominator
+    /// behind every accuracy and kappa in the run rather than showing up as disagreement.
     mutating func add(ref: String, pred: String) {
-        guard let r = classes.firstIndex(of: ref), let c = classes.firstIndex(of: pred) else { return }
+        guard let r = classes.firstIndex(of: SleepStageVocabulary.canonical(ref)),
+              let c = classes.firstIndex(of: SleepStageVocabulary.canonical(pred)) else { return }
         m[r][c] += 1
     }
     mutating func merge(_ o: Confusion) {
@@ -148,7 +169,9 @@ func confusion(ref: [String], pred: [String], classes: [String] = stageOrder) ->
 }
 
 /// Collapse a 4-class hypnogram to the 2-class sleep/wake problem the wake over-call lives in.
-func toSleepWake(_ labels: [String]) -> [String] { labels.map { $0 == "wake" ? "wake" : "sleep" } }
+/// Wake is matched in either spelling: a bare `== "wake"` here would have folded every `"awake"` epoch
+/// into "sleep", producing a reference that claims the wearer never woke.
+func toSleepWake(_ labels: [String]) -> [String] { labels.map { isWake($0) ? "wake" : "sleep" } }
 
 // MARK: - Descriptive statistics
 
