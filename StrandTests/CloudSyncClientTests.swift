@@ -9,8 +9,12 @@ final class CloudSyncClientTests: XCTestCase {
 
     private let baseURL = URL(string: "https://cloud.example.com")!
 
-    private func makeClient() -> CloudSyncClient {
-        CloudSyncClient(baseURL: baseURL, token: "tok-1", session: OuraURLProtocolStub.session())
+    /// `retry: .immediate` keeps `CloudSyncRetryPolicy.standard`'s attempt COUNTS and drops the waits,
+    /// so a test can assert on how many requests a class of failure produced without spending the real
+    /// backoff. The delays themselves are pinned separately, as pure arithmetic, in `CloudSyncRetryTests`.
+    private func makeClient(retry: CloudSyncRetryPolicy = .immediate) -> CloudSyncClient {
+        CloudSyncClient(baseURL: baseURL, token: "tok-1", session: OuraURLProtocolStub.session(),
+                        retry: retry, bulkRetry: retry)
     }
 
     /// One journal row. `payloadJSON`'s embedded quotes are hand-escaped at the JSON level (`\"`)
@@ -53,15 +57,15 @@ final class CloudSyncClientTests: XCTestCase {
         XCTAssertTrue(url.contains("since=42"))
     }
 
-    func testFetchEdits401ThrowsBadResponse() async throws {
+    func testFetchEdits401ThrowsUnauthorized() async throws {
         OuraURLProtocolStub.queue = [.init(status: 401, body: "nope".data(using: .utf8)!)]
         let client = makeClient()
 
         do {
             _ = try await client.fetchEdits(since: 0)
-            XCTFail("expected badResponse to be thrown")
+            XCTFail("expected unauthorized to be thrown")
         } catch {
-            XCTAssertEqual(error as? CloudSyncError, CloudSyncError.badResponse(401, "nope"))
+            XCTAssertEqual(error as? CloudSyncError, CloudSyncError.unauthorized(status: 401, detail: "nope"))
         }
     }
 
@@ -90,15 +94,15 @@ final class CloudSyncClientTests: XCTestCase {
         XCTAssertTrue(url.contains("/edits/ack"))
     }
 
-    func testAck401ThrowsBadResponse() async throws {
+    func testAck401ThrowsUnauthorized() async throws {
         OuraURLProtocolStub.queue = [.init(status: 401, body: "denied".data(using: .utf8)!)]
         let client = makeClient()
 
         do {
             _ = try await client.ack(seqs: [1])
-            XCTFail("expected badResponse to be thrown")
+            XCTFail("expected unauthorized to be thrown")
         } catch {
-            XCTAssertEqual(error as? CloudSyncError, CloudSyncError.badResponse(401, "denied"))
+            XCTAssertEqual(error as? CloudSyncError, CloudSyncError.unauthorized(status: 401, detail: "denied"))
         }
     }
 
@@ -112,6 +116,197 @@ final class CloudSyncClientTests: XCTestCase {
         } catch {
             XCTAssertEqual(error as? CloudSyncError, CloudSyncError.decode)
         }
+    }
+
+    // MARK: - Status code -> typed error
+    //
+    // The noop-cloud server answers a DIFFERENT code for each failure mode on purpose, and the client
+    // used to fold every one of them into `badResponse(Int, String)` — which is how "your backup is
+    // fine, retry later" (507), "never send these bytes again" (400), "an optional feature is switched
+    // off" (503), and "your token is wrong" (401) all became the same sentence with a different number
+    // in it. One test per code, asserting the case AND (below) whether it is retryable, so a future
+    // refactor cannot quietly re-collapse them.
+
+    func testEachServerStatusMapsToItsOwnTypedError() {
+        let cases: [(Int, String, CloudSyncError)] = [
+            (401, #"{"error":"unauthorized"}"#,
+             .unauthorized(status: 401, detail: "")),
+            (403, #"{"error":"forbidden"}"#,
+             .unauthorized(status: 403, detail: "")),
+            (400, #"{"error":"corrupt_sqlite","detail":"file is not a database"}"#,
+             .rejected(status: 400, code: "corrupt_sqlite", detail: "file is not a database")),
+            (400, #"{"error":"bad_zip"}"#,
+             .rejected(status: 400, code: "bad_zip", detail: "")),
+            (404, #"{"error":"not_found"}"#,
+             .rejected(status: 404, code: "not_found", detail: "")),
+            (413, #"{"error":"too_large"}"#,
+             .rejected(status: 413, code: "too_large", detail: "")),
+            (507, #"{"error":"insufficient_space","detail":"only 300 MB free"}"#,
+             .serverOutOfSpace(code: "insufficient_space", detail: "only 300 MB free")),
+            (507, #"{"error":"storage_unavailable","detail":"EIO"}"#,
+             .serverOutOfSpace(code: "storage_unavailable", detail: "EIO")),
+            (500, #"{"error":"ingest_failed"}"#,
+             .serverFault(status: 500, code: "ingest_failed", detail: "")),
+            (502, "<html>bad gateway</html>",
+             .serverFault(status: 502, code: "server_error", detail: "<html>bad gateway</html>")),
+        ]
+        for (status, body, expected) in cases {
+            XCTAssertEqual(CloudSyncError.from(status: status, body: Data(body.utf8), lane: "ingest"),
+                           expected, "status \(status) body \(body)")
+        }
+    }
+
+    /// The deep-buffer 503 is the one status whose meaning depends on the body: `storage_not_configured`
+    /// is "this optional lane was never switched on", which is not a failure. Any OTHER 503 is a genuine
+    /// server fault and must still read as one.
+    func test503IsOnlyNotConfiguredWhenTheServerSaysSo() {
+        let notConfigured = #"{"error":"storage_not_configured","configured":false,"feature":"deepbuf"}"#
+        XCTAssertEqual(CloudSyncError.from(status: 503, body: Data(notConfigured.utf8), lane: "deep-buffer"),
+                       .featureNotConfigured(feature: "deepbuf", detail: ""))
+
+        XCTAssertEqual(CloudSyncError.from(status: 503, body: Data(#"{"error":"overloaded"}"#.utf8),
+                                            lane: "deep-buffer"),
+                       .serverFault(status: 503, code: "overloaded", detail: ""))
+    }
+
+    /// The classification the retry engine actually reads. Stated as one table so "which of these does
+    /// the phone try again" is answerable by reading a single test.
+    func testOnlyTransientClassesAreRetryable() {
+        XCTAssertTrue(CloudSyncError.serverOutOfSpace(code: "insufficient_space", detail: "").isRetryable)
+        XCTAssertTrue(CloudSyncError.serverFault(status: 500, code: "x", detail: "").isRetryable)
+        XCTAssertTrue(CloudSyncError.network("offline").isRetryable)
+
+        XCTAssertFalse(CloudSyncError.unauthorized(status: 401, detail: "").isRetryable)
+        XCTAssertFalse(CloudSyncError.rejected(status: 400, code: "corrupt_sqlite", detail: "").isRetryable)
+        XCTAssertFalse(CloudSyncError.featureNotConfigured(feature: "deepbuf", detail: "").isRetryable)
+        XCTAssertFalse(CloudSyncError.cancelled.isRetryable)
+        XCTAssertFalse(CloudSyncError.decode.isRetryable)
+    }
+
+    /// Cancellation reaches this code in two different shapes depending on where it was observed — the
+    /// concurrency runtime's `CancellationError` and the transport's `URLError.cancelled` — and BOTH have
+    /// to land on `.cancelled`. If either fell through to `.network` it would be retryable, so a
+    /// `BGAppRefreshTask` whose expiration handler just fired would sit out a backoff it cannot survive.
+    func testCancellationIsNeverMistakenForANetworkFault() {
+        XCTAssertEqual(CloudSyncError.from(transport: CancellationError()), .cancelled)
+        XCTAssertEqual(CloudSyncError.from(transport: URLError(.cancelled)), .cancelled)
+        XCTAssertEqual(CloudSyncError.from(transport: URLError(.timedOut)),
+                       .network(URLError(.timedOut).localizedDescription))
+    }
+
+    /// The whole point of the taxonomy is the sentence a human ends up reading in
+    /// `cloudsync.lastStatus`. Pin the two that mattered during the outage: 507 must say the data is
+    /// safe and will be retried, 401 must say retrying won't help.
+    func testMessagesTellTheUserWhatHappensNext() throws {
+        let outOfSpace = try XCTUnwrap(
+            CloudSyncError.serverOutOfSpace(code: "insufficient_space", detail: "").errorDescription)
+        XCTAssertTrue(outOfSpace.contains("Nothing was lost"), outOfSpace)
+        XCTAssertTrue(outOfSpace.contains("try again"), outOfSpace)
+
+        let auth = try XCTUnwrap(CloudSyncError.unauthorized(status: 401, detail: "").errorDescription)
+        XCTAssertTrue(auth.contains("Re-enter"), auth)
+        XCTAssertTrue(auth.contains("won't help"), auth)
+
+        let corrupt = try XCTUnwrap(
+            CloudSyncError.rejected(status: 400, code: "corrupt_sqlite", detail: "").errorDescription)
+        XCTAssertTrue(corrupt.contains("fresh backup"), corrupt)
+
+        // Never leak an unbounded server body into a user-facing string.
+        let huge = String(repeating: "x", count: 5000)
+        guard case .serverFault(_, _, let detail) =
+                CloudSyncError.from(status: 500, body: Data(huge.utf8), lane: "ingest") else {
+            return XCTFail("expected serverFault")
+        }
+        XCTAssertEqual(detail.count, 200)
+    }
+
+    // MARK: - Retry behaviour through the real client
+
+    /// A transient 500 followed by a 200: one sync, two requests, and the user never sees a failure.
+    /// Before this, that first 500 ended the sync and the next attempt was the next launch.
+    func testRetryableFailureIsRetriedAndCanSucceed() async throws {
+        OuraURLProtocolStub.queue = [
+            .init(status: 500, body: Data(#"{"error":"internal"}"#.utf8)),
+            .init(status: 200, body: Data(#"{"edits":[],"latestSeq":7}"#.utf8)),
+        ]
+        let client = makeClient()
+
+        let result = try await client.fetchEdits(since: 0)
+
+        XCTAssertEqual(result.latestSeq, 7)
+        XCTAssertEqual(OuraURLProtocolStub.requestedURLs.count, 2)
+    }
+
+    /// The budget is bounded: `standard` is three attempts, not "keep going". A server that is down
+    /// stays down, and a sync that hangs on retries is the failure mode this whole PR exists to remove.
+    func testRetryableFailureStopsAtTheAttemptLimit() async throws {
+        OuraURLProtocolStub.queue = (0..<5).map { _ in
+            .init(status: 503, body: Data(#"{"error":"overloaded"}"#.utf8))
+        }
+        let client = makeClient()
+
+        do {
+            _ = try await client.fetchEdits(since: 0)
+            XCTFail("expected serverFault to be thrown")
+        } catch {
+            XCTAssertEqual(error as? CloudSyncError, .serverFault(status: 503, code: "overloaded", detail: ""))
+        }
+        XCTAssertEqual(OuraURLProtocolStub.requestedURLs.count, CloudSyncRetryPolicy.standard.maxAttempts)
+    }
+
+    /// A terminal class costs exactly one request. Retrying a 401 re-sends a credential the server has
+    /// already refused; retrying a 400 re-sends bytes it has already said it cannot read.
+    func testTerminalFailureIsNeverRetried() async throws {
+        OuraURLProtocolStub.queue = [
+            .init(status: 401, body: Data(#"{"error":"unauthorized"}"#.utf8)),
+            .init(status: 200, body: Data(#"{"edits":[],"latestSeq":1}"#.utf8)),
+        ]
+        let client = makeClient()
+
+        do {
+            _ = try await client.fetchEdits(since: 0)
+            XCTFail("expected unauthorized to be thrown")
+        } catch {
+            XCTAssertEqual(error as? CloudSyncError, .unauthorized(status: 401, detail: ""))
+        }
+        XCTAssertEqual(OuraURLProtocolStub.requestedURLs.count, 1)
+    }
+
+    /// A 2xx body the client can't parse is a contract mismatch, not a transient fault — re-running the
+    /// same parse over the same endpoint cannot help, so it must not burn attempts either.
+    func testDecodeFailureIsNotRetried() async throws {
+        OuraURLProtocolStub.queue = [
+            .init(status: 200, body: Data("not json".utf8)),
+            .init(status: 200, body: Data(#"{"edits":[],"latestSeq":1}"#.utf8)),
+        ]
+        let client = makeClient()
+
+        do {
+            _ = try await client.fetchEdits(since: 0)
+            XCTFail("expected decode to be thrown")
+        } catch {
+            XCTAssertEqual(error as? CloudSyncError, .decode)
+        }
+        XCTAssertEqual(OuraURLProtocolStub.requestedURLs.count, 1)
+    }
+
+    /// `/deepbuf`'s not-configured answer reaches the caller as `featureNotConfigured` — the case
+    /// `DeepBufferUploader.drain` skips on — and is not retried, because a server with no bucket
+    /// configured will answer identically for as long as that stays true.
+    func testDeepBufferNotConfiguredSurfacesAsFeatureNotConfiguredAndIsNotRetried() async throws {
+        let body = #"{"error":"storage_not_configured","configured":false,"feature":"deepbuf"}"#
+        OuraURLProtocolStub.queue = [.init(status: 503, body: Data(body.utf8)),
+                                     .init(status: 503, body: Data(body.utf8))]
+        let client = makeClient()
+
+        do {
+            _ = try await client.uploadDeepBuffer(generation: "g1", byteStart: 0, byteEnd: 10,
+                                                    compressed: Data([1, 2, 3]))
+            XCTFail("expected featureNotConfigured to be thrown")
+        } catch {
+            XCTAssertEqual((error as? CloudSyncError)?.isFeatureNotConfigured, true)
+        }
+        XCTAssertEqual(OuraURLProtocolStub.requestedURLs.count, 1)
     }
 }
 

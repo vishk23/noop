@@ -16,6 +16,10 @@ private final class SpyDeepBufferClient: DeepBufferIngesting {
     }
     private(set) var calls: [Call] = []
     var failFrom: Int?
+    /// When set, the Nth call onward throws THIS instead of a generic transport failure — so a test can
+    /// drive the specific `503 storage_not_configured` answer the real server gives when no object
+    /// storage bucket is configured.
+    var failWith: CloudSyncError?
     var reportDuplicate = false
     /// Runs INSIDE an upload, standing in for the seconds a real network call takes. The only way to
     /// exercise something rotating the log mid-drain — the window the identity re-check exists for.
@@ -24,7 +28,9 @@ private final class SpyDeepBufferClient: DeepBufferIngesting {
     func uploadDeepBuffer(generation: String, byteStart: Int, byteEnd: Int,
                           compressed: Data) async throws -> DeepBufferUploadReceipt {
         onUpload?()
-        if let failFrom, calls.count >= failFrom { throw CloudSyncError.network("simulated failure") }
+        if let failFrom, calls.count >= failFrom {
+            throw failWith ?? CloudSyncError.network("simulated failure")
+        }
         calls.append(Call(generation: generation, byteStart: byteStart, byteEnd: byteEnd, compressed: compressed))
         return DeepBufferUploadReceipt(storedBytes: compressed.count, lines: 1, duplicate: reportDuplicate)
     }
@@ -399,6 +405,60 @@ final class DeepBufferUploaderTests: XCTestCase {
     }
 
     // MARK: - Compression
+
+    // MARK: - A lane the server never switched on is not a failure
+
+    /// `POST /deepbuf` answers `503 storage_not_configured` when no object-storage bucket is configured.
+    /// That is BY DESIGN — the archive is optional and the whole-database `/ingest` backup is
+    /// unaffected — but the drain used to record it in `summary.error`, which `CloudSyncModel` renders
+    /// as " · Deep buffers: The cloud sync server returned an error (503)" beside whatever else the
+    /// sync said. During a real outage that sentence appeared next to a genuine `/ingest` failure with
+    /// nothing to distinguish them, so one broken thing read as two.
+    func testNotConfiguredServerIsRecordedAsASkipNotAnError() async throws {
+        try append(lines(5), to: liveURL)
+        let client = SpyDeepBufferClient(), marks = MemoryWatermarks()
+        client.failFrom = 0 // the very first chunk gets the answer
+        client.failWith = .featureNotConfigured(feature: "deepbuf", detail: "no bucket configured")
+
+        let s = await DeepBufferUploader.drain(client: client, watermarks: marks, directory: dir)
+
+        XCTAssertTrue(s.skippedNotConfigured)
+        XCTAssertNil(s.error, "a switched-off optional lane must never read as a sync failure")
+        XCTAssertTrue(s.isEmpty, "a skip contributes nothing to the user-visible status line")
+    }
+
+    /// The skip must not consume the backlog. The watermark stays exactly where it was, so the moment a
+    /// bucket IS configured server-side the very same bytes ship — nothing is silently written off.
+    func testNotConfiguredSkipLeavesTheWatermarkUntouched() async throws {
+        try append(lines(5), to: liveURL)
+        // Name the generation explicitly so the assertion below is about THIS key, not vacuously true
+        // over an empty map.
+        let generation = try XCTUnwrap(DeepBufferUploader.scanGenerations(in: dir).first)
+        XCTAssertGreaterThan(generation.size, 0, "there must be real bytes for the skip to leave behind")
+
+        let client = SpyDeepBufferClient(), marks = MemoryWatermarks()
+        client.failFrom = 0 // the very first chunk gets the answer
+        client.failWith = .featureNotConfigured(feature: "deepbuf", detail: "")
+
+        _ = await DeepBufferUploader.drain(client: client, watermarks: marks, directory: dir)
+
+        XCTAssertEqual(marks.marks[generation.id] ?? 0, 0,
+                       "a skipped lane must not advance past bytes it never sent")
+    }
+
+    /// A REAL deep-buffer failure still reports as one — the skip is scoped to the one status that means
+    /// "never switched on", not a blanket amnesty for the lane.
+    func testARealDeepBufferFailureIsStillReportedAsAnError() async throws {
+        try append(lines(5), to: liveURL)
+        let client = SpyDeepBufferClient(), marks = MemoryWatermarks()
+        client.failFrom = 0 // the very first chunk gets the answer
+        client.failWith = .serverFault(status: 500, code: "deepbuf_failed", detail: "")
+
+        let s = await DeepBufferUploader.drain(client: client, watermarks: marks, directory: dir)
+
+        XCTAssertFalse(s.skippedNotConfigured)
+        XCTAssertNotNil(s.error)
+    }
 
     func testDeflateRoundTripsThroughApplesOwnDecoder() {
         let body = lines(20)
