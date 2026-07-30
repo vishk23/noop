@@ -1715,4 +1715,51 @@
     <string name="battery_critical_body">Restam %1$d%%. A bracelete deixa de gravar perto dos 10%% – não vai captar esta noite se não a carregar.</string>
     <string name="battery_bedtime_title">Não dura a noite</string>
     <string name="battery_bedtime_body">Restam %1$s de gravação, mas esta noite precisa de cerca de %2$s. Carregue antes de se deitar.</string>
+
+    <!-- #867: the three older battery notifications, previously raw Kotlin literals in
+         BatteryAlertNotifier and therefore English in every locale. Wording and translations are the
+         Apple catalog's, moved across unchanged. -->
+    <string name="battery_runtime_title">Bateria fraca da correia</string>
+    <string name="battery_runtime_body">Autonomia restante no teu WHOOP: %1$s. Recarrega-o esta noite.</string>
+    <string name="battery_low_title">Bateria fraca</string>
+    <string name="battery_low_body">Recarregue o teu WHOOP antes desta noite.</string>
+    <string name="battery_full_title">Correia totalmente carregada</string>
+    <string name="battery_full_body">O teu WHOOP está a 100%.</string>
+
+    <!-- Foreground-service notification (WhoopConnectionService). Always on screen while the strap is
+         connected, and hardcoded English until now: com/noop/ble is outside i18n_audit.py's scan roots,
+         and a NotificationCompat builder chain matches none of its Compose patterns, so the gate could
+         not see it. postNotification's dedupe key now includes the locale — without that, these would
+         keep the previous language until the connection or battery state happened to change. -->
+    <string name="fgs_title_reconnecting">A reconectar ao teu WHOOP…</string>
+    <string name="fgs_title_syncing">Sincronizando o histórico da bracelete…</string>
+    <string name="fgs_title_connected">Ligado ao teu WHOOP</string>
+    <string name="fgs_detail_streaming">A transmitir em segundo plano</string>
+    <string name="fgs_detail_keeping_link">A manter a ligação aberta</string>
+    <string name="fgs_detail_recovery">Recuperação %1$d%%</string>
+    <string name="fgs_detail_battery">Correia %1$d%%</string>
+    <string name="fgs_action_disconnect">Desconectar</string>
+    <string name="fgs_channel_name">Ligação da correia</string>
+    <string name="fgs_channel_desc">Apresentado enquanto o NOOP mantém o teu WHOOP ligado em segundo plano.</string>
+
+    <!-- The remaining notifier titles/bodies, surfaced by extending i18n_audit.py to the
+         notification builders. Same defect as the block above: user-visible, never localised. -->
+    <string name="illness_alert_title">Aviso prévio: vá com calma</string>
+    <string name="inactivity_title">Mover lembrete</string>
+    <string name="smart_alarm_title">Bom dia</string>
+    <string name="smart_alarm_body">O teu alarme inteligente acabou de tocar.</string>
+    <string name="battery_channel_name">Alertas de bateria</string>
+    <string name="battery_channel_desc">Avisos quando a bateria da correia está fraca ou totalmente carregada.</string>
+    <string name="l10n_app_changelog_battery_saver_quiets_the_gauges_translated_bdbe8650">A poupança de bateria acalma os indicadores, notificações Android traduzidas e gráficos instantâneos</string>
+    <string name="l10n_settings_screen_turn_deep_data_back_off_r22disable">Voltar a desativar os dados profundos</string>
+    <string name="l10n_settings_screen_r22disable_needs_bond">Necessita da ligação encriptada completa: feche primeiro a app oficial da WHOOP e emparelhe a pulseira com o NOOP (uma ligação apenas de FC em direto não consegue transportar a escrita).</string>
+    <string name="l10n_settings_screen_r22disable_reason">Escreve o valor de desativação nas 16 marcas e lê cada uma de volta, para que veja o que a pulseira guarda e não apenas que confirmou. O valor de desativação é inferido da marca que o NOOP já desliga assim para a transmissão Garmin — nunca foi visto numa marca R22, por isso o NOOP testa primeiro uma só e pára se a pulseira a recusar. Limpar as marcas não é o mesmo que ver os registos profundos pararem: confirme isso sincronizando depois.</string>
+    <string name="l10n_settings_screen_r22disable_running">A limpar as marcas R22 e a reler cada uma…</string>
+    <string name="l10n_settings_screen_r22disable_dismiss">Dispensar o relatório de desativação</string>
+    <string name="l10n_settings_screen_r22disable_confirm_title">Limpar as marcas R22 na pulseira?</string>
+    <string name="l10n_settings_screen_r22disable_confirm_body">Desligar este interruptor apenas impede o NOOP de enviar o desbloqueio. As marcas já escritas permanecem na pulseira até que algo as limpe. O NOOP pode agora escrever o valor de desativação nas 16 e reler cada uma para que veja o que a pulseira guarda realmente. Necessita da pulseira ligada e emparelhada.</string>
+    <string name="l10n_settings_screen_r22disable_confirm_action">Limpar marcas na pulseira</string>
+    <string name="l10n_settings_screen_r22disable_confirm_cancel">Apenas parar de enviar</string>
+    <string name="l10n_settings_screen_r22_accepted_all">✓ A pulseira aceitou as %1$d marcas R22</string>
+    <string name="l10n_settings_screen_r22_accepted_partial">A pulseira aceitou %1$d/%2$d marcas R22…</string>
 </resources>

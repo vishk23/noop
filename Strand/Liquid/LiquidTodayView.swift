@@ -26,6 +26,11 @@ struct LiquidTodayView: View {
     // only publishes connect/discovery state, never HR. Injected at the app roots beside .environmentObject(model).
     @EnvironmentObject var ble: BLEManager
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    /// Low Power Mode — and the in-app "Reduce motion in NOOP" toggle — pose the sky still too, the
+    /// behaviour the comment on the sky branch below has always described. Neither has a SwiftUI
+    /// environment key, hence the shared monitor.
+    @ObservedObject private var motion = NoopMotionState.shared
+    private var poseStill: Bool { motion.poseStill(reduceMotion) }
 
     /// Shared with the real Today's card-customise editor so the two stay in sync.
     @AppStorage(DashboardCardPrefs.selectionKey) private var dashboardCardsRaw = ""
@@ -262,6 +267,14 @@ struct LiquidTodayView: View {
 
                 VStack(alignment: .leading, spacing: 12) {
                     scene
+                    // The illness early-warning banner, dropped in the liquid Home rewrite while Liquid became
+                    // the default Today — so a raised/already-unwell signal had no surface on the screen the
+                    // user actually opens (only the Health tab's HeadsUpCard and the once-a-day notification).
+                    // Restored as the SAME leaf the classic TodayView renders directly under its top bar, so
+                    // it sits above the reorderable block and can't be reordered out of sight. Renders nothing
+                    // when there's no alert; it owns its own AppModel observation, so the ~1 Hz HR stream
+                    // re-renders only the banner, not this body.
+                    HealthAlertBanner()
                     // #105: the live "workout in progress" card, dropped in the liquid Home rewrite. Restored
                     // here as the SAME leaf the classic TodayView renders (and Android's WorkoutInProgressCard),
                     // pinned above the reorderable block so an active manual workout is immediately visible
@@ -318,7 +331,7 @@ struct LiquidTodayView: View {
                     // "Sky behind cards" (opt-in): fill the whole backdrop with a softer settle so the sky
                     // reads under every card, instead of the default 340 top band that dissolves to canvas.
                     Group {
-                        if reduceMotion || !dataLoaded { LiquidSkyStatic(hour: liveHour, settleStrength: skyBehindCards ? 0.78 : 1) }
+                        if poseStill || !dataLoaded { LiquidSkyStatic(hour: liveHour, settleStrength: skyBehindCards ? 0.78 : 1) }
                         else { LiquidSky(hour: liveHour, settleStrength: skyBehindCards ? 0.78 : 1) }
                     }
                     .frame(maxWidth: .infinity)

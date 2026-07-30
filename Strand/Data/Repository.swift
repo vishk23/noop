@@ -594,6 +594,16 @@ final class Repository: ObservableObject {
     /// Checkpoint the WAL into the main DB file if the store is already open, so a file-level
     /// backup captures everything. No-op (returns false) if no handle exists yet , the caller
     /// then copies the on-disk files as-is, which still includes the -wal sidecar.
+    ///
+    /// Known residual hazard, deliberately not changed here: under `WalCheckpointing.external` this
+    /// checkpoint restarts the WAL underneath a page replicator and costs its next push a full
+    /// snapshot of the database (see `WhoopStore.writeConsistentCopy(to:)` for the measurement, and
+    /// `CloudSyncUploader.defaultExporter` for the pattern that avoids it). It is left alone because
+    /// its callers are the *user-initiated* file-level backups — the Export button, and
+    /// `BackupSync.catchUpIfDue`, which is gated on the auto-backup toggle AND a chosen folder AND a
+    /// full day elapsed. Those want the disk reclaimed, they are at most daily, and swapping them to
+    /// a staged full copy would make a manual export visibly slower for everyone to protect a trial
+    /// that only one device is running. Revisit if page replication becomes the default.
     func checkpointForBackup() async -> Bool {
         guard let store else { return false }
         do { try await store.checkpointWAL(); return true } catch { return false }
@@ -1425,10 +1435,12 @@ final class Repository: ObservableObject {
         let steps = useMotionAwareWake
             ? ((try? await store.stepSamples(deviceId: deviceId, from: lo, to: hi, limit: 200_000)) ?? [])
             : []
-        // Opt-in experimental staging (Settings → Experimental · Sleep staging): when the user has flipped
-        // the V2 flag on, re-stage with the cardiorespiratory recipe `SleepStagerV2`; otherwise the default
-        // V1 `SleepStager`. Read once here off the actor; the switch is purely which engine runs over the
-        // already-detected window , V1 stays the default and is untouched. (V7 Pillar 3b)
+        // Which staging engine re-stages this window (Settings → Experimental · Sleep staging). The flag is
+        // **default ON** (#277 promoted V2 over V1; #351 extended it to every strap family), so unless the
+        // user has explicitly turned it OFF this re-stages with the cardiorespiratory recipe `SleepStagerV2`;
+        // turning it off falls back to V1 `SleepStager`. Read once here off the actor; the switch is purely
+        // which engine runs over the already-detected window — detection is identical either way.
+        // (V7 Pillar 3b)
         let useV2 = PuffinExperiment.experimentalSleepV2Enabled
         let segs = await Task.detached(priority: .utility) {
             let staged = useV2
