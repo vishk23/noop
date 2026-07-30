@@ -64,9 +64,9 @@ final class LitersRoundTripTests: XCTestCase {
     /// chain fails here rather than three integration layers later.
     func testWriterPushesCommittedContent() throws {
         try makeOriginDatabase(rows: 1...50)
-        // Establishes the baseline the replica half will be compared against once liters' restore
-        // works under system SQLite (see testReplicaRestoreIsBrokenUnderSystemSQLite), and proves the
-        // fixture really is 50 committed rows rather than an empty file liters would happily push.
+        // Proves the fixture really is 50 committed rows rather than an empty file liters would
+        // happily push. The same check on the replica side closes the loop, in
+        // testReplicaRestoresTheOriginUnderSystemSQLite.
         XCTAssertEqual(try readIds(at: originPath), Array(1...50))
 
         let writer = try LitersWriter(dbPath: originPath, storage: .dir(path: bucketPath))
@@ -227,46 +227,59 @@ final class LitersRoundTripTests: XCTestCase {
         print("[liters] reopen push snapshotted=\(secondPush.snapshotted) reason=\(secondPush.snapshotReason ?? "nil")")
     }
 
-    // MARK: - The replica, which is the half the SERVER is, and which system SQLite breaks
+    // MARK: - The replica, which is the half the SERVER is
 
-    /// **This test asserts a bug, on purpose.** When it starts failing, liters has been fixed and the
-    /// assertion below should be inverted into the real round trip (restore, then compare
-    /// `readIds(at: replicaPath)` against the origin's rows).
+    /// **The round trip closes here**: bytes written through Swift's SQLite, pushed to a bucket by
+    /// Rust, and restored into a second database that reads back as the origin's rows.
     ///
-    /// `Replica.sync()` cannot restore when liters is linked against the platform `libsqlite3` —
-    /// which is the configuration NOOP ships, and the whole point of `default-features = false`.
-    /// The cause is `crates/liters/src/replica.rs:648`, the only read-only open in the crate, reached
-    /// only from `check_integrity` after a restore:
+    /// The linkage is the whole point. NOOP builds liters with `default-features = false` so it
+    /// links the *platform* `libsqlite3` — the same one GRDB links — instead of compiling its own
+    /// copy of the amalgamation (see `Rust/Cargo.toml`). That is a correctness requirement, not a
+    /// size one: two SQLite libraries in one process do not share the process-global
+    /// `unixInodeInfo` table, so either can silently drop the other's advisory locks. This test is
+    /// the only place the restore half is exercised in exactly that arrangement, which matters
+    /// because the restore half is where the two SQLites historically disagreed.
     ///
-    /// ```rust
-    /// rusqlite::Connection::open_with_flags(&self.db_path, OpenFlags::SQLITE_OPEN_READ_ONLY)
-    /// ```
+    /// They disagreed about page 1. A snapshot's page 1 is a byte-for-byte copy of the origin's, so
+    /// a restored image inherited the origin's WAL journal-mode header (bytes 18/19 = `0x02 0x02`)
+    /// while the restore had just deleted the `-wal`/`-shm` sidecars that header claims exist.
+    /// Reading a WAL database needs the `-shm` index, and a `SQLITE_OPEN_READONLY` connection may
+    /// not create one — so `check_integrity`'s read-only open, the crate's only one, failed with
+    /// `SQLITE_CANTOPEN` ("unable to open database file"). Apple's libsqlite3 (3.51.0) enforces
+    /// that; the bundled amalgamation (3.50.2) tolerates it, which is why the defect was invisible
+    /// to a default-features build and fatal to ours. liters' `Replica::restore` now normalizes the
+    /// image to a rollback-journal file (bytes 18/19 = `0x01 0x01`), the same rewrite the
+    /// incremental `apply_spooled` path always did, so both writers of the file agree.
     ///
-    /// Apple's libsqlite3 (3.51.0) cannot run a statement on a WAL-mode database opened
-    /// `SQLITE_OPEN_READONLY` when the `-shm` sidecar is absent — and the restore deletes `-wal`/
-    /// `-shm` immediately before this call. Reduced to a four-case C program against
-    /// `/usr/lib/libsqlite3.dylib`; opening the same file READWRITE, or leaving the sidecars in
-    /// place, succeeds. liters' own suite passes 80/80 with its bundled SQLite and 31/80 without,
-    /// and every one of those 49 failures is on this path.
-    ///
-    /// **It does not block the phone.** NOOP is a Writer; `writer.rs` contains no read-only open at
-    /// all, and the tests above prove the writer half works in exactly this linkage. The Replica runs
-    /// on the server, in a Rust process with no GRDB, which therefore builds liters with bundled
-    /// SQLite and never reaches this. The test exists so that "we knew, and here is the boundary"
-    /// is a property of the codebase rather than of someone's memory.
-    func testReplicaRestoreIsBrokenUnderSystemSQLite() throws {
+    /// The header assertion below is deliberate: `readIds` alone would pass on a bundled build too,
+    /// so it would not pin the mechanism. The bytes are what `Replica::db_path` documents as the
+    /// replica's contract — "open it read-only; it is a rollback-journal-mode file" — and what a
+    /// server-side reader depends on.
+    func testReplicaRestoresTheOriginUnderSystemSQLite() throws {
         try makeOriginDatabase(rows: 1...10)
+        // Proves the fixture is 10 committed rows, so "the replica has 10 rows" is a statement about
+        // replication rather than about two empty databases agreeing.
+        XCTAssertEqual(try readIds(at: originPath), Array(1...10))
+
         let writer = try LitersWriter(dbPath: originPath, storage: .dir(path: bucketPath))
         defer { writer.close() }
         _ = try writer.push()
 
         let replica = try LitersReplica(dbPath: replicaPath, storage: .dir(path: bucketPath), autoReset: true)
         defer { replica.close() }
+        try replica.sync()
 
-        XCTAssertThrowsError(try replica.sync(), "if this no longer throws, liters is fixed — invert this test") { error in
-            XCTAssertTrue("\(error)".contains("unable to open database file"),
-                          "expected the known SQLITE_CANTOPEN from check_integrity, got: \(error)")
-        }
+        XCTAssertEqual(try readIds(at: replicaPath), Array(1...10),
+                       "the restored replica must contain the origin's committed rows")
+
+        // The mechanism, not just the outcome: 0x01 0x01 is rollback-journal mode. 0x02 0x02 here
+        // would mean the restore left the origin's WAL header on an image with no -shm, which is the
+        // state every read-only open of a replica used to die on.
+        let header = try FileHandle(forReadingFrom: URL(fileURLWithPath: replicaPath))
+        defer { try? header.close() }
+        try header.seek(toOffset: 18)
+        XCTAssertEqual(Array(header.readData(ofLength: 2)), [0x01, 0x01],
+                       "a restored replica must present as a rollback-journal file")
     }
 
     // MARK: - Errors cross the FFI as errors
@@ -377,10 +390,13 @@ final class LitersRoundTripTests: XCTestCase {
 
     private func readIds(at path: String) throws -> [Int] {
         var db: OpaquePointer?
-        // READWRITE, not READONLY, and that is not arbitrary: Apple's libsqlite3 cannot run a
-        // statement on a WAL-mode database opened SQLITE_OPEN_READONLY when the -shm sidecar is
-        // absent, which it is right after a liters restore. Opening read-only here would fail with
-        // SQLITE_CANTOPEN for reasons that have nothing to do with whether the bytes arrived.
+        // READWRITE, not READONLY: this helper reads both a live WAL origin and a freshly restored
+        // replica, and READWRITE is valid for both without the caller having to know which it holds.
+        // Read-only would be too, now — a restored replica presents as a rollback-journal file — but
+        // only because liters normalizes page 1. Opening READWRITE keeps "did the bytes arrive"
+        // independent of that, so a regression in the normalization surfaces in the header
+        // assertion in testReplicaRestoresTheOriginUnderSystemSQLite rather than as a confusing
+        // SQLITE_CANTOPEN here.
         let rc = sqlite3_open_v2(path, &db, SQLITE_OPEN_READWRITE, nil)
         defer { sqlite3_close(db) }
         guard rc == SQLITE_OK, db != nil else { throw SQLiteFailure(code: rc, message: "open replica \(path)") }
