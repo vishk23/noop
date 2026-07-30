@@ -209,6 +209,30 @@ personal build. See [`BUILD.md`](BUILD.md) for the signed-bundle recipe and pair
 - No new third-party dependency unless it's discussed first. Today the only ones are **GRDB.swift**
   (SQLite) and **ZIPFoundation** (export unzip), both via SwiftPM.
 
+### What CI gates — and what it deliberately doesn't
+
+NOOP runs a **deliberately lean CI**: fast, no-hardware checks guard the point of merge, while heavier
+and hardware-dependent verification runs at release time or on demand. This is a choice for an
+anonymous, offline, sideloaded project — not a gap to fill with more gates.
+
+- **On every PR (required):** `swift-packages` runs `swift test` for `Packages/**`; `i18n-coverage`
+  runs the string audit. These catch the regressions that matter most (protocol/analytics math,
+  storage, i18n) without a device or an Xcode/Gradle app build.
+- **Disabled by design — you build the app yourself:** `app-build.yml` (app-target compile, iOS needs
+  `macos-26`) and `android.yml` (Android app build) are **off**. So a compile error in **app-target**
+  code (SwiftUI Views, `BLEManager`, `Repository`, a Compose screen) passes every default check.
+  Before you push app-layer changes, compile locally — `xcodebuild … build` /
+  `./gradlew compileFullDebugKotlin` — or dispatch `app-build.yml` on demand.
+- **Gated at release, not per PR:** Android release lint (`lintVitalFullRelease`) runs inside
+  `assembleFullRelease` in the staging/release builds, so lint-fatal issues (e.g. an
+  `ExtraTranslation` in a `values-<lang>` file) surface there. Run `./gradlew lintVitalFullRelease`
+  locally before a release if you touched `res/`.
+- **On demand:** `app-build.yml` also runs the `StrandTests` macOS integration suite; dispatch it when
+  you change app-target Swift that no package test covers.
+- **Absent on purpose:** dependency/vuln scanning and Android instrumentation/connected tests. The
+  dependency set is small and pinned, there is no server or telemetry, and BLE/offload behavior is
+  validated **on a real strap** — compile-success proves nothing about connection behavior.
+
 ---
 
 ## The design system is the law
@@ -450,6 +474,21 @@ Schema lives in `Packages/WhoopStore/Sources/WhoopStore/Database.swift` as a **v
   add metric caches (`sleepSession`, `dailyMetric`, `metricSeries`), cursors, and more. Follow the
   same shape and naming.
 - Add a `MigrationTests` case proving the migration applies cleanly on top of the prior version.
+- **Update `schema_oracle.json` in the same PR.** Room (Android) and GRDB (iOS) must agree on the
+  resulting schema, and that agreement is pinned by a shared fixture committed in two byte-identical
+  copies (`Packages/WhoopStore/Tests/WhoopStoreTests/Resources/` and `android/app/src/test/resources/`).
+  `SchemaOracleTests.swift` compares it to GRDB's `PRAGMA table_info`; `SchemaOracleTest.kt` compares it
+  to the schema Room's KSP processor exports. Both fail on a column added to one side only, a column
+  ORDER difference, a type/nullability/DEFAULT change, a primary-key change, an index change, or a new
+  unpinned table — so a migration cannot land until the twin lands with it. A divergence that is
+  deliberate must be written into the fixture's `divergenceReasons` with the reason and what closing it
+  would cost; the suites also fail on a ledger entry that has stopped being true, so the list can only
+  shrink on purpose. Extend the oracle rather than adding a parallel mechanism (same idiom as
+  `decoder_oracle.json`).
+- **GRDB migration identifiers are `v<N>[-slug]`, strictly sequential.** GRDB keys migrations by NAME
+  and applies them in registration order, so two open PRs that both add a `v31` produce two migrations
+  claiming one number (and an exact name collision makes GRDB silently skip the second body). The
+  oracle test asserts the numbers run 1…N with no gaps or repeats: renumber when you rebase.
 
 ---
 
@@ -482,6 +521,18 @@ Schema lives in `Packages/WhoopStore/Sources/WhoopStore/Database.swift` as a **v
 - **No proprietary material.** Don't add WHOOP firmware, decompiled app code, logos, or assets, and
   don't introduce DRM circumvention. Keep contributions to clean-room interoperability with hardware
   the user owns.
+- **Facts vs code — the line that actually gets tested.** The rule above is about *code*: verbatim or
+  transcribed implementations, string literals, and assets stay out however correct they are. A
+  **protocol fact** — a byte offset, a field width, an enum value — is an observation about the wire,
+  and this project's practice is that it may be reimplemented, *provided* it is attributed and lands as an **unvalidated candidate**: decoded and
+  logged, never backing a shipped metric, until independent captures clear it. `spo2_candidate_82`
+  (v18 byte `@82`) is the worked example — sourced from a decompile, attributed as such in
+  `Interpreter.swift`, gated by a test that stops it ever writing `spo2Pct`, and still a candidate
+  because the cross-device evidence is split. See [`ATTRIBUTION.md`](../ATTRIBUTION.md).
+
+  This matters because third-party WHOOP projects are frequently decompile-derived. "It came from a
+  decompile" doesn't by itself rule a finding out; **copying their implementation does**, and so does
+  shipping a metric on an unvalidated one.
 - **Licensing.** By opening a pull request you agree your contribution is licensed under the same
   [PolyForm Noncommercial License 1.0.0](../LICENSE) as the rest of NOOP. Forks and personal,
   non-commercial use are welcome under those terms.

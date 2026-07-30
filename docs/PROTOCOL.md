@@ -25,7 +25,7 @@ CoreBluetooth-free for tests and CLI tools).
 This work builds on two community reverse-engineering efforts:
 
 - **`johnmiddleton12/my-whoop`** — WHOOP 4.0 protocol.
-- **`b-nnett/goose`** — WHOOP 5.0 ("puffin") protocol.
+- **`b-nnett/goose`** — WHOOP 5.0 fd4b ("puffin" packet framing) protocol.
 
 The canonical decode tables are bundled as a JSON resource:
 `Packages/WhoopProtocol/Sources/WhoopProtocol/Resources/whoop_protocol.json`, loaded by
@@ -63,6 +63,24 @@ The 5.0 transport ("puffin") adds a fifth characteristic (`…0007`). UUID strin
 | Custom service | `fd4b0001-cce1-4033-93ce-002d5875f58a` |
 | Command write | `fd4b0002-cce1-4033-93ce-002d5875f58a` |
 | Notify channels | `fd4b0003`, `fd4b0004`, `fd4b0005`, `fd4b0007` (`…-cce1-4033-93ce-002d5875f58a`) |
+
+NOOP's historical "puffin" label refers to this fd4b Maverick/Goose framing. Decompiled WHOOP app
+taxonomy also names a separate `PUFFIN` service family at
+`11500001-6215-11ee-8c99-0242ac120002`; NOOP names that metadata `puffin1150` to avoid confusing it
+with the implemented fd4b path.
+
+### Diagnostic-only WHOOP service families
+
+The official app also models additional WHOOP service families with the same `0001` service plus
+`0002`/`0003`/`0004`/`0005`/`0007` characteristic pattern. NOOP lists these as protocol metadata and
+logs them when advertised, but does not connect, discover characteristics, or send commands for them
+until the correct framing is mapped and hardware-tested.
+
+| Family label in NOOP | Service UUID | Current status |
+|----------------------|--------------|----------------|
+| `puffin1150` | `11500001-6215-11ee-8c99-0242ac120002` | detected but unsupported |
+| `monument` | `8a580001-2fe8-4796-9267-b87a2b0c8234` | detected but unsupported; likely Castle/Rev2 framing |
+| `symphony` | `59830001-5955-419b-bb8d-c8262926af23` | detected but unsupported; likely Castle/Rev2 framing |
 
 ### Standard SIG services (both generations)
 
@@ -170,7 +188,46 @@ public func parseFrame(_ frame: [UInt8], family: DeviceFamily) -> ParsedFrame
 `38 PUFFIN_COMMAND_RESPONSE` and `56 PUFFIN_METADATA` are aliased onto `COMMAND_RESPONSE` /
 `METADATA` by `canonicalTypeName(_:schema:)` so they never decode as "unknown".
 
-### 2.4 Checksums
+### 2.4 COMMAND_RESPONSE body
+
+Every reply to a command (`COMMAND_RESPONSE`, type 36 — and its 5/MG alias 38) opens with two bytes
+before whatever the command itself returns:
+
+```
+WHOOP 4.0    [6] resp_cmd   [7] resp_seq   [8] result   [9..] per-command body
+WHOOP 5/MG   [10] resp_cmd  [11] resp_seq  [12] result  [13..] per-command body
+```
+
+the 5/MG offsets being the 4.0 ones + 4, like the rest of the puffin inner record.
+
+- **`resp_cmd`** — the command being answered (`CommandNumber`).
+- **`resp_seq`** — the strap's own per-response counter. Not the envelope `seq` at `[5]`/`[9]`, which is
+  host-assigned and echoed back: a single capture shows envelope `seq` 147 alongside `resp_seq` 2. A
+  repeated `resp_seq` across replies is how a duplicated write was identified in #791.
+- **`result`** — `CommandResult`: `0` FAILURE, `1` SUCCESS, `2` PENDING, `3` UNSUPPORTED. `GET_DATA_RANGE`
+  answers PENDING then SUCCESS; `3` is what a real MG returned when it rejected `RUN_HAPTICS_PATTERN`
+  (#48). Both fields are decoded from the bounded payload slice, so a reply too short to carry them
+  yields neither rather than reading the CRC32 trailer (#894).
+
+**The first body byte is per-command, and is not a status flag.** `GET_BATTERY_LEVEL` puts the charge
+percentage there — `47` in the hardware-confirmed fixture — so the slot carries real data. On other
+commands it has only ever been observed as `1`:
+
+| capture | command | result | first body byte |
+|---|---|---|---:|
+| real 5/MG | `GET_BATTERY_LEVEL` | SUCCESS | **47** (= 47%) |
+| real 5/MG | `GET_DATA_RANGE` | SUCCESS | 1 |
+| real MG | `SELECT_WRIST`, accepted | SUCCESS | 1 |
+| real MG | `SELECT_WRIST`, refused | FAILURE | 1 |
+| real MG | `TOGGLE_LABRADOR_*` | SUCCESS | 1 |
+
+For the wrist and ECG commands what that `1` means is **open**. A capture that sent `SELECT_WRIST` with
+argument `0` got `1` back, which refutes an echo of the request — but every frame anyone has captured had
+a stored value of `1`, so "reads back stored state" and "this handler writes a literal `1`" make identical
+predictions on all of them. It is therefore left undecoded rather than named; settling it needs a reply
+from a strap whose stored value is `0`. See #891.
+
+### 2.5 Checksums
 
 | Algorithm | Function | Parameters |
 |-----------|----------|------------|
@@ -184,7 +241,7 @@ and `classifyHistoricalMeta(_:)` refuses to act on a frame where `p.crcOK == fal
 that gate a garbled or hostile peer could forge a `HISTORY_END`/`HISTORY_COMPLETE` and advance
 the strap's trim cursor, discarding data that was never durably stored.
 
-### 2.5 Reassembly
+### 2.6 Reassembly
 
 BLE notifications arrive as MTU-sized fragments. `Reassembler` (`Framing.swift`) accumulates
 bytes, finds the `0xAA` SOF, reads the `u16` LE length at `buf[1..3]`, and emits a complete
@@ -342,7 +399,7 @@ public func frame(seq: UInt8, payload: [UInt8] = [0x00]) -> [UInt8] {
 | 22 | `SEND_HISTORICAL_DATA` | `[0x00]` | begin offload of the type-47 store |
 | 23 | `HISTORICAL_DATA_RESULT` | `[0x01] + end_data(8)` | ack a `HISTORY_END` chunk / advance trim |
 | 26 | `GET_BATTERY_LEVEL` | `[0x00]` | battery percent; also the **bond** write |
-| 34 | `GET_DATA_RANGE` | `[0x00]` | strap's stored oldest/newest record range |
+| 34 | `GET_DATA_RANGE` | `[0x00]` | strap's stored oldest/newest record range; #689 also logs a diagnostic ring-buffer page backlog — see below |
 | 35 | `GET_HELLO_HARVARD` | `[0x00]` | identity/version hello |
 | 39 / 40 | `SET_LED_DRIVE` / `GET_LED_DRIVE` | — | optical LED drive (research) |
 | 41 / 42 | `SET_TIA_GAIN` / `GET_TIA_GAIN` | — | optical front-end gain (research) |
@@ -356,12 +413,14 @@ public func frame(seq: UInt8, payload: [UInt8] = [0x00]) -> [UInt8] {
 | 79 | `RUN_HAPTICS_PATTERN` | `[patternId, loops, 0,0,0]` | buzz a preset haptic pattern |
 | 80 | `GET_ALL_HAPTICS_PATTERN` | — | enumerate preset patterns |
 | 81 / 82 | `START_RAW_DATA` / `STOP_RAW_DATA` | `[0x01]` | raw-data collection toggle |
-| 84 | `GET_BODY_LOCATION_AND_STATUS` | — | wrist/body-location status |
+| 84 | `GET_BODY_LOCATION_AND_STATUS` | — | wrist/body-location status (read-only diagnostic probe, #690 — below) |
 | 96 / 97 | `ENTER_HIGH_FREQ_SYNC` / `EXIT_HIGH_FREQ_SYNC` | `[0x00]` | high-freq offload mode |
 | 98 | `GET_EXTENDED_BATTERY_INFO` | — | extended battery (mV etc.) |
 | 100 | `CALIBRATE_CAPSENSE` | — | recalibrate cap-touch |
 | 105 / 106 | `TOGGLE_IMU_MODE_HISTORICAL` / `TOGGLE_IMU_MODE` | `[0x01]` | IMU stream mode |
 | 107 | `ENABLE_OPTICAL_DATA` | — | optical (PPG) data |
+| 117 | `START_FF_KEY_EXCHANGE` | `[0x01]` | how many feature flags the firmware knows (read-only enumeration probe, #761 — below) |
+| 118 | `SEND_NEXT_FF` | `[0x01]` | next feature-flag NAME (cursor, not index; read-only, #761 — below) |
 | 122 | `STOP_HAPTICS` | `[0x00]` | stop an in-progress haptic |
 | 123 | `SELECT_WRIST` | — | set strap wrist |
 
@@ -390,10 +449,26 @@ On MAVERICK the clock commands also answer in the high opcode space — `SET_CLO
 and `GET_CLOCK` at 147 (0x93), alongside `GET_HELLO` at 145 (0x91) — distinct from the 4.0
 numbers (10 / 11) above.
 
-The strap further exposes an ECG/HeartKey command family (`ECG_MAIN_CONTROL`, `ECG_SEND_RAW`,
-`ECG_SAVE_RAW`, `ECG_SAVE_FILTERED`, `ECG_SELECT_WRIST`; five consecutive codes around 0x7B–0x8B),
-an `IMU_SET_DATA_STREAM` (code 106, shared with `TOGGLE_IMU_MODE`), and a `UART_DISABLE` (0x61–0x69).
-Exact codes for these are unconfirmed.
+The strap further exposes an ECG/HeartKey command family. The `CommandNumber` table carries four codes
+for it — 123 `SELECT_WRIST`, 124 `TOGGLE_LABRADOR_DATA_GENERATION`, 125 `TOGGLE_LABRADOR_RAW_SAVE`,
+139 `TOGGLE_LABRADOR_FILTERED` — which are **not** contiguous, and an earlier revision of this section
+described "five consecutive codes around 0x7B–0x8B" against five names (`ECG_MAIN_CONTROL`,
+`ECG_SEND_RAW`, `ECG_SAVE_RAW`, `ECG_SAVE_FILTERED`, `ECG_SELECT_WRIST`). Both cannot be right:
+`ECG_SEND_RAW` has no code, and 139 (0x8B) is separated from 123–125 (0x7B–0x7D). Treat the name↔code
+mapping as unconfirmed — the 5/MG is known to remap opcodes into the high space (the clock family answers
+at 145/146/147 there versus 10/11 on a 4.0), so a code that is accepted is not evidence that it means
+what the name says.
+
+What is confirmed: on a real WHOOP 5 MG (`WS50_r03`), 124, 125 and 139 are all **accepted** — each
+answers `COMMAND_RESPONSE` with result `SUCCESS(1)` — and no ECG-shaped data followed in a 30-second
+window. That is a null result with several live explanations (an open electrode circuit, flash rather
+than a realtime channel, a wrong opcode mapping, no start verb, a flag block, an entitlement gate); see
+#891. **NOOP does not send any of these** — none is in the sender enum on either platform, and the 5/MG
+send path is an allowlist. The three reply frames are pinned as decode fixtures in
+`Whoop5CommandResponseTests` / `CommandCatalogueTest`.
+
+The strap also exposes an `IMU_SET_DATA_STREAM` (code 106, shared with `TOGGLE_IMU_MODE`) and a
+`UART_DISABLE` (0x61–0x69). Exact codes for these are unconfirmed.
 
 ### Destructive commands — *do not send*
 
@@ -409,6 +484,14 @@ data, brick, or power-cycle the strap. NOOP must never send them.
 | 38 | `PROCESS_FIRMWARE_IMAGE` | firmware write |
 | 45 | `ENTER_BLE_DFU` | enters DFU bootloader |
 | 99 | `RESET_FUEL_GAUGE` | resets battery fuel gauge |
+| 142 | `START_FIRMWARE_LOAD_NEW` | firmware write |
+| 143 | `LOAD_FIRMWARE_DATA_NEW` | firmware write |
+| 144 | `PROCESS_FIRMWARE_IMAGE_NEW` | firmware write |
+
+The 142–144 family is the high-opcode-space counterpart of 36/37/38, in the same style as the clock
+family answering at 145–147 on MAVERICK. It is named by the schema and absent from the sender enum on
+both platforms; it was missing from this table, so nothing recorded that it must stay that way. (83
+`VERIFY_FIRMWARE_IMAGE` is part of the same flow but is not itself a write, and is likewise unsent.)
 
 **Two guarded exceptions — both restarts, both non-destructive** (a restart keeps the strap's stored
 data and just re-advertises after boot). Neither is ever sent automatically or on any connect/offload path.
@@ -430,6 +513,106 @@ one non-destructive candidate at a time — `REBOOT_STRAP(29)` empty, `POWER_CYC
 link (worked) vs is ignored. The definitive fix is still an HCI capture of the official app rebooting a
 4.0 (the way the alarm frame was pinned, #535). Driven by `BLEManager.rebootProbe(_:)` /
 `WhoopBleClient.rebootProbe(...)`; candidates enumerated in `RebootProbeVariant`.
+
+**Body-location probe (#690).** A read-only, user-triggered diagnostic (Test Centre → Connection, both
+families) that sends `GET_BODY_LOCATION_AND_STATUS` (84 / `0x54`) and dumps the strap's full raw
+COMMAND_RESPONSE to the strap log + a copyable dialog. The 4-byte inner-payload record is
+`revision · location · confidence · status`; `location` maps `0 UNKNOWN, 1 WRIST, 2 BICEP, 3 CALF,
+4 SIDE_TORSO, 5 GLUTE, 7 ANKLE, 128 NOT_CONCLUSIVE, 160 UNKNOWN_GARMENT` (any other value — including the
+gap at 6 — is kept raw; `confidence`/`status` stay raw until captures establish their semantics). Decoded
+only on WHOOP 4.0, where the inner payload starts at the command byte + 1; on 5/MG the puffin envelope's
+result code sits where `location` would land, so the raw grid is shown and the record is left undecoded
+until a real 5/MG capture maps the offset. **Never** feeds wear detection, sleep gating, or scoring.
+Driven by `BLEManager.probeBodyLocationAndStatus()` / `WhoopBleClient.probeBodyLocationAndStatus()`;
+formatted by the pure `BodyLocationProbe` twin (Swift↔Kotlin byte-parity locked by a golden test). The
+layout + enum facts are reverse-engineered from the WHOOP app and reimplemented in NOOP's own code
+(facts, not copied expression — see [`ATTRIBUTION.md`](../ATTRIBUTION.md)).
+
+**Feature-flag enumeration probe (#761, read-only).** NOOP has always been able to WRITE a feature flag
+(`SET_FF_VALUE` / 120, the R22 unlock in `Whoop5Config`) but never to ASK a strap which flags it knows.
+The `CommandNumber` table names a full symmetric read side that was never implemented — 117
+`START_FF_KEY_EXCHANGE` / 118 `SEND_NEXT_FF` for feature flags, 115 / 116 for device config — and this
+probe uses the enumerate pair only: **names, no values, nothing written.** `GET_FF_VALUE` (128) is
+deliberately not sent: the only hands-on report of it (`johnmiddleton12/wearable`, run on the author's
+own WHOOP 4.0 on fw 41.16.6.0) states its reply's value field is contaminated by a stale shared buffer,
+so an on/off read is unreliable; the same session ran the 117→118 loop and got a complete key dump.
+
+Request bodies are `[0x01]` (the inner b3 byte the SET_CONFIG family and `GET_HELLO` use); 118's body is
+a **cursor, not an index**, so the same frame is repeated to walk the list. The reply is an ordinary
+COMMAND_RESPONSE whose record sits behind the 2-byte response header (`pay[1]` is the 5/MG result code) —
+the same `pay[2]` record start `GET_BATTERY_LEVEL` and `GET_CLOCK` already decode from:
+
+| Command | Record (from `pay[2]`) |
+|---|---|
+| 117 `START_FF_KEY_EXCHANGE` | `revision u8` · `numberOfFeatureFlags u16 LE` · padding |
+| 118 `SEND_NEXT_FF` | `revision u8` · `index u8` · `validKey u8` · `key` (ASCII, NUL-terminated) · padding |
+
+The walk stops on the strap's own end marker (`validKey = 0`, or `index = 0xFF`), on the announced count,
+or on a hard cap of 128 replies — and each 118 is only sent after the previous reply lands. Both CRCs are
+verified before any field is read; a failed CRC, a non-COMMAND_RESPONSE type, or a short record ends the
+walk with a named reason instead of a decode. Driven by `BLEManager.probeFeatureFlags()` /
+`WhoopBleClient.probeFeatureFlags()` (user-triggered, Test Centre → Connection, both families) and
+allowlisted for 5/MG framing **only while a probe is in flight**; parsed + rendered by the pure
+`FeatureFlagProbe` / `FeatureFlagProbeReport` twins (Swift↔Kotlin byte-parity, unit-tested on synthetic
+frames). Result goes to a copyable dialog + the strap log; no storage. The field order and opcode numbers
+are facts read off a decompiled official client's response types and corroborated by that 4.0 dump,
+reimplemented in NOOP's own code — facts, not copied expression (see [`ATTRIBUTION.md`](../ATTRIBUTION.md)).
+**Unverified on 5/MG:** the published key dump is a 4.0's R19-era list; whether a 5/MG answers 117 at all
+is what the probe exists to establish (§10).
+
+**Device-config read probe (#103, read-only).** The #761 follow-up: that probe asked the strap for key
+NAMES, this one asks for a named key's VALUE — and it reaches the namespace 117/118 never covered. NOOP
+writes config through two different verbs into two different namespaces (`SET_FF_VALUE` / 120 for the
+sixteen R22 feature flags in `Whoop5Config.enableR22Sequence`, `SET_DEVICE_CONFIG_VALUE` / 119 for the
+Broadcast-HR key, #181) and has never read either. The `CommandNumber` table names the read side of both:
+121 `GET_DEVICE_CONFIG_VALUE` and 128 `GET_FF_VALUE`.
+
+**Both opcodes may simply not be implemented.** A number in the table is not a served verb — opcode 96
+(`ENTER_HIGH_FREQ_HISTORICAL_MODE`) is the standing example of one nothing in the wild sends. So the
+probe's primary deliverable is a per-verb verdict — **answered**, **rejected as UNSUPPORTED**, or
+**silent** — and a clean "neither verb is served" is a useful result, not a failure. It spends exactly one
+round-trip per verb establishing that (128 against a flag NOOP writes, 121 against the known-good
+Broadcast-HR key) before doing anything else; a verb that is refused, silent or undecodable is **retired**,
+so a dead verb costs one 8 s window rather than one per key.
+
+Only a verb that answers goes on to read values: the sixteen known flag names (whose values NOOP has only
+ever written, never read), then a short list of **guessed** oxygen-related key names against the
+device-config namespace — `DeviceConfigReadProbe.oxygenCandidateKeys`, the one constant to extend, and
+labelled as guesses everywhere they surface. That list is the #103 question in probe form: the byte at
+deep-record offset 82 reads as real SpO2 on some straps and flat `0x00` on others, which is what a
+subscription gate would look like, and a config key governing it would sit in the device-config namespace.
+
+Request body is `[0x01]` (the inner b3 byte) + the key as ASCII NUL-padded to 32 bytes — the SET side's own
+name field minus its value byte. That shape is **inferred from the SET side, not observed**; if it is wrong
+the strap answers FAILURE or nothing, which the report says plainly. The reply is an ordinary
+COMMAND_RESPONSE whose record sits behind the 2-byte response header, and **beyond that offset no field
+layout is assumed**: the record is reported as raw hex. A value is only ever *claimed* when the reply
+echoes the requested key inside a 32-byte NUL-padded field, in which case the byte immediately after that
+field is the value — the SET layout, checked rather than assumed. (On 5/MG the puffin envelope pads the
+inner payload to a 4-byte boundary, so trailing NULs in a record are envelope padding; reading "the byte
+after the echoed field" rather than "the last byte" is what keeps that out of the answer.)
+
+Read-only by construction. `DeviceConfigReadProbe.readOnlyOpcodes` is `{121, 128}` and
+`isReadOnlyOpcode` is the *same predicate* the 5/MG `send()` allowlist consults — admitting them only
+while a probe is in flight — so the "119/120 are never sent from this path" claim is a unit-tested property
+of the allowlist rather than a comment. The plan is capped at 64 round-trips. Driven by
+`BLEManager.probeDeviceConfigValues()` / `WhoopBleClient.probeDeviceConfigValues()` (user-triggered, Test
+Centre → Connection, both families); parsed + planned + rendered by the pure `DeviceConfigReadProbe` /
+`DeviceConfigReadProbeReport` twins (Swift↔Kotlin byte-parity, unit-tested on synthetic frames). Result
+goes to a copyable dialog + the strap log; no storage. The opcode numbers come from this repo's own
+protocol table (`Resources/whoop_protocol.json`). **Unverified on any strap:** nothing in this project has
+ever had 121 or 128 answered.
+
+**GET_DATA_RANGE ring backlog (#689, diagnostic only).** Beyond the oldest/newest timestamps NOOP already
+scans from a `GET_DATA_RANGE` reply, the app computes a ring-buffer page backlog from three u32s in the
+command-response inner payload (whose byte 0 is a subtype): write page `W = V(2)`, read pointer `U = V(3)`,
+ring capacity `T = V(5)`, where `V(i)` is the u32 at inner offset `i·4 + 1` (frame offsets `cmdOff + 10/14/22`
+here). Backlog with wraparound: `W < U ? W + (T − U) : W − U`. `DataRange.pagesBehind` (Swift + Kotlin twins,
+byte-parity, unit-tested for normal / wraparound / too-short / implausible) logs `Strap backlog pages behind:
+N` when it decodes plausibly — read u32 LE, guarded on frame length + a capacity sanity ceiling. **Never**
+gates sync or backfill: the layout is RE'd from the WHOOP app (facts, reimplemented in NOOP's own code, see
+[`ATTRIBUTION.md`](../ATTRIBUTION.md)) but **not yet confirmed against real 4.0 / 5-MG captures**, so it stays
+a log-only diagnostic until a fixture pins the offsets + endianness.
 
 **Payload forms** (decoded from the official app's command builders — recorded so the wire format is
 *known*: for the destructive commands, known-and-avoidable; for the one guarded exception,
@@ -562,7 +745,61 @@ inherit a base layout and override only what changed. The streamed decode that f
 
 ---
 
-## 9. File map
+## 9. WHOOP 5.0 vs MG — telling the hardware apart
+
+Both labels share the `fd4b…` GATT family and the same puffin envelope: framing, CRC, offload and
+historical decode are **identical**, and `DeviceFamily.whoop5` covers both. What differs is hardware —
+an MG carries the ECG-conductive clasp, a 5.0 does not.
+
+`Whoop5Variant` resolves it from the standard BLE Device Information Service (`BLEManager` discovers
+both characteristics as `disSerialChar` / `disHwRevChar`), deliberately orthogonal to `DeviceFamily` so
+a capability gate can never change how a frame is parsed:
+
+| Signal | DIS characteristic | Reads |
+|---|---|---|
+| Serial prefix `5AM` | Serial Number String (`0x2A25`) | MG |
+| Serial prefix `5AG` | Serial Number String (`0x2A25`) | 5.0 |
+| Hardware revision contains `WG50` | Hardware Revision String (`0x2A27`) | 5.0 |
+
+Contradictory signals resolve to `.unknown` rather than a guess, and `.unknown` is not MG — an MG-only
+feature stays gated off until the hardware attests to it. Only the 5.0 hardware string is attested on
+real hardware so far; the MG's own revision string is not, so its absence proves nothing.
+
+## 10. SpO₂ on 5.0 / MG — what the wire does and does not carry
+
+Recorded because "why is there no blood oxygen?" is a recurring question with a protocol answer.
+
+- **No SpO₂ read opcode is known.** Our `CommandNumber` catalogue carries 80 commands and none is an
+  oxygen/blood-oxygen read; independent RE reports none either. Note the catalogue is what we have
+  mapped, not a proof of the strap's whole command space — §6 is explicitly a *safe subset*, and the
+  98-vs-87 battery dispute shows the map is incomplete. Treat it as "nobody has found one", which is
+  still enough to say hunting for a missing opcode is the wrong lead.
+- **It is computed on-device, during sleep.** Our own decode corroborates the gating: `aux_byte_82` is
+  observed nonzero *only* while the band sleep flag reads asleep. Expect values in overnight windows,
+  never a continuous 24/7 series.
+- **The export is a per-cycle aggregate.** `blood_oxygen_pct` arrives on the physiological-cycles row —
+  our own importer reads it beside `recovery_score_pct` and `day_strain`, keyed on
+  `cycleStart`/`cycleEnd` (`WhoopExportImporter.swift:272`) — so it is one value per recovery cycle and
+  will not equal a plain mean of raw wire samples. Rounding, quality gates and incomplete nights all
+  move it.
+- **A night with no export value is a real gap**, not a NOOP bug — naps and incomplete nights are
+  reported to carry none. (Contributor observation from #807, not something this repo can verify from
+  the wire; recorded because "my SpO₂ is missing" reads as a decode failure otherwise.)
+
+- **Whether a firmware FLAG gates it is now answerable from the strap itself.** The read-only
+  feature-flag enumeration probe (§6, #761) asks the strap to list the flag names its own firmware
+  knows. A 5/MG list with no oxygen-related key is evidence Blood Oxygen is not client-writable at all;
+  a list containing one is the answer outright. That is a direct read, not an inference from a byte that
+  happens to be zero — the same move the Oura `spo2_status` probe already makes for the ring.
+
+So the research target is finding the banked on-device sample in the historical type-47 record — not
+inventing a red/IR ratio or reversing a calibration curve. The v18 `@82` candidate and its split
+cross-device evidence are covered in
+[`WHOOP5_DEEP_DATA.md`](WHOOP5_DEEP_DATA.md); the full v18 field map lives in
+[`BLE_REVERSE_ENGINEERING.md`](BLE_REVERSE_ENGINEERING.md#the-whoop-50-type-47-record-version-18) and
+is deliberately **not** duplicated here — one table, one place to keep correct.
+
+## 11. File map
 
 | Path | Responsibility |
 |------|----------------|

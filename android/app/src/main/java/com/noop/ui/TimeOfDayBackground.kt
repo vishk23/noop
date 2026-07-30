@@ -1,5 +1,7 @@
 package com.noop.ui
 
+import com.noop.R
+import androidx.compose.ui.res.stringResource
 import androidx.compose.animation.core.LinearEasing
 import androidx.compose.animation.core.RepeatMode
 import androidx.compose.animation.core.animateFloat
@@ -143,8 +145,8 @@ fun Modifier.timeOfDayBackground(
  *  Reduce Motion, so the whole layer is static. One slow loop (~80s) so the system has near-zero work. */
 @Composable
 private fun atmospherePhase(animated: Boolean): Float {
-    val reduced = rememberReduceMotion()
-    if (!animated || reduced) return 0f
+    val renderStill = rememberPoseStill()
+    if (!animated || renderStill) return 0f
     val transition = rememberInfiniteTransition(label = "atmosphere")
     val phase by transition.animateFloat(
         initialValue = 0f,
@@ -153,7 +155,7 @@ private fun atmospherePhase(animated: Boolean): Float {
             animation = tween(durationMillis = 80_000, easing = LinearEasing),
             repeatMode = RepeatMode.Restart,
         ),
-        label = "atmospherePhase",
+        label = uiString(R.string.l10n_time_of_day_background_atmospherephase_5ce21300),
     )
     return phase
 }
