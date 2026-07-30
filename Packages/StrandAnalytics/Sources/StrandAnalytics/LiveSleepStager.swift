@@ -40,8 +40,15 @@ public struct LiveStageDecision: Equatable, Sendable {
 }
 
 /// Produces a per-stage log-emission from one normalised causal epoch.
+///
+/// `minutesSinceOnset` is the REM-latency guard's clock (#930). V2 obtains it by staging the whole night
+/// once with the guard disabled, reading `sustainedSleepOnset` out of the result, and re-running Viterbi —
+/// a second whole-night pass this stager cannot make. The causal substitute is described on
+/// `LiveSleepStager.onsetMinutes`; until onset is established the caller passes 0, which is the guard at
+/// FULL penalty, i.e. "REM is not expected yet".
 public protocol LiveEmissionModel {
-    func logEmissions(_ n: CausalSleepFeatureExtractor.Normalised) -> [String: Double]
+    func logEmissions(_ n: CausalSleepFeatureExtractor.Normalised,
+                      minutesSinceOnset: Double) -> [String: Double]
 }
 
 /// `SleepStagerV2`'s emission recipe, evaluated causally.
@@ -59,7 +66,8 @@ public struct RecipeEmissionModel: LiveEmissionModel, Sendable {
         n.moveFrac <= 0.0 && n.jerkRatio <= SleepStagerV2.jerkFloorGateMult
     }
 
-    public func logEmissions(_ n: CausalSleepFeatureExtractor.Normalised) -> [String: Double] {
+    public func logEmissions(_ n: CausalSleepFeatureExtractor.Normalised,
+                             minutesSinceOnset: Double) -> [String: Double] {
         let gate = SleepStagerV2.deepGateSlope * max(0.0, n.flatPercentile - SleepStagerV2.deepGateThresh)
         let awakeCardiac0: Double = 0.8 * n.zHRVar + 0.4 * n.zHR
         let awakeCardiac: Double = Self.motionQuiescent(n) ? min(0.0, awakeCardiac0) : awakeCardiac0
@@ -72,7 +80,7 @@ public struct RecipeEmissionModel: LiveEmissionModel, Sendable {
         let awake: Double = 1.0 * n.zMove + awakeCardiac + SleepStagerV2.baseLogPrior["awake"]!
 
         var em: [String: Double] = ["deep": deep, "rem": rem, "light": light, "awake": awake]
-        let pr = SleepStagerV2.cyclePrior(n.clock)
+        let pr = SleepStagerV2.cyclePrior(n.clock, minutesSinceOnset)
         for s in SleepStagerV2.stageNames { em[s]! += pr[s]! }
         if n.jerkRatio > SleepStagerV2.jerkFloorGateMult { em["awake"]! += SleepStagerV2.motionGateBoost }
         if n.hasRespReg {
@@ -146,7 +154,12 @@ public struct LogisticEmissionModel: LiveEmissionModel, Equatable, Sendable, Cod
 
     public static let featureCount = 16
 
-    public func logEmissions(_ n: CausalSleepFeatureExtractor.Normalised) -> [String: Double] {
+    /// `minutesSinceOnset` is deliberately UNUSED: this model learns its own temporal prior from the
+    /// `clock` / `earlyNight` columns of `featureVector`, so injecting the hand-tuned guard on top would
+    /// double-count it. The parameter stays in the signature so both models satisfy one protocol and the
+    /// forward filter needs no special case.
+    public func logEmissions(_ n: CausalSleepFeatureExtractor.Normalised,
+                             minutesSinceOnset: Double) -> [String: Double] {
         let x = Self.featureVector(n, temporal: usesTemporalPrior)
         var out: [String: Double] = [:]
         for (i, s) in SleepStagerV2.stageNames.enumerated() {
@@ -188,6 +201,24 @@ public final class LiveSleepStager {
     /// Running log-posterior over stages. nil before the first epoch (the filter starts uniform).
     private var logAlpha: [String: Double]?
 
+    /// Elapsed minutes at the epoch that began the first sustained sleep run, once one has been seen.
+    ///
+    /// V2 finds this by staging the whole night with the REM-latency guard disabled and reading
+    /// `sustainedSleepOnset` out of that first pass (#930). A live stager has no first pass — but the RULE
+    /// is causal: "the first epoch of `onsetSustainedEpochs` consecutive non-wake labels" is decidable the
+    /// moment the run's last epoch closes, from labels already emitted. So the run is counted forward and
+    /// onset is stamped at the run's START, which is 10 epochs (5 min) in the PAST — no future data is read.
+    ///
+    /// TWO honest differences from V2, neither of them a lookahead:
+    ///  * The 9 epochs before onset is confirmed were already scored with the guard at full penalty, and are
+    ///    NOT retroactively re-scored — that would be the backward pass this whole file exists to avoid.
+    ///  * V2 reads onset from labels staged with the guard OFF; these labels have it ON. The guard only ever
+    ///    lowers REM's emission, and the onset rule tests wake-vs-not-wake, so the two agree except where
+    ///    suppressing REM lets "awake" take the argmax outright.
+    public private(set) var onsetMinutes: Double?
+    private var sleepRun = 0
+    private var runStartMinutes: Double?
+
     public private(set) var decisions: [LiveStageDecision] = []
 
     public init(priors: PersonalSleepPriors, sessionStart: Int, config: Config = Config()) {
@@ -212,12 +243,27 @@ public final class LiveSleepStager {
         var out: [LiveStageDecision] = []
         for s in extractor.advance(to: now) {
             let f = s.epoch
-            let em = emission.logEmissions(s.normalised)
+            let elapsedMin = Double(f.elapsedSec) / 60.0
+            // Guard clock: minutes since the onset we have ALREADY established. Before that, 0 — which is
+            // `remLatencyGuard` at full strength, the correct prior for "sleep has not been confirmed yet".
+            let sinceOnset = onsetMinutes.map { elapsedMin - $0 } ?? 0.0
+            let em = emission.logEmissions(s.normalised, minutesSinceOnset: sinceOnset)
             let post = step(emission: em)
             var best = SleepStagerV2.stageNames[0]
             var bestP = post[best] ?? 0
             for s in SleepStagerV2.stageNames.dropFirst() where (post[s] ?? 0) > bestP {
                 bestP = post[s] ?? 0; best = s
+            }
+            // Advance the sustained-sleep run on the label just emitted. Onset latches once and never moves,
+            // so a later awakening cannot retro-date the guard.
+            if onsetMinutes == nil {
+                if best == "awake" {
+                    sleepRun = 0; runStartMinutes = nil
+                } else {
+                    if sleepRun == 0 { runStartMinutes = elapsedMin }
+                    sleepRun += 1
+                    if sleepRun >= SleepStagerV2.onsetSustainedEpochs { onsetMinutes = runStartMinutes }
+                }
             }
             let d = LiveStageDecision(epochStart: f.start,
                                       stage: best == "awake" ? "wake" : best,

@@ -339,8 +339,9 @@ final class LiveSleepStagerTests: XCTestCase {
             zHR: 0, zHRVar: 0, zMove: 0, zRespReg: 0, hasRespReg: false,
             flatPercentile: SleepStagerV2.deepGateThresh, clock: 0.5,
             jerkRatio: 0, moveFrac: 0, adaptWeight: 1)
-        let em = m.logEmissions(n)
-        let pr = SleepStagerV2.cyclePrior(0.5)
+        // Onset an hour back, so `remLatencyGuard` is fully spent and the neutral emission is base + cycle.
+        let em = m.logEmissions(n, minutesSinceOnset: SleepStagerV2.remLatencyMinutes)
+        let pr = SleepStagerV2.cyclePrior(0.5, SleepStagerV2.remLatencyMinutes)
         // With every z at 0 and the gate exactly at threshold, each emission is base prior + cycle prior.
         // `awake` additionally keeps its motion-quiescent clamp, which cannot lower a zero cardiac term.
         for s in SleepStagerV2.stageNames {
@@ -356,12 +357,73 @@ final class LiveSleepStagerTests: XCTestCase {
         func em(moveFrac: Double, jerkRatio: Double) -> Double {
             m.logEmissions(.init(zHR: 2.0, zHRVar: 2.0, zMove: 0, zRespReg: 0, hasRespReg: false,
                                  flatPercentile: 0.5, clock: 0.5,
-                                 jerkRatio: jerkRatio, moveFrac: moveFrac, adaptWeight: 1))["awake"]!
+                                 jerkRatio: jerkRatio, moveFrac: moveFrac, adaptWeight: 1),
+                           minutesSinceOnset: SleepStagerV2.remLatencyMinutes)["awake"]!
         }
         let still = em(moveFrac: 0, jerkRatio: 1)
         let moved = em(moveFrac: 0.3, jerkRatio: 1)
         XCTAssertLessThan(still, moved,
                           "a motionless epoch with a raised HR must score lower on wake than a moving one")
+    }
+
+    // MARK: - Causal sleep onset (the REM-latency guard's clock, #930)
+
+    /// V2 finds sleep onset by staging the whole night with the guard off and re-running Viterbi. The live
+    /// stager has to latch it forward, from labels it has already emitted. Onset must appear, and must be
+    /// stamped at the START of the sustained run rather than at the epoch that completed it.
+    func testOnsetLatchesAtTheStartOfTheSustainedRun() {
+        let n = SyntheticNight(hours: 6)
+        let s = LiveSleepStager(priors: .coldStart, sessionStart: n.start)
+        s.ingest(hr: n.hr); s.ingest(rr: n.rr); s.ingest(gravity: n.grav)
+        s.advance(to: n.end)
+        guard let onset = s.onsetMinutes else {
+            return XCTFail("a 6-hour night must establish sleep onset")
+        }
+        // The run that establishes onset is `onsetSustainedEpochs` long, so onset can never be later than
+        // the first non-wake decision, and must coincide with one.
+        let firstSleep = s.decisions.first { $0.stage != "wake" }
+        XCTAssertNotNil(firstSleep)
+        XCTAssertGreaterThanOrEqual(onset, Double(firstSleep!.elapsedSec) / 60.0 - 1e-9,
+                                    "onset cannot precede the first non-wake decision")
+        let atOnset = s.decisions.first { abs(Double($0.elapsedSec) / 60.0 - onset) < 1e-9 }
+        XCTAssertNotNil(atOnset, "onset must land on an epoch the stager actually emitted")
+        XCTAssertNotEqual(atOnset?.stage, "wake", "onset must be stamped on a non-wake epoch")
+    }
+
+    /// Onset latches ONCE. A later awakening must not re-date it, or the REM-latency guard would come back
+    /// and suppress REM in the second half of the night.
+    func testOnsetNeverMovesOnceEstablished() {
+        let n = SyntheticNight(hours: 6)
+        let s = LiveSleepStager(priors: .coldStart, sessionStart: n.start)
+        var seen: [Double] = []
+        var t = n.start
+        while t < n.end {
+            let bound = min(n.end, t + 1800)
+            s.ingest(hr: n.hr.filter { $0.ts >= t && $0.ts < bound })
+            s.ingest(rr: n.rr.filter { $0.ts >= t && $0.ts < bound })
+            s.ingest(gravity: n.grav.filter { $0.ts >= t && $0.ts < bound })
+            s.advance(to: bound)
+            if let o = s.onsetMinutes { seen.append(o) }
+            t = bound
+        }
+        XCTAssertFalse(seen.isEmpty, "onset must be established at some point")
+        XCTAssertEqual(Set(seen).count, 1, "onset moved after being established: \(Set(seen).sorted())")
+    }
+
+    /// Before onset is established the guard runs at FULL penalty, so REM must be strictly less likely than
+    /// it would be with onset an hour in the past. This pins the direction of the substitution rather than a
+    /// value, so a re-tune of `remLatencyPenalty` moves the test with the recipe.
+    func testPreOnsetSuppressesREMRelativeToAnEstablishedOnset() {
+        let m = RecipeEmissionModel()
+        let n = CausalSleepFeatureExtractor.Normalised(
+            zHR: 0.5, zHRVar: 1.5, zMove: -0.5, zRespReg: 0, hasRespReg: false,
+            flatPercentile: 0.5, clock: 0.5, jerkRatio: 0, moveFrac: 0, adaptWeight: 1)
+        let preOnset = m.logEmissions(n, minutesSinceOnset: 0)["rem"]!
+        let settled = m.logEmissions(n, minutesSinceOnset: SleepStagerV2.remLatencyMinutes)["rem"]!
+        XCTAssertLessThan(preOnset, settled,
+                          "an unconfirmed onset must suppress REM, not licence it")
+        XCTAssertEqual(settled - preOnset, SleepStagerV2.remLatencyPenalty, accuracy: 1e-12,
+                       "the gap must be exactly V2's own penalty, not a copy of it")
     }
 
     // MARK: - Learned model
