@@ -66,6 +66,17 @@ def _is_doc_open(line: str) -> bool:
     return s.startswith("/**") and s != "/**/"
 
 
+def _after_close(line: str, search_from: int = 0) -> int:
+    """Column just past this line's `*/`, or -1 if the block does not close here.
+
+    Deliberately `in`, not `endswith`: a close may carry code after it on the same
+    line (`*/restored: Bool,`). Requiring `*/` to be LAST makes the walk skip its
+    own block's close and run on to the next unrelated one — see `findings`.
+    """
+    j = line.find("*/", search_from)
+    return -1 if j < 0 else j + 2
+
+
 def findings(path: Path) -> list[tuple[int, str]]:
     """(1-indexed line, reason) for every detached doc block in one file."""
     lines = path.read_text(errors="ignore").splitlines()
@@ -76,14 +87,25 @@ def findings(path: Path) -> list[tuple[int, str]]:
             i += 1
             continue
         start = i
-        # Walk to the block's close. A single-line `/** … */` closes on its own line.
+        # Walk to the block's close, stopping at the first line that CONTAINS `*/`. Stopping only
+        # at one that ENDS with it steps over a close that has code after it and lands on the next
+        # unrelated close, which invents a finding here AND consumes every real site in between —
+        # a false negative in exactly the case this gate exists for.
         end = start
-        if not lines[start].strip().endswith("*/") or lines[start].strip() == "/**":
+        past = _after_close(lines[start], lines[start].find("/**") + 3)
+        while past < 0:
             end += 1
-            while end < len(lines) and not lines[end].strip().endswith("*/"):
-                end += 1
             if end >= len(lines):
                 break  # unterminated block — a compile error, not this tool's business
+            past = _after_close(lines[end])
+        if past < 0:
+            break
+
+        # Code on the closing line itself is what the block documents — uniffi emits parameter docs
+        # this way (`*/restored: Bool,`). Bound, so there is nothing to report.
+        if lines[end][past:].strip():
+            i = end + 1
+            continue
 
         nxt = end + 1
         if nxt < len(lines):
