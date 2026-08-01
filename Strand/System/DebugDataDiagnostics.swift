@@ -143,8 +143,14 @@ enum DebugDataDiagnostics {
         // the window as a whole has enough in-band samples for analyzeDay to learn a device anchor.
         let windowSkin = (try? await store.skinTempSamples(deviceId: did, from: nowSec - 14 * 86400, to: nowSec, limit: 200_000)) ?? []
         let devAnchor = family == .whoop4 ? Whoop4SkinTemp.deviceAnchorRaw(windowSkin.map { $0.raw }) : nil
-        lines.append(AnalyticsEngine.skinTempFunnel([det], hr: hr, skinTemp: skin,
-                                                    family: family, anchorRaw: devAnchor).summary)
+        // Same on-charger exclusion the real computation applies, so this funnel keeps explaining the SAME
+        // mean the app uses (its whole contract) instead of diverging on any night with a charge in it.
+        let nightEvents = (try? await store.events(deviceId: did, from: cs.startTs, to: cs.endTs,
+                                                   limit: 50_000)) ?? []
+        lines.append(AnalyticsEngine.skinTempFunnel(
+            [det], hr: hr, skinTemp: skin, family: family, anchorRaw: devAnchor,
+            chargeIntervals: AnalyticsEngine.chargeIntervals(events: nightEvents,
+                                                             windowEnd: cs.endTs)).summary)
         return lines
     }
 
