@@ -88559,10 +88559,110 @@
       }
     },
     "NOOP is not a medical device and this is not an ECG test. Anything the strap reports here — including any heart-rhythm classification it happens to send — is unvalidated instrumentation for protocol research, not a measurement and not a diagnosis. Never use it to make a decision about your health. If you have symptoms or are worried about your heart, talk to a doctor.": {
-      "comment": "MEDICAL SAFETY COPY — needs a native speaker, not a machine translation. Deliberately left untranslated: a disclaimer that drifts in meaning is worse than one shown in English. Until a human translates it, the absent localizations make the runtime fall back to this English source text, which is correct and complete. Keep every element when translating: not a medical device, not a diagnosis, and the instruction to see a doctor."
+      "comment": "MEDICAL SAFETY COPY — needs a native speaker, not a machine translation. Deliberately left untranslated: a disclaimer that drifts in meaning is worse than one shown in English. Until a human translates it, the absent localizations make the runtime fall back to this English source text, which is correct and complete. Keep every element when translating: not a medical device, not a diagnosis, and the instruction to see a doctor.",
+      "localizations": {
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "NOOP ist kein Medizinprodukt und dies ist kein EKG-Test. Alles, was das Band hier meldet — einschließlich einer etwaigen Herzrhythmus-Klassifizierung, die es zufällig sendet — ist unvalidierte Messtechnik für Protokollforschung, keine Messung und keine Diagnose. Triff damit niemals eine Entscheidung über deine Gesundheit. Wenn du Symptome hast oder dir Sorgen um dein Herz machst, sprich mit einer Ärztin oder einem Arzt."
+          }
+        },
+        "fr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "NOOP n'est pas un dispositif médical et ceci n'est pas un test ECG. Tout ce que le bracelet rapporte ici — y compris toute classification du rythme cardiaque qu'il pourrait envoyer — relève d'une instrumentation non validée destinée à la recherche sur le protocole ; ce n'est ni une mesure ni un diagnostic. Ne vous en servez jamais pour prendre une décision concernant votre santé. Si vous avez des symptômes ou si vous êtes inquiet pour votre cœur, parlez-en à un médecin."
+          }
+        },
+        "es": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "NOOP no es un dispositivo médico y esto no es una prueba de ECG. Todo lo que la banda informe aquí — incluida cualquier clasificación del ritmo cardíaco que llegue a enviar — es instrumentación no validada para investigación del protocolo, no es una medición ni un diagnóstico. Nunca lo uses para tomar una decisión sobre tu salud. Si tienes síntomas o te preocupa tu corazón, habla con un médico."
+          }
+        },
+        "pt-PT": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "O NOOP não é um dispositivo médico e isto não é um teste de ECG. Tudo o que a pulseira comunicar aqui — incluindo qualquer classificação do ritmo cardíaco que venha a enviar — é instrumentação não validada para investigação do protocolo, não é uma medição nem um diagnóstico. Nunca o uses para tomar uma decisão sobre a tua saúde. Se tiveres sintomas ou estiveres preocupado com o teu coração, fala com um médico."
+          }
+        },
+        "it": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "NOOP non è un dispositivo medico e questo non è un esame ECG. Tutto ciò che il braccialetto riporta qui — inclusa qualsiasi classificazione del ritmo cardiaco che dovesse inviare — è strumentazione non convalidata per la ricerca sul protocollo, non è una misurazione né una diagnosi. Non usarlo mai per prendere una decisione sulla tua salute. Se hai sintomi o sei preoccupato per il tuo cuore, parlane con un medico."
+          }
+        },
+        "ru": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "NOOP не является медицинским устройством, и это не ЭКГ-исследование. Всё, что браслет сообщает здесь, — включая любую классификацию сердечного ритма, которую он может прислать, — это неподтверждённые измерения для исследования протокола, а не измерение и не диагноз. Никогда не принимайте на их основе решения о своём здоровье. Если у вас есть симптомы или вы беспокоитесь о сердце, обратитесь к врачу."
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "NOOP 不是医疗设备，这也不是心电图检查。手环在此处报告的任何内容（包括它可能发送的任何心律分类）都是用于协议研究的未经验证的实验性测量，既不是测量结果，也不是诊断。切勿据此做出任何健康决定。如果你有症状或担心自己的心脏，请咨询医生。"
+          }
+        },
+        "zh-Hant": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "NOOP 不是醫療裝置，這也不是心電圖檢查。手環在此處回報的任何內容（包括它可能傳送的任何心律分類）都是用於協定研究的未經驗證實驗性測量，既不是測量結果，也不是診斷。切勿據此做出任何健康決定。如果你有症狀或擔心自己的心臟，請諮詢醫生。"
+          }
+        }
+      }
     },
     "NOOP is not a medical device and this is not an ECG test. It asks your MG to start its ECG subsystem and logs whatever comes back — unvalidated instrumentation for protocol research, never a measurement or a diagnosis, including any heart-rhythm classification the strap happens to send. Don't use it to make a health decision; see a doctor if you have symptoms.\n\nHold the two indents on the clasp with the fingers of your other hand for the whole capture. The MG measures across your wrist AND that clasp, so until you hold it the circuit is open, the strap has nothing to record, and you would see zero packets whatever the firmware did.\n\nNobody has confirmed a strap honours these commands, so the likely outcome is that nothing happens. Everything here is reversible: “Stop” turns the streams back off. Results land in the strap log.": {
-      "comment": "MEDICAL SAFETY COPY — needs a native speaker, not a machine translation. Deliberately left untranslated: a disclaimer that drifts in meaning is worse than one shown in English. Until a human translates it, the absent localizations make the runtime fall back to this English source text, which is correct and complete. Keep every element when translating: not a medical device, not a diagnosis, and the instruction to see a doctor. The middle paragraph is a RUN INSTRUCTION, not a disclaimer: without the clasp held the electrode circuit is open and the capture returns zero packets for a reason that has nothing to do with the firmware, so a translation that loses it produces false negatives in the very reports #891 is asking people for."
+      "comment": "MEDICAL SAFETY COPY — needs a native speaker, not a machine translation. Deliberately left untranslated: a disclaimer that drifts in meaning is worse than one shown in English. Until a human translates it, the absent localizations make the runtime fall back to this English source text, which is correct and complete. Keep every element when translating: not a medical device, not a diagnosis, and the instruction to see a doctor. The middle paragraph is a RUN INSTRUCTION, not a disclaimer: without the clasp held the electrode circuit is open and the capture returns zero packets for a reason that has nothing to do with the firmware, so a translation that loses it produces false negatives in the very reports #891 is asking people for.",
+      "localizations": {
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "NOOP ist kein Medizinprodukt und dies ist kein EKG-Test. Es bittet dein MG, sein EKG-Subsystem zu starten, und protokolliert alles, was zurückkommt — unvalidierte Messtechnik für Protokollforschung, niemals eine Messung oder eine Diagnose, einschließlich einer etwaigen Herzrhythmus-Klassifizierung, die das Band zufällig sendet. Triff damit keine Gesundheitsentscheidung; geh zu einer Ärztin oder einem Arzt, wenn du Symptome hast.\n\nHalte die beiden Vertiefungen am Verschluss während der gesamten Aufzeichnung mit den Fingern deiner anderen Hand. Das MG misst über dein Handgelenk UND diesen Verschluss: Solange du ihn nicht hältst, ist der Stromkreis offen, das Band hat nichts aufzuzeichnen, und du würdest null Pakete sehen, egal was die Firmware täte.\n\nNiemand hat bestätigt, dass ein Band diese Befehle befolgt; wahrscheinlich passiert also nichts. Alles hier ist umkehrbar: „Stopp“ schaltet die Streams wieder aus. Ergebnisse landen im Band-Protokoll."
+          }
+        },
+        "fr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "NOOP n'est pas un dispositif médical et ceci n'est pas un test ECG. L'application demande à votre MG de démarrer son sous-système ECG et enregistre tout ce qui revient — instrumentation non validée destinée à la recherche sur le protocole, jamais une mesure ni un diagnostic, y compris toute classification du rythme cardiaque que le bracelet pourrait envoyer. Ne vous en servez pas pour prendre une décision de santé ; consultez un médecin si vous avez des symptômes.\n\nTenez les deux encoches du fermoir avec les doigts de votre autre main pendant toute la capture. Le MG mesure entre votre poignet ET ce fermoir : tant que vous ne le tenez pas, le circuit reste ouvert, le bracelet n'a rien à enregistrer, et vous ne verriez aucun paquet quoi que fasse le firmware.\n\nPersonne n'a confirmé qu'un bracelet honore ces commandes ; il ne se passera donc probablement rien. Tout ici est réversible : « Arrêter » désactive les flux. Les résultats arrivent dans le journal du bracelet."
+          }
+        },
+        "es": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "NOOP no es un dispositivo médico y esto no es una prueba de ECG. Le pide a tu MG que inicie su subsistema de ECG y registra todo lo que llegue — instrumentación no validada para investigación del protocolo, nunca una medición ni un diagnóstico, incluida cualquier clasificación del ritmo cardíaco que la banda llegue a enviar. No lo uses para tomar una decisión de salud; consulta a un médico si tienes síntomas.\n\nSujeta las dos muescas del cierre con los dedos de la otra mano durante toda la captura. El MG mide entre tu muñeca Y ese cierre: mientras no lo sujetes, el circuito está abierto, la banda no tiene nada que registrar y verías cero paquetes hiciera lo que hiciera el firmware.\n\nNadie ha confirmado que una banda obedezca estos comandos, así que lo más probable es que no pase nada. Todo aquí es reversible: «Detener» vuelve a apagar los flujos. Los resultados van al registro de la banda."
+          }
+        },
+        "pt-PT": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "O NOOP não é um dispositivo médico e isto não é um teste de ECG. Pede ao teu MG que inicie o subsistema de ECG e regista tudo o que voltar — instrumentação não validada para investigação do protocolo, nunca uma medição nem um diagnóstico, incluindo qualquer classificação do ritmo cardíaco que a pulseira venha a enviar. Não o uses para tomar uma decisão de saúde; consulta um médico se tiveres sintomas.\n\nSegura as duas reentrâncias do fecho com os dedos da outra mão durante toda a captura. O MG mede entre o teu pulso E esse fecho: enquanto não o segurares, o circuito está aberto, a pulseira não tem nada para registar e verias zero pacotes fizesse o firmware o que fizesse.\n\nNinguém confirmou que uma pulseira cumpre estes comandos, por isso o mais provável é não acontecer nada. Tudo aqui é reversível: «Parar» desliga novamente os fluxos. Os resultados vão para o registo da pulseira."
+          }
+        },
+        "it": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "NOOP non è un dispositivo medico e questo non è un esame ECG. Chiede al tuo MG di avviare il sottosistema ECG e registra tutto ciò che arriva — strumentazione non convalidata per la ricerca sul protocollo, mai una misurazione né una diagnosi, inclusa qualsiasi classificazione del ritmo cardiaco che il braccialetto dovesse inviare. Non usarlo per prendere una decisione sulla salute; consulta un medico se hai sintomi.\n\nTieni le due rientranze della chiusura con le dita dell'altra mano per tutta la acquisizione. L'MG misura tra il tuo polso E quella chiusura: finché non la tieni, il circuito resta aperto, il braccialetto non ha nulla da registrare e vedresti zero pacchetti qualunque cosa facesse il firmware.\n\nNessuno ha confermato che un braccialetto esegua questi comandi, quindi molto probabilmente non succederà nulla. Tutto qui è reversibile: «Ferma» disattiva di nuovo i flussi. I risultati finiscono nel registro del braccialetto."
+          }
+        },
+        "ru": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "NOOP не является медицинским устройством, и это не ЭКГ-исследование. Приложение просит ваш MG запустить подсистему ЭКГ и записывает всё, что придёт в ответ, — это неподтверждённые измерения для исследования протокола, никогда не измерение и не диагноз, включая любую классификацию сердечного ритма, которую браслет может прислать. Не принимайте на их основе решения о здоровье; при появлении симптомов обратитесь к врачу.\n\nВсё время записи удерживайте две выемки на застёжке пальцами другой руки. MG измеряет между вашим запястьем И этой застёжкой: пока вы её не держите, цепь разомкнута, браслету нечего записывать, и вы увидите ноль пакетов, что бы ни делала прошивка.\n\nНикто не подтвердил, что браслет выполняет эти команды, поэтому вероятнее всего ничего не произойдёт. Всё здесь обратимо: «Стоп» снова выключает потоки. Результаты попадают в журнал браслета."
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "NOOP 不是医疗设备，这也不是心电图检查。它请求你的 MG 启动其心电图子系统，并记录返回的任何内容——这是用于协议研究的未经验证的实验性测量，绝不是测量结果或诊断，包括手环可能发送的任何心律分类。请勿据此做出健康决定；如有症状请就医。\n\n在整个采集过程中，请用另一只手的手指按住表扣上的两个凹槽。MG 是在你的手腕与该表扣之间进行测量的：只要你不按住它，电路就是断开的，手环没有任何内容可记录，无论固件做什么你都只会看到零个数据包。\n\n目前没有人确认手环会执行这些命令，因此最可能的结果是什么都不会发生。这里的一切都可撤销：「停止」会重新关闭数据流。结果会记入手环日志。"
+          }
+        },
+        "zh-Hant": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "NOOP 不是醫療裝置，這也不是心電圖檢查。它請求你的 MG 啟動其心電圖子系統，並記錄回傳的任何內容——這是用於協定研究的未經驗證實驗性測量，絕不是測量結果或診斷，包括手環可能傳送的任何心律分類。請勿據此做出健康決定；如有症狀請就醫。\n\n在整個擷取過程中，請用另一隻手的手指按住錶扣上的兩個凹槽。MG 是在你的手腕與該錶扣之間進行測量的：只要你不按住它，電路就是斷開的，手環沒有任何內容可記錄，無論韌體做什麼你都只會看到零個封包。\n\n目前沒有人確認手環會執行這些命令，因此最可能的結果是什麼都不會發生。這裡的一切都可復原：「停止」會重新關閉資料流。結果會記入手環日誌。"
+          }
+        }
+      }
     },
     "NOOP is not a medical device. It is for informational and personal-insight purposes only and is not intended to diagnose, treat, cure or prevent any condition. Talk to a clinician for medical advice.": {
       "localizations": {
@@ -146198,7 +146298,57 @@
       }
     },
     "Unvalidated instrumentation, not a medical measurement and not a diagnosis.": {
-      "comment": "MEDICAL SAFETY COPY — needs a native speaker, not a machine translation. Deliberately left untranslated: a disclaimer that drifts in meaning is worse than one shown in English. Until a human translates it, the absent localizations make the runtime fall back to this English source text, which is correct and complete. Keep every element when translating: not a medical device, not a diagnosis, and the instruction to see a doctor."
+      "comment": "MEDICAL SAFETY COPY — needs a native speaker, not a machine translation. Deliberately left untranslated: a disclaimer that drifts in meaning is worse than one shown in English. Until a human translates it, the absent localizations make the runtime fall back to this English source text, which is correct and complete. Keep every element when translating: not a medical device, not a diagnosis, and the instruction to see a doctor.",
+      "localizations": {
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Unvalidierte Messtechnik, keine medizinische Messung und keine Diagnose."
+          }
+        },
+        "fr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Instrumentation non validée, ni une mesure médicale ni un diagnostic."
+          }
+        },
+        "es": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Instrumentación no validada, no es una medición médica ni un diagnóstico."
+          }
+        },
+        "pt-PT": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Instrumentação não validada, não é uma medição médica nem um diagnóstico."
+          }
+        },
+        "it": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Strumentazione non convalidata, non è una misurazione medica né una diagnosi."
+          }
+        },
+        "ru": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Неподтверждённые измерения, это не медицинское измерение и не диагноз."
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "未经验证的实验性测量，不是医疗测量，也不是诊断。"
+          }
+        },
+        "zh-Hant": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "未經驗證的實驗性測量，不是醫療測量，也不是診斷。"
+          }
+        }
+      }
     },
     "Updated weekly": {
       "localizations": {
