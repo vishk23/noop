@@ -14,9 +14,16 @@ let package = Package(
         .package(url: "https://github.com/groue/GRDB.swift.git", exact: "6.29.3"),
     ],
     targets: [
+        // Fixed-arity C wrappers for `sqlite3_db_config`, which is variadic and therefore
+        // uncallable from Swift. See Sources/WhoopStoreCShims/include/WhoopStoreCShims.h.
+        .target(
+            name: "WhoopStoreCShims",
+            linkerSettings: [.linkedLibrary("sqlite3")]
+        ),
         .target(
             name: "WhoopStore",
             dependencies: [
+                "WhoopStoreCShims",
                 "WhoopProtocol",
                 "OuraProtocol",
                 .product(name: "GRDB", package: "GRDB.swift"),
@@ -24,7 +31,7 @@ let package = Package(
         ),
         .testTarget(
             name: "WhoopStoreTests",
-            dependencies: ["WhoopStore", "WhoopProtocol", "OuraProtocol"],
+            dependencies: ["WhoopStore", "WhoopStoreCShims", "WhoopProtocol", "OuraProtocol"],
             // schema_oracle.json — the shared Room<->GRDB schema fixture (#775). Byte-identical twin at
             // android/app/src/test/resources/schema_oracle.json; SchemaOracleTests asserts they match.
             resources: [.process("Resources")]

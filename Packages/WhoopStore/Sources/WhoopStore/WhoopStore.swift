@@ -1,6 +1,7 @@
 import Foundation
 import GRDB
 import WhoopProtocol
+import WhoopStoreCShims
 
 /// OpenWhoop persistence library — decoded streams are durable; raw frames are a
 /// transient, compressed, prunable outbox. Built on GRDB/SQLite.
@@ -72,8 +73,11 @@ public enum WalCheckpointing: Sendable {
     /// behaviour of every build that does not opt out, and the only behaviour upstream ships.
     case automatic
     /// Disable `wal_autocheckpoint` on every connection this store opens, because an external
-    /// component checkpoints instead. See the obligation documented above — which the
-    /// `walBackstop` parameter of `init(path:walCheckpointing:walBackstop:)` discharges by default.
+    /// component checkpoints instead. Also disables SQLite's LAST-CONNECTION-CLOSE checkpoint
+    /// (`SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE`) on the same connections, so a graceful app termination
+    /// does not restart the WAL under the replicator either — see `disableCheckpointOnClose`. See
+    /// the obligation documented above — which the `walBackstop` parameter of
+    /// `init(path:walCheckpointing:walBackstop:)` discharges by default.
     case external
 }
 
@@ -97,14 +101,16 @@ public enum WalCheckpointing: Sendable {
 private actor StoreOpenGate {
     static let shared = StoreOpenGate()
 
-    func openAndMigrate(path: String, configuration config: Configuration) throws -> DatabasePool {
+    func openAndMigrate(path: String,
+                        configuration config: Configuration,
+                        walCheckpointing: WalCheckpointing) throws -> DatabasePool {
         // Self-heal a foreign DB left in place by a bad cross-platform restore (#222): an Android
         // (Room) backup that slipped past the import guard replaces our file with one that has our
         // data tables but NO `grdb_migrations` bookkeeping. The migrator then thinks nothing is
         // applied, re-runs v1, and crashes with `table "device" already exists` on every open — the
         // store never bootstraps. Quarantine such a file BEFORE opening so we start fresh instead of
         // looping forever. (A normal GRDB backup carries grdb_migrations and is left untouched.)
-        WhoopStore.quarantineIncompatibleDatabase(at: path)
+        WhoopStore.quarantineIncompatibleDatabase(at: path, walCheckpointing: walCheckpointing)
         let pool = try DatabasePool(path: path, configuration: config)
         try WhoopStore.makeMigrator().migrate(pool)
         return pool
@@ -211,10 +217,17 @@ public actor WhoopStore {
             // connections still auto-checkpointing, which is the exact bug this guards against.
             if case .external = walCheckpointing {
                 try db.execute(sql: "PRAGMA wal_autocheckpoint = 0")
+                // Autocheckpoint off is not enough: SQLite ALSO checkpoints (and restarts) the WAL
+                // when the file's last connection CLOSES, and a graceful app termination closes
+                // every pool. Same per-connection scoping, same reasoning as the pragma above —
+                // see `disableCheckpointOnClose`.
+                try WhoopStore.disableCheckpointOnClose(db)
             }
         }
         config.busyMode = .timeout(5)
-        let pool = try await StoreOpenGate.shared.openAndMigrate(path: path, configuration: config)
+        let pool = try await StoreOpenGate.shared.openAndMigrate(path: path,
+                                                                 configuration: config,
+                                                                 walCheckpointing: walCheckpointing)
 
         // Only `.external` needs a backstop: under `.automatic` SQLite's own autocheckpoint already
         // bounds the WAL, and installing an observer there would be pure cost for upstream builds.
@@ -235,13 +248,24 @@ public actor WhoopStore {
     /// would make the migrator re-run v1 and throw `table "device" already exists` forever. Moving it
     /// to a `.incompatible-<ts>` sidecar lets the next open create a clean store. A valid GRDB DB
     /// (has `grdb_migrations`) and a fresh/empty file are both left untouched. Best-effort + silent.
-    static func quarantineIncompatibleDatabase(at path: String) {
+    static func quarantineIncompatibleDatabase(at path: String, walCheckpointing: WalCheckpointing) {
         let fm = FileManager.default
         guard fm.fileExists(atPath: path) else { return }
         let names: Set<String>
         do {
+            var config = Configuration()
+            if case .external = walCheckpointing {
+                // This probe runs BEFORE the pool opens, on every open of an existing file — at a
+                // cold launch it is the file's ONLY connection, so its close is a last-connection
+                // close and would checkpoint + restart the WAL that survived the previous run
+                // (`disableCheckpointOnClose` explains the cost). It never writes, so the
+                // autocheckpoint pragma is moot here; the close-time flag is the one that matters.
+                config.prepareDatabase { db in
+                    try disableCheckpointOnClose(db)
+                }
+            }
             // Read-only probe of sqlite_master; a raw queue does NOT run migrations.
-            let probe = try DatabaseQueue(path: path)
+            let probe = try DatabaseQueue(path: path, configuration: config)
             names = try probe.read { db in
                 try Set(String.fetchAll(db, sql: "SELECT name FROM sqlite_master WHERE type = 'table'"))
             }
@@ -257,6 +281,50 @@ public actor WhoopStore {
         do { try fm.moveItem(atPath: path, toPath: quarantine) } catch { return }
         // Drop the now-orphaned WAL/SHM sidecars so the fresh DB starts clean.
         for suffix in ["-wal", "-shm"] { try? fm.removeItem(atPath: path + suffix) }
+    }
+
+    /// Disable SQLite's close-time checkpoint on one connection
+    /// (`SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE`). Applied, under `WalCheckpointing.external`, to every
+    /// connection this package opens on the live file — the pool's writer and readers via
+    /// `prepareDatabase`, and the quarantine probe.
+    ///
+    /// ## Why `wal_autocheckpoint = 0` alone is not enough
+    ///
+    /// When the LAST connection to a WAL database closes, SQLite checkpoints the WAL — that is a
+    /// separate mechanism from autocheckpoint, and the pragma does not touch it. A fully
+    /// backfilled WAL is then restarted (new salt, frame 1) on the next write, so a page-level
+    /// replicator holding a resume offset into it finds "wal overwritten" and must push a full
+    /// snapshot of the whole database — ~400 MB on the production store, on every graceful
+    /// termination. `devicectl install` terminates the app gracefully, which made every deploy buy
+    /// one snapshot (2026-08-04 it exceeded the server proxy's request window twice). A SIGKILL
+    /// suspension never closes the connection and costs nothing; this flag makes a graceful close
+    /// equally free.
+    ///
+    /// ## What it deliberately does NOT change
+    ///
+    /// Only the close-time checkpoint. Explicit checkpoints — `checkpointWAL()`, the
+    /// `WalBackstopMonitor`'s emergency TRUNCATE, and the external replicator's own — run exactly
+    /// as before, so `.external`'s WAL-growth bound is intact. Under `.automatic` this is never
+    /// called and close-time behaviour is byte-for-byte upstream's.
+    ///
+    /// Throws on any failure (result code, or the readback reporting the flag unset): a connection
+    /// that silently kept close-time checkpointing would surface only as "uploads never get
+    /// smaller", the exact pathology `StoreReplication` exists to prevent.
+    ///
+    /// The C shim exists because `sqlite3_db_config` is variadic and Swift cannot call it — see
+    /// `WhoopStoreCShims.h`.
+    static func disableCheckpointOnClose(_ db: Database) throws {
+        guard let handle = db.sqliteConnection else {
+            throw DatabaseError(resultCode: .SQLITE_MISUSE,
+                                message: "no sqlite3 handle to disable checkpoint-on-close on")
+        }
+        var disabled: Int32 = 0
+        let rc = whoopstore_disable_checkpoint_on_close(UnsafeMutableRawPointer(handle), &disabled)
+        guard rc == SQLITE_OK, disabled == 1 else {
+            throw DatabaseError(resultCode: ResultCode(rawValue: rc),
+                                message: "SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE not applied "
+                                       + "(rc=\(rc), disabled=\(disabled))")
+        }
     }
 
     /// An in-memory store (migrations applied). For tests.

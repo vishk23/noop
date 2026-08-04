@@ -1,6 +1,7 @@
 import XCTest
 import GRDB
 import WhoopProtocol
+import WhoopStoreCShims
 @testable import WhoopStore
 
 /// `WalCheckpointing` decides whether SQLite auto-checkpoints the WAL back into the main database.
@@ -187,5 +188,127 @@ final class WalCheckpointingTests: XCTestCase {
 
         try await store.checkpointWAL()
         XCTAssertLessThan(walBytes(), grown, "explicit checkpointWAL() must still truncate the WAL")
+    }
+
+    // MARK: - Close-time checkpointing (SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE)
+
+    /// Queries `SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE` on a live connection via the C shim's read-back
+    /// form. 1 = close-time checkpoint disabled, 0 = SQLite's default.
+    private func checkpointOnCloseDisabled(_ db: Database) -> Int32 {
+        var disabled: Int32 = -1
+        guard let handle = db.sqliteConnection else { return -1 }
+        let rc = whoopstore_checkpoint_on_close_disabled(UnsafeMutableRawPointer(handle), &disabled)
+        return rc == SQLITE_OK ? disabled : -1
+    }
+
+    /// The two 4-byte salts at offsets 16..<24 of the WAL header. A WAL *restart* — the thing a
+    /// close-time checkpoint leads to, and the thing that costs the external replicator its resume
+    /// offset — writes new salts; appending frames never touches them. So salt identity is the
+    /// direct on-disk evidence of "the WAL survived".
+    private func walHeaderSalt(_ path: String) throws -> Data {
+        let data = try Data(contentsOf: URL(fileURLWithPath: path + "-wal"))
+        XCTAssertGreaterThanOrEqual(data.count, 32, "WAL file too short to carry a header")
+        return data.subdata(in: 16..<24)
+    }
+
+    private func walBytes(_ path: String) -> Int64 {
+        let attrs = try? FileManager.default.attributesOfItem(atPath: path + "-wal")
+        return (attrs?[.size] as? NSNumber)?.int64Value ?? 0
+    }
+
+    /// `.automatic` must NOT carry the flag: upstream's close-time checkpoint is part of the
+    /// byte-for-byte default behaviour (it is what keeps a plain build's `-wal` from lingering).
+    func testAutomaticLeavesCloseTimeCheckpointEnabled() async throws {
+        let path = tempPath()
+        defer { removeDB(path) }
+
+        let store = try await WhoopStore(path: path, walCheckpointing: .automatic)
+        let writer = try await store.registryWriter.write { [self] in checkpointOnCloseDisabled($0) }
+        let reader = try await store.registryWriter.read { [self] in checkpointOnCloseDisabled($0) }
+        XCTAssertEqual(writer, 0, ".automatic must keep SQLite's close-time checkpoint (writer)")
+        XCTAssertEqual(reader, 0, ".automatic must keep SQLite's close-time checkpoint (reader)")
+    }
+
+    /// Like the autocheckpoint pragma, the close-time flag is per-connection, so it must reach the
+    /// pool's readers too — under `DatabasePool.close()` the writer closes FIRST, which makes a
+    /// reader the last-connection close that would run the checkpoint.
+    func testExternalDisablesCloseTimeCheckpointOnWriterAndReader() async throws {
+        let path = tempPath()
+        defer { removeDB(path) }
+
+        let store = try await WhoopStore(path: path, walCheckpointing: .external)
+        let writer = try await store.registryWriter.write { [self] in checkpointOnCloseDisabled($0) }
+        let reader = try await store.registryWriter.read { [self] in checkpointOnCloseDisabled($0) }
+        XCTAssertEqual(writer, 1, ".external must disable the close-time checkpoint on the writer")
+        XCTAssertEqual(reader, 1, ".external must ALSO disable it on reader connections")
+    }
+
+    /// THE DEPLOY-SNAPSHOT ASSERTION: under `.external` a graceful close must leave the `-wal`
+    /// byte-identical (same salts, same size), and a reopened writer must APPEND to it rather than
+    /// restart it. This is the on-disk property behind "a deploy's graceful termination no longer
+    /// costs the replicator a full snapshot". The reopen leg also covers the
+    /// `quarantineIncompatibleDatabase` probe: it opens (and closes) its own connection on the
+    /// existing file before the pool exists, so a probe without the flag would checkpoint the WAL
+    /// right here and fail the salt assertion.
+    func testExternalWalSurvivesCloseAndReopenAppendsToIt() async throws {
+        let path = tempPath()
+        defer { removeDB(path) }
+
+        let store = try await WhoopStore(path: path, walCheckpointing: .external)
+        var ts = 0
+        var hr: [HRSample] = []
+        for _ in 0..<500 { ts += 1; hr.append(HRSample(ts: ts, bpm: 60 + ts % 40)) }
+        _ = try await store.insert(Streams(hr: hr), deviceId: "dev")
+
+        let saltBeforeClose = try walHeaderSalt(path)
+        let sizeBeforeClose = walBytes(path)
+        XCTAssertGreaterThan(sizeBeforeClose, 0, "writes should have populated the WAL")
+
+        try store.registryWriter.close()
+
+        XCTAssertTrue(FileManager.default.fileExists(atPath: path + "-wal"),
+                      "a graceful close must not delete the -wal under .external")
+        XCTAssertEqual(try walHeaderSalt(path), saltBeforeClose,
+                       "a graceful close must not restart the WAL under .external")
+        XCTAssertEqual(walBytes(path), sizeBeforeClose,
+                       "a graceful close must not checkpoint or truncate the WAL under .external")
+
+        let reopened = try await WhoopStore(path: path, walCheckpointing: .external)
+        var hr2: [HRSample] = []
+        for _ in 0..<500 { ts += 1; hr2.append(HRSample(ts: ts, bpm: 60 + ts % 40)) }
+        _ = try await reopened.insert(Streams(hr: hr2), deviceId: "dev")
+
+        XCTAssertEqual(try walHeaderSalt(path), saltBeforeClose,
+                       "a reopened writer must append to the surviving WAL, not restart it")
+        XCTAssertGreaterThan(walBytes(path), sizeBeforeClose,
+                             "the reopened writer's frames should extend the same WAL")
+        try reopened.registryWriter.close()
+    }
+
+    /// The contrast run: same choreography under `.automatic` must land on DIFFERENT salts after
+    /// close + reopen + write, because the close-time checkpoint ran and the WAL restarted. This
+    /// pins the flag's absence behaviourally, not just via the config read-back above.
+    func testAutomaticCloseRestartsTheWal() async throws {
+        let path = tempPath()
+        defer { removeDB(path) }
+
+        let store = try await WhoopStore(path: path, walCheckpointing: .automatic)
+        var ts = 0
+        var hr: [HRSample] = []
+        for _ in 0..<500 { ts += 1; hr.append(HRSample(ts: ts, bpm: 60 + ts % 40)) }
+        _ = try await store.insert(Streams(hr: hr), deviceId: "dev")
+        let saltBeforeClose = try walHeaderSalt(path)
+
+        try store.registryWriter.close()
+
+        let reopened = try await WhoopStore(path: path, walCheckpointing: .automatic)
+        var hr2: [HRSample] = []
+        for _ in 0..<500 { ts += 1; hr2.append(HRSample(ts: ts, bpm: 60 + ts % 40)) }
+        _ = try await reopened.insert(Streams(hr: hr2), deviceId: "dev")
+
+        XCTAssertNotEqual(try walHeaderSalt(path), saltBeforeClose,
+                          ".automatic's close-time checkpoint should have restarted the WAL — "
+                          + "if these salts match, the flag leaked into the default path")
+        try reopened.registryWriter.close()
     }
 }
