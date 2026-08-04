@@ -7,9 +7,13 @@ struct ScreenScaffold<Content: View, Trailing: View>: View {
     /// own custom header in `content` (iOS Today's compact top bar).
     let title: LocalizedStringKey?
     var subtitle: LocalizedStringKey? = nil
-    /// Optional pull-to-refresh hook. When set, the scroll view becomes `.refreshable`
-    /// (the standard iPhone gesture for a data dashboard). Defaults to nil so callers that
-    /// don't opt in are unaffected — and on macOS `.refreshable` surfaces no affordance.
+    /// Optional pull-to-refresh hook: the screen's LOCAL re-read (typically `repo.refresh()`).
+    /// When set, the scroll view becomes `.refreshable` (the standard iPhone gesture for a data
+    /// dashboard), and the gesture ALSO kicks the gated manual strap offload via the environment's
+    /// `strapSyncKick` before the re-read — see `PullToRefresh.run`. A pull is the universal "go get
+    /// the latest" gesture, so a bare DB re-read that spins and succeeds while acquiring nothing
+    /// actively misleads on a stale day. Defaults to nil so callers that don't opt in are
+    /// unaffected — and on macOS `.refreshable` surfaces no affordance.
     var onRefresh: (() async -> Void)? = nil
     /// Lazily materialise the content column. When `true` the inner stack is a `LazyVStack`,
     /// so a screen whose content ends in a long `ForEach` only builds the cards on screen
@@ -156,12 +160,49 @@ extension ScreenScaffold where Trailing == EmptyView {
 /// screen — never attach the modifier at all.
 private struct RefreshableIfNeeded: ViewModifier {
     let onRefresh: (() async -> Void)?
+    /// The app-root-injected manual strap-offload kick (`BLEManager.syncNow`). An environment
+    /// CLOSURE, not `@EnvironmentObject var ble: BLEManager` — the scaffold never needs to observe
+    /// BLE state (so no screen re-renders on connect churn), and the nil default keeps previews and
+    /// hosts without a strap context working instead of crashing on a missing environment object.
+    @Environment(\.strapSyncKick) private var strapSyncKick
     func body(content: Content) -> some View {
         if let onRefresh {
-            content.refreshable { await onRefresh() }
+            content.refreshable { await PullToRefresh.run(strapSyncKick: strapSyncKick, refresh: onRefresh) }
         } else {
             content
         }
+    }
+}
+
+/// The shared pull-to-refresh composition behind every `ScreenScaffold(onRefresh:)` screen — the
+/// #334 Liquid-Today idiom (and Android Today's pull-to-sync twin, TodayScreen.kt) generalised.
+/// A pull must ACQUIRE, not just redraw: it first kicks the manual strap history offload, then runs
+/// the screen's local DB re-read. Without the kick, the gesture re-read unchanged rows, spun, and
+/// reported success — reinforcing the false impression that stale displayed values were current.
+/// The kick routes through `BLEManager.syncNow()`, which owns the connected+bonded+not-already-
+/// backfilling gate and logs the skip — so a pull with no strap safely stays a plain local re-read
+/// (no fake spinner delay; the existing sync chip / "History synced N ago" affordances disclose
+/// progress and staleness). The `.manual` trigger bypasses BackfillPolicy's periodic floor by
+/// design, exactly like the Health screen's "Sync now" button. Pure and injectable for
+/// PullToRefreshTests; the cloud sync is deliberately NOT kicked here (it has its own cadence and
+/// gates — uploading on every pull would tie an outbound network call to a browsing gesture).
+enum PullToRefresh {
+    static func run(strapSyncKick: (() -> Void)?, refresh: () async -> Void) async {
+        strapSyncKick?()
+        await refresh()
+    }
+}
+
+private struct StrapSyncKickKey: EnvironmentKey {
+    static let defaultValue: (() -> Void)? = nil
+}
+
+extension EnvironmentValues {
+    /// Injected once at each app root as `{ model.ble.syncNow() }` so every ScreenScaffold pull
+    /// shares ONE acquire mechanism. nil (previews, tests) leaves the pull a pure local re-read.
+    var strapSyncKick: (() -> Void)? {
+        get { self[StrapSyncKickKey.self] }
+        set { self[StrapSyncKickKey.self] = newValue }
     }
 }
 
