@@ -12,6 +12,7 @@ import com.noop.protocol.HistoricalMeta
 import com.noop.protocol.classifyHistoricalMeta
 import com.noop.protocol.decodeHistorical
 import com.noop.protocol.extractHistoricalStreams
+import com.noop.protocol.isAllZeroPayloadRecord
 import com.noop.protocol.rejectedHistoricalRecords
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
@@ -501,9 +502,24 @@ class Backfiller(
                 // records run ~84 B and the truncated tail is exactly where the unmapped motion/HR
                 // fields sit), and sample a few more so one log carries enough records to triangulate
                 // offsets. These only ever fire for unmapped firmware.
-                rejected.take(8).forEachIndexed { i, f ->
+                // EXCEPT all-zero payloads: a strap can bank structurally-valid records whose payload
+                // is entirely zero (observed: 1584 B frames once per second on a 5/MG after a raw-data
+                // config-flag write), and 1,559 zero bytes carry no layout to map — dumping them floods
+                // the log with 3,168-char lines. Summarize those in ONE line per chunk (count + the
+                // first frame's header hex) and spend the hex-dump budget on informative frames only.
+                val zeroPayload = rejected.filter { isAllZeroPayloadRecord(it) }
+                val informative = rejected.filterNot { isAllZeroPayloadRecord(it) }
+                informative.take(8).forEachIndexed { i, f ->
                     val hex = f.joinToString("") { "%02x".format(it) }
                     log("Backfill: rejected frame[$i] ${f.size}B: $hex")
+                }
+                zeroPayload.firstOrNull()?.let { first ->
+                    val headerHex = first.take(21).joinToString("") { "%02x".format(it) }
+                    log(
+                        "Backfill: ${zeroPayload.size} rejected frame(s) this chunk carry an all-zero " +
+                            "payload (nothing to map — hex dump skipped); first frame ${first.size}B, " +
+                            "header $headerHex",
+                    )
                 }
             }
             // Commit the decoded rows FIRST (durable) — BEFORE the reject archive (#1006, matching the

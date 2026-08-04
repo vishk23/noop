@@ -575,9 +575,20 @@ final class Backfiller {
                 // prefix — v25/v26 records run ~84 B and the truncated tail is exactly where the
                 // unmapped motion/HR fields sit), and sample a few more so one log carries enough
                 // records to triangulate offsets. These only ever fire for unmapped firmware.
-                for (i, f) in rejected.prefix(8).enumerated() {
+                // EXCEPT all-zero payloads: a strap can bank structurally-valid records whose payload
+                // is entirely zero (observed: 1584 B frames once per second on a 5/MG after a raw-data
+                // config-flag write), and 1,559 zero bytes carry no layout to map — dumping them floods
+                // the log with 3,168-char lines. Summarize those in ONE line per chunk (count + the
+                // first frame's header hex) and spend the hex-dump budget on informative frames only.
+                let zeroPayload = rejected.filter { isAllZeroPayloadRecord($0) }
+                let informative = rejected.filter { !isAllZeroPayloadRecord($0) }
+                for (i, f) in informative.prefix(8).enumerated() {
                     let hex = f.map { String(format: "%02x", $0) }.joined()
                     log?("Backfill: rejected frame[\(i)] \(f.count)B: \(hex)")
+                }
+                if let first = zeroPayload.first {
+                    let headerHex = first.prefix(21).map { String(format: "%02x", $0) }.joined()
+                    log?("Backfill: \(zeroPayload.count) rejected frame(s) this chunk carry an all-zero payload (nothing to map — hex dump skipped); first frame \(first.count)B, header \(headerHex)")
                 }
             }
             // Commit the decoded rows FIRST (durable). Doing this before the reject archive means a

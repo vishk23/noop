@@ -583,10 +583,10 @@ public final class LiveState: ObservableObject {
         dataFrontierUnix = nil            // …nor a stale frontier, which would quote a gap that's moved on
         lastFrameAtUnix = nil             // #987: a stale "last frame" freshness must not outlive it either
         ouraWearState = nil               // a stale worn/charging badge must not outlive the link either
-        // Perf: flush the durable log tail on disconnect (mirroring is batched in `append`), so a completed
-        // session's tail is always persisted for a later scheduled export despite the per-line throttle.
+        // Perf: flush the durable log tail on disconnect (mirroring is debounced in `append`), so a
+        // completed session's tail is always persisted for a later scheduled export despite the throttle.
         Self.persistTail(log)
-        logsSincePersist = 0
+        lastTailPersistUptime = ProcessInfo.processInfo.systemUptime
     }
 
     /// Cap on the in-app strap-log ring buffer. Raised from the old ~1h (200 lines) to retain a rolling
@@ -599,12 +599,43 @@ public final class LiveState: ObservableObject {
     /// Perf: the durable UserDefaults tail (`persistTail`) only feeds a scheduled export that fires hours
     /// later, so it needn't be current to the last line. Mirroring the whole tail on EVERY append was a
     /// hot-path cost that grew as more diagnostics (offload/backfill/#700/#714/#720) funnel through this one
-    /// sink. Persist in batches of `persistEveryNLines` instead, and always flush on disconnect
-    /// (`clearBiometrics`) so a finished session stays durable; a few unmirrored lines on an abrupt kill is
-    /// harmless for a debug tail. iOS-only — Android's `logBuffer` is an O(1) `ArrayDeque` with no per-line
-    /// persist, already correct.
-    private static let persistEveryNLines = 32
-    private var logsSincePersist = 0
+    /// sink. Debounced by TIME (at most one write per `persistDebounceSeconds`, with a trailing flush so
+    /// the tail is never stale by more than the window) rather than a line-count batch: a count bounds
+    /// writes per LINE, so its write rate still scales with how fast the log fills — during a hex-dump-heavy
+    /// offload the tail blob re-serialized many times per chunk while the offload paid for it. Always flush
+    /// on disconnect (`clearBiometrics`) so a finished session stays durable; a few unmirrored lines on an
+    /// abrupt kill is harmless for a debug tail. iOS-only — Android's `logBuffer` is an O(1) `ArrayDeque`
+    /// with no per-line persist, already correct.
+    private static let persistDebounceSeconds: TimeInterval = 1.0
+    /// Monotonic (`systemUptime`) instant of the last durable-tail write; `-.infinity` so the first
+    /// appended line persists immediately.
+    private var lastTailPersistUptime: TimeInterval = -.infinity
+    /// True while a trailing flush Task is pending, so a burst schedules exactly one.
+    private var tailFlushScheduled = false
+
+    /// Debounced durable-tail mirror: write immediately when the last write is at least
+    /// `persistDebounceSeconds` old; otherwise schedule ONE trailing flush at the window's end, which
+    /// carries every line appended in between. The durable tail therefore lags the live log by at most
+    /// the debounce window — fine for the scheduled export it feeds — while the write rate stays
+    /// independent of the append rate.
+    private func persistTailDebounced() {
+        let now = ProcessInfo.processInfo.systemUptime
+        if now - lastTailPersistUptime >= Self.persistDebounceSeconds {
+            lastTailPersistUptime = now
+            Self.persistTail(log)
+        } else if !tailFlushScheduled {
+            tailFlushScheduled = true
+            let delay = Self.persistDebounceSeconds - (now - lastTailPersistUptime)
+            Task { @MainActor [weak self] in
+                try? await Task.sleep(nanoseconds: UInt64(max(0, delay) * 1_000_000_000))
+                guard let self else { return }
+                self.tailFlushScheduled = false
+                self.lastTailPersistUptime = ProcessInfo.processInfo.systemUptime
+                Self.persistTail(self.log)
+            }
+        }
+    }
+
     /// Amortize the ring trim: let the buffer overrun by this slack, then trim back to the cap in one batch
     /// — turning an O(n) `Array.removeFirst` on every line at steady state into one per `trimSlack` lines.
     /// Still hard-bounded (never exceeds `maxLogLines + trimSlack`).
@@ -618,13 +649,9 @@ public final class LiveState: ObservableObject {
         log.append(Self.redactPii(tagged))
         // Batched trim: overrun by `trimSlack`, then trim back to the cap in one shot (amortized O(1)/line).
         if log.count > Self.maxLogLines + Self.trimSlack { log.removeFirst(log.count - Self.maxLogLines) }
-        // Batched durable-tail mirror: persist every `persistEveryNLines` lines, not on every line;
+        // Debounced durable-tail mirror: at most ~1 write/sec regardless of how fast lines arrive;
         // `clearBiometrics()` flushes on disconnect so a completed session is always fully mirrored.
-        logsSincePersist += 1
-        if logsSincePersist >= Self.persistEveryNLines {
-            logsSincePersist = 0
-            Self.persistTail(log)
-        }
+        persistTailDebounced()
         // #990: fold the Backfiller's per-session "session persisted N rows" summary into the persisted
         // ALL-TIME drained-rows tally, right here at the single log sink (no new BLE seam). The summary
         // is emitted unconditionally whenever rows landed (#150), so the cumulative counter accrues on
@@ -649,19 +676,36 @@ public final class LiveState: ObservableObject {
     /// fires hours after the last live session (the Apple analogue of Android's `StrapLogBuffer`) would
     /// otherwise find nothing to write. We mirror the rolling log to a single UserDefaults key so the
     /// scheduled export can read the last day's lines even with no live BLE session open. Small and
-    /// bounded: capped to the tail (`tailLimit`, well under `maxLogLines`) of short redacted strings, so
-    /// the persisted blob stays a few hundred KB at most. On-device only; nothing is sent anywhere.
+    /// bounded BOTH ways: capped to the tail (`tailLimit`, well under `maxLogLines`) AND per-line
+    /// (`persistedLineCap` — "short redacted strings" was an assumption the #91 full-frame hex dumps
+    /// violated at ~3,168 chars each), so the persisted blob genuinely stays under ~1 MB worst-case.
+    /// On-device only; nothing is sent anywhere.
     private static let tailKey = "strapLog.tail"
     /// How many recent lines the durable tail retains — a sensible day's worth for a scheduled export,
     /// smaller than the live `maxLogLines` ring so the persisted copy stays modest.
     static let tailLimit = 2_000
 
-    /// Mirror the most recent `tailLimit` lines to UserDefaults (called from `append`). Synchronous and
-    /// cheap (a single small array write); UserDefaults coalesces the disk flush. `nonisolated` (touches
-    /// only UserDefaults, no actor state) so the background/static export path can read the twin getter.
+    /// Cap on a SINGLE persisted line. Ordinary diagnostic lines run well under 200 chars, but the
+    /// Backfiller's full-frame reject hex dumps (#91) reach ~3,168 chars each — enough of them in the
+    /// tail once inflated the blob to megabytes, and every subsequent persist re-serialized all of it.
+    /// The cap applies at PERSIST time only: the in-memory `log` ring keeps full lines, so live viewing
+    /// and the manual `exportableLogText()` share (where a full hex dump is the point) are unchanged.
+    static let persistedLineCap = 512
+
+    /// A line as persisted to the durable tail: unchanged when within `cap`, else truncated with an
+    /// explicit "… (+N more)" suffix so a capped hex dump is visibly capped, never silently short.
+    nonisolated static func capForPersist(_ line: String, cap: Int = persistedLineCap) -> String {
+        guard line.count > cap else { return line }
+        return line.prefix(cap) + "… (+\(line.count - cap) more)"
+    }
+
+    /// Mirror the most recent `tailLimit` lines to UserDefaults (debounced in `append`, flushed on
+    /// disconnect). Each line is capped (`capForPersist`) so the blob stays modest even when the log
+    /// carries full-frame hex dumps. `nonisolated` (touches only UserDefaults, no actor state) so the
+    /// background/static export path can read the twin getter.
     nonisolated private static func persistTail(_ lines: [String]) {
         let tail = lines.count > tailLimit ? Array(lines.suffix(tailLimit)) : lines
-        UserDefaults.standard.set(tail, forKey: tailKey)
+        UserDefaults.standard.set(tail.map { capForPersist($0) }, forKey: tailKey)
     }
 
     /// The persisted log tail, newest-last — what a scheduled export reads when no live session is open.

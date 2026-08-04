@@ -515,6 +515,29 @@ fun rejectedHistoricalRecords(
     }
 }
 
+/**
+ * True when a rejected HISTORICAL_DATA frame's payload — the bytes between the record header and the
+ * CRC32 trailer — is entirely zero, so its hex dump carries nothing an unmapped layout could be mapped
+ * from. The Backfiller's reject hex dump (#91 / #30) exists to let a firmware's record layout be
+ * triangulated from a user's strap log; a zero payload has no layout to triangulate, yet straps have
+ * been observed banking such records once per SECOND (structurally valid 1584 B frames, ~21-byte
+ * header + 1,559 zero bytes + CRC32, seen on a WHOOP 5/MG after a raw-data config-flag write) —
+ * full-frame-dumping those floods the log with 3,168-char lines that say nothing.
+ *
+ * [headerLength] defaults to the observed 21-byte record header. It is deliberately generous rather
+ * than family-exact: if a frame's real header is shorter, the extra assumed-header bytes are zero in a
+ * zero-payload frame anyway, and the summarizing log line the caller emits includes the header hex, so
+ * no mappable byte is ever hidden by this check. Direct port of Swift `isAllZeroPayloadRecord`; pure
+ * function (no I/O) so it is unit-testable.
+ */
+fun isAllZeroPayloadRecord(frame: ByteArray, headerLength: Int = 21, trailerLength: Int = 4): Boolean {
+    if (frame.size <= headerLength + trailerLength) return false
+    for (i in headerLength until frame.size - trailerLength) {
+        if (frame[i] != 0.toByte()) return false
+    }
+    return true
+}
+
 // MARK: - METADATA classification (port of HistoricalMeta.swift)
 
 /** Classification of a METADATA frame (type 49) for the historical-offload state machine. */

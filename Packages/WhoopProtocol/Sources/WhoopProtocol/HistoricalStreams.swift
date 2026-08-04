@@ -103,6 +103,23 @@ public func rejectedHistoricalRecords(_ rawFrames: [[UInt8]], family: DeviceFami
     }
 }
 
+/// True when a rejected HISTORICAL_DATA frame's payload — the bytes between the record header and the
+/// CRC32 trailer — is entirely zero, so its hex dump carries nothing an unmapped layout could be mapped
+/// from. The Backfiller's reject hex dump (#91 / #30) exists to let a firmware's record layout be
+/// triangulated from a user's strap log; a zero payload has no layout to triangulate, yet straps have
+/// been observed banking such records once per SECOND (structurally valid 1584 B frames, ~21-byte
+/// header + 1,559 zero bytes + CRC32, seen on a WHOOP 5/MG after a raw-data config-flag write) —
+/// full-frame-dumping those floods the log with 3,168-char lines that say nothing.
+///
+/// `headerLength` defaults to the observed 21-byte record header. It is deliberately generous rather
+/// than family-exact: if a frame's real header is shorter, the extra assumed-header bytes are zero in a
+/// zero-payload frame anyway, and the summarizing log line the caller emits includes the header hex, so
+/// no mappable byte is ever hidden by this check. Pure function (no I/O) so it is unit-testable.
+public func isAllZeroPayloadRecord(_ frame: [UInt8], headerLength: Int = 21, trailerLength: Int = 4) -> Bool {
+    guard frame.count > headerLength + trailerLength else { return false }
+    return frame[headerLength ..< (frame.count - trailerLength)].allSatisfy { $0 == 0 }
+}
+
 /// Turn historical (offload) parsed frames into datastore rows. Port of
 /// interpreter.extract_historical_streams.
 ///
