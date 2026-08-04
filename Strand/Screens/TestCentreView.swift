@@ -638,6 +638,10 @@ private struct BatteryReadoutPanel: View {
 /// same ReadoutRow tokens as the other panels. No em-dash in any string here.
 private struct ConnectionReadoutPanel: View {
     @ObservedObject var live: LiveState
+    /// §8c: the clock-latched row needs the strap family (a 5/MG must read "unknown", not a false
+    /// "no" — see ConnectionReadout.clockLatchedLabel). Injected from the environment like the
+    /// sibling rows in TestCentreView itself.
+    @EnvironmentObject var model: AppModel
 
     var body: some View {
         let tail = live.taggedTail(domain: .connection)
@@ -668,9 +672,12 @@ private struct ConnectionReadoutPanel: View {
             ReadoutRow(label: String(localized: "Rows drained (session)"),
                        value: sessionRows.map(String.init) ?? String(localized: "no offload yet"))
             ReadoutRow(label: String(localized: "Rows drained (all time)"), value: String(allTimeRows))
+            // §8c: pass the family so a 5/MG (whose data-range reply is feedsSync-gated, #695) reads
+            // "unknown", not a standing false "no".
             ReadoutRow(label: String(localized: "Clock latched"),
                        value: ConnectionReadout.clockLatchedLabel(deviceClockUnix: deviceClock,
-                                                                  strapNewestUnix: live.strapRange?.newestUnix))
+                                                                  strapNewestUnix: live.strapRange?.newestUnix,
+                                                                  isWhoop5: model.ble.isWhoop5))
             ReadoutRow(label: String(localized: "Last frame"),
                        value: ConnectionReadout.lastFrameLabel(lastFrameUnix: live.lastFrameAtUnix, nowUnix: now))
             if let rtcWarning {

@@ -94,8 +94,12 @@ private struct DevicesContent: View {
         guard live.connected else { return nil }
         let deviceClock = ConnectionReadout.clockCorrelatedDevice(logLines: live.log)
         guard deviceClock != nil || live.strapRange != nil || live.lastFrameAtUnix != nil else { return nil }
+        // §8c: on a 5/MG neither clock signal can populate today (the GET_DATA_RANGE reply is
+        // feedsSync-gated, #695), so the label needs the family to read "unknown" there instead of a
+        // standing false "no" over a strap that may be banking fine.
         let latched = ConnectionReadout.clockLatchedLabel(deviceClockUnix: deviceClock,
-                                                          strapNewestUnix: live.strapRange?.newestUnix)
+                                                          strapNewestUnix: live.strapRange?.newestUnix,
+                                                          isWhoop5: model.ble.isWhoop5)
         let frame = ConnectionReadout.lastFrameLabel(lastFrameUnix: live.lastFrameAtUnix,
                                                      nowUnix: Int(Date().timeIntervalSince1970))
         let warning = ConnectionReadout.rtcWarning(deviceClockUnix: deviceClock,

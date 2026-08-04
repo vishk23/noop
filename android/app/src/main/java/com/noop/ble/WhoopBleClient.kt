@@ -423,6 +423,15 @@ class WhoopBleClient(
     private val gattOpsFactory: (BluetoothGatt) -> GattOps = ::RealGattOps,
 ) {
 
+    /** S8c: how an offload that surfaced NO sensor records ended. The two terminals are different
+     *  failures with different fixes, and the old single user string conflated them.
+     *  COMPLETED_EMPTY: the strap ANSWERED and completed the offload (HISTORY_COMPLETE) but handed
+     *  over no sensor records - the command channel works; nothing was banked. TIMED_OUT_EMPTY: the
+     *  idle watchdog fired with ZERO offload progress - the strap never answered SEND_HISTORICAL at
+     *  all (on 2026-08-03 a 5/MG in this state was cleared by the in-app strap Restart where charging
+     *  would not have been). Twin of the Swift `BLEManager.EmptyOffloadTerminal`. */
+    enum class EmptyOffloadTerminal { COMPLETED_EMPTY, TIMED_OUT_EMPTY }
+
     companion object {
         private const val TAG = "WhoopBleClient"
         /**
@@ -1109,6 +1118,46 @@ class WhoopBleClient(
             val bankedSensorRecords = decodedChunks > 0 || rowsPersisted > 0
             val bankedNothing = !bankedSensorRecords && (consoleChunks >= 3 || rowsPersisted == 0)
             return Pair(bankedSensorRecords, bankedNothing)
+        }
+
+        /**
+         * S8c signal 2: the user-facing copy for an empty offload, split by terminal reason. Pure and
+         * unit-tested (EmptyBankingClassifierTest) like [classifyCompletedOffload] above. The strings
+         * say what was OBSERVED (the strap completed empty / never answered) - not the "its clock has
+         * lost sync" diagnosis the old copy asserted without measuring. Clock-fault wording stays where
+         * clock evidence actually exists (the #324/#928 future-dated banner and the Backfiller's
+         * implausible-timestamp paths).
+         *
+         * Returns null where the caller should keep a non-error surface: TIMED_OUT_EMPTY on a 5/MG
+         * never seen banking keeps the #580 "history sync experimental" state, and on a WHOOP 4.0 keeps
+         * the caller's existing "went quiet" copy (no in-app restart exists for a 4.0, #275).
+         * [hasBankedBeforeOnThisInstall] is the `sync.lastWriteOkAt` evidence: rows have persisted from
+         * this strap before, so "no stored history" / "experimental" would be the wrong reading - the
+         * strap answering nothing is a wedged command channel, and the in-app Restart comes before the
+         * charge ritual. Byte-identical twin of the Swift `BLEManager.emptyOffloadUserCopy`.
+         */
+        fun emptyOffloadUserCopy(
+            terminal: EmptyOffloadTerminal,
+            isWhoop5: Boolean,
+            hasBankedBeforeOnThisInstall: Boolean,
+            consecutiveEmptySyncs: Int,
+        ): String? = when (terminal) {
+            EmptyOffloadTerminal.COMPLETED_EMPTY -> {
+                val streak =
+                    if (consecutiveEmptySyncs > 1) " ($consecutiveEmptySyncs syncs in a row now)" else ""
+                val remedy = if (isWhoop5) {
+                    "Fully charge it to 100% and reconnect; if it still hands over nothing, restart it from the Devices screen."
+                } else {
+                    "Fully charge it to 100% and reconnect; if it still hands over nothing, share a strap log."
+                }
+                "Synced, but the strap finished the offload without handing over any stored history - only its diagnostic output$streak. " + remedy
+            }
+            EmptyOffloadTerminal.TIMED_OUT_EMPTY ->
+                if (!isWhoop5 || !hasBankedBeforeOnThisInstall) {
+                    null
+                } else {
+                    "Sync timed out - the strap didn't answer the history request at all this time, though it has handed over history before. Restart it from the Devices screen (it reconnects on its own), then sync again; fully charging it to 100% is the fallback."
+                }
         }
 
         /**
@@ -2299,6 +2348,13 @@ class WhoopBleClient(
      *  many completions can't reset the cap each slice (#25). Main-looper only. Mirrors Swift
      *  `consecutiveAutoContinues`. */
     private var consecutiveAutoContinues = 0
+
+    /** S8c: rows persisted across ALL completed sessions of the current auto-continue burst (#364), fed
+     *  to [Backfiller.begin] as priorBurstRows so the no-cursor terminal line can say "caught up - 0
+     *  new records after N this sync" instead of reading identically to a wedged strap. Lifecycle
+     *  mirrors [consecutiveAutoContinues] exactly: folded in at each session end, cleared wherever the
+     *  streak clears (caught-up else path + disconnect). Mirrors Swift `burstRowsPersisted`. */
+    private var burstRowsPersisted = 0
 
     /** #364 spin-detector: the trim cursor as of the END of the PREVIOUS backfill session this
      *  connection. [exitBackfilling] compares Backfiller.lastAckedTrim against this to decide whether the
@@ -6395,10 +6451,14 @@ class WhoopBleClient(
             backfiller.clockRef = ClockRef(device = newest.toInt(), wall = wall)
             log("Clock: seeded backfiller correlation from Data Range (device=$newest wall=$wall, offset ${wall - newest}s)")
         }
-        // #42/#364: consecutiveAutoContinues > 0 means this offload is re-kicked after an EARLIER session
-        // in the same burst banked rows — tell the backfiller so its no-cursor END reads as "caught up",
-        // not "no banked history / charge to 100%". A fresh offload (count 0) keeps the honest guidance.
-        backfiller.begin(connectedFamily, continuedAfterRows = consecutiveAutoContinues > 0)   // family drives the +4 puffin offset for 5/MG (#78)
+        // #42/#364/S8c: consecutiveAutoContinues > 0 means this offload is re-kicked after an EARLIER
+        // session in the same burst — hand the backfiller that burst's row tally so its no-cursor END
+        // reads as "caught up - 0 new records after N this sync", not "no banked history / charge to
+        // 100%". A fresh offload (count 0, tally 0) keeps the honest zero-rows guidance.
+        backfiller.begin(
+            connectedFamily,   // family drives the +4 puffin offset for 5/MG (#78)
+            priorBurstRows = if (consecutiveAutoContinues > 0) burstRowsPersisted else 0,
+        )
         backfilling = true
         lastBackfillAtMs = System.currentTimeMillis()   // the BackfillPolicy floor is measured from the last KICK
         ackedChunksThisSession = 0
@@ -6719,11 +6779,32 @@ class WhoopBleClient(
         val bankedThisOffload = offloadFramesThisSession > 0 ||
             backfiller.sessionRowsPersisted > 0 || _state.value.deepPacketsThisSession > 0
         var whoop5HistoryExperimental = _state.value.historySyncExperimental
+        var whoop5TimeoutCopy: String? = null
         if (reason == "timeout" && isWhoop5) {
             val crossed = whoop5EmptyOffload.recordOffload(bankedRecords = bankedThisOffload)
-            whoop5HistoryExperimental = whoop5EmptyOffload.historyEmpty
+            // S8c: a sustained-empty timeout means the strap answered NOTHING — but that reads two
+            // opposite ways, and `sync.lastWriteOkAt` (rows have persisted from this strap before) is
+            // the evidence that separates them. Banked before ⇒ a wedged command channel, not "history
+            // experimental": surface the timed-out copy with the in-app Restart first (the fix that
+            // worked in the field on 2026-08-03, where charging would not have). Never banked ⇒ keep
+            // the honest #580 experimental state (many 5/MG firmwares genuinely serve no history).
+            if (whoop5EmptyOffload.historyEmpty) {
+                whoop5TimeoutCopy = emptyOffloadUserCopy(
+                    terminal = EmptyOffloadTerminal.TIMED_OUT_EMPTY,
+                    isWhoop5 = true,
+                    hasBankedBeforeOnThisInstall = NoopPrefs.of(context).contains("sync.lastWriteOkAt"),
+                    consecutiveEmptySyncs = whoop5EmptyOffload.consecutiveEmpty,
+                )
+            }
+            whoop5HistoryExperimental = whoop5EmptyOffload.historyEmpty && whoop5TimeoutCopy == null
             if (crossed) {
-                log("Backfill: WHOOP 5/MG offload empty ${whoop5EmptyOffload.consecutiveEmpty}× — history sync is experimental on 5.0; surfacing 'connected, history experimental' (not a sync error) and backing off the bounce loop.")
+                log(
+                    if (whoop5TimeoutCopy != null) {
+                        "Backfill: WHOOP 5/MG offload empty ${whoop5EmptyOffload.consecutiveEmpty}× with NO response to the history request, on a strap that HAS banked history on this install — not 'history experimental'; surfacing the timed-out copy with the in-app Restart first (S8c)."
+                    } else {
+                        "Backfill: WHOOP 5/MG offload empty ${whoop5EmptyOffload.consecutiveEmpty}× — history sync is experimental on 5.0; surfacing 'connected, history experimental' (not a sync error) and backing off the bounce loop."
+                    },
+                )
             }
         } else if (reason == "HISTORY_COMPLETE" && isWhoop5 && bankedSensorRecords) {
             // A real HISTORY_COMPLETE with banked records proves the 5/MG offload IS working — recover.
@@ -6739,8 +6820,14 @@ class WhoopBleClient(
                 // checked ONLY on the banked-something path, matching the Swift else-if order exactly so
                 // the two platforms never disagree on which banner a given sync shows.
                 lastSyncError = when {
-                    bankedNothing && sustainedEmpty ->
-                        "Synced, but your strap had no stored history to hand over - only its diagnostic output. This usually means its clock has lost sync, so it isn't saving data to flash. Fully charge it to 100%, then reconnect, and it should start banking again."
+                    // S8c: state what was observed (completed, nothing handed over) — the old wording
+                    // asserted a clock diagnosis this path never measures. See emptyOffloadUserCopy.
+                    bankedNothing && sustainedEmpty -> emptyOffloadUserCopy(
+                        terminal = EmptyOffloadTerminal.COMPLETED_EMPTY,
+                        isWhoop5 = isWhoop5,
+                        hasBankedBeforeOnThisInstall = NoopPrefs.of(context).contains("sync.lastWriteOkAt"),
+                        consecutiveEmptySyncs = emptySyncTracker.consecutiveEmptySyncs,
+                    )
                     bankedNothing -> null   // banked nothing but not yet sustained — stay silent (matches Swift)
                     // #324/#928: the strap banked records but its newest is dated implausibly in the future
                     // (RTC relatched ahead). #773 drops the samples so nothing is misfiled, but this path
@@ -6759,7 +6846,9 @@ class WhoopBleClient(
                 // error (it's just the empty offload), and surface the experimental flag instead.
                 // #324/#928: a future-dated WHOOP-4 TIMES OUT on its deep future-dated backlog — prefer the
                 // honest future-clock banner over "strap went quiet" (the reporter's #324 case timed out).
-                lastSyncError = if (isWhoop5) null
+                // S8c: a 5/MG that has banked before but answered nothing surfaces the timed-out copy
+                // (wedged channel, Restart first); other 5/MG timeouts stay non-errors (#580).
+                lastSyncError = if (isWhoop5) whoop5TimeoutCopy
                     else futureClockBanner ?: "Sync interrupted - the strap went quiet. It will retry on the next sync.",
                 historySyncExperimental = whoop5HistoryExperimental,
             )
@@ -6829,6 +6918,10 @@ class WhoopBleClient(
             NoopPrefs.setTsHealPending(context, true)
         }
 
+        // S8c: fold this session's rows into the burst tally, so a LATER session of the same burst can
+        // stamp its no-cursor terminal with "0 new records after N this sync". Before the continuation
+        // decision below (which may clear the streak + tally when we're genuinely caught up).
+        burstRowsPersisted += backfiller.sessionRowsPersisted
         // #364 auto-continue spin-detector: did THIS session move the strap's trim cursor? Compare the
         // Backfiller's current high-water trim against where it stood when the previous session ended.
         // A frozen cursor (console-only / refusing to trim) ⇒ don't re-kick (it would spin forever).
@@ -6911,7 +7004,10 @@ class WhoopBleClient(
                 // STAYS engaged for the rest of this connection (the 900s floor takes over); zeroing it here
                 // would immediately re-arm the cap and let a runaway strap spin again.
                 if (count < MAX_AUTO_CONTINUES) {
-                    handler.post { consecutiveAutoContinues = 0 }
+                    handler.post {
+                        consecutiveAutoContinues = 0
+                        burstRowsPersisted = 0   // S8c: burst over; the next sync starts a fresh tally
+                    }
                 }
                 return@launch
             }
@@ -7331,6 +7427,7 @@ class WhoopBleClient(
         // #364: the auto-continue streak + spin-detector are per-connection — a fresh connection earns a
         // fresh budget of back-to-back re-kicks and restarts its trim-advance comparison from scratch.
         consecutiveAutoContinues = 0
+        burstRowsPersisted = 0   // S8c: the burst row tally is per-connection, like the streak it mirrors
         lastSessionEndTrim = null
         // A mid-offload link drop must still flush the capture file (summary already logged or not —
         // don't double-log it here).

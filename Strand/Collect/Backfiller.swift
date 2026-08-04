@@ -87,11 +87,13 @@ final class Backfiller {
     /// tell a banking strap from a broken one. Reset at begin(); read by BLEManager at session end to emit
     /// "persisted N rows (M with motion) across K night(s)". Nights are day-keys (ts / 86400).
     private(set) var sessionRowsPersisted = 0
-    /// #42: set by `begin` when this session continues an auto-continue burst (#364) that already banked
-    /// rows in an earlier session, so a trim=0xFFFFFFFF END here reads as "caught up", not "no history".
-    /// Without it the fresh session's `sessionRowsPersisted` is 0 and the scary "charge to 100%" line
-    /// false-fires on the empty tail of a sync that just offloaded real records.
-    private(set) var continuedAfterRows = false
+    /// #42/§8c: rows persisted by EARLIER sessions of the same auto-continue burst (#364), passed in by
+    /// `begin`, so a trim=0xFFFFFFFF END here reads as "caught up - 0 new records after N this sync",
+    /// not "no history". Without it the fresh session's `sessionRowsPersisted` is 0 and the scary
+    /// "charge to 100%" line false-fires on the empty tail of a sync that just offloaded real records.
+    /// A count, not a bool (§8c): a burst whose earlier sessions ALSO banked nothing must fall through
+    /// to the honest zero-rows line rather than claim the strap "handed over its banked history".
+    private(set) var priorBurstRows = 0
     /// #57: set true the moment ANY chunk's persist (decoded rows / reject archive / raw enqueue / trim
     /// cursor) fails this session. While set, `finishChunk` must NOT ack — not even a subsequent EMPTY END,
     /// which skips the insert and would otherwise advance the strap's trim PAST the held records-carrying
@@ -119,7 +121,8 @@ final class Backfiller {
     private(set) var sessionClockWall: Int?
     private(set) var sessionUsedIdentityRef = false
     /// Logged once per session when the strap reports trim=0xFFFFFFFF — the "no valid flash cursor"
-    /// sentinel: it has no banked history to offload (a clock/charge state, not a decode bug).
+    /// sentinel: nothing left to offload past the last trim. Whether that is "caught up" or "never
+    /// banked anything" is decided by the session/burst row counts (see `noCursorLine`, §8c).
     private var loggedNoCursor = false
     /// #773: logged once per session the first time a HISTORY_END's own timestamp is dated implausibly far
     /// in the FUTURE (a corrupt strap RTC). Distinct from #547's per-record drop tally: this fires on the
@@ -225,9 +228,9 @@ final class Backfiller {
     /// Called by BLEManager when the strap signals a historical offload is beginning.
     /// chunkOpen starts TRUE: the high-freq-sync biometric replay streams records immediately and
     /// sends one HISTORY_START then repeated HISTORY_ENDs, so we must accumulate from the outset.
-    func begin(family: DeviceFamily, continuedAfterRows: Bool = false) {
+    func begin(family: DeviceFamily, priorBurstRows: Int = 0) {
         self.family = family
-        self.continuedAfterRows = continuedAfterRows
+        self.priorBurstRows = priorBurstRows
         isBackfilling = true
         persistStalled = false   // #57: fresh session starts un-stalled
         chunk.removeAll(keepingCapacity: true)
@@ -336,24 +339,30 @@ final class Backfiller {
         return line
     }
 
-    /// The trim=0xFFFFFFFF sentinel line (#783). 0xFFFFFFFF means two different things depending on whether
-    /// THIS run already banked rows. On the first end of a fresh offload it's the "no valid flash cursor"
-    /// state (no banked history, a clock/charge problem). But the #364 auto-continuation re-kicks
-    /// SEND_HISTORICAL after a run that DID persist rows, and the next end then carries 0xFFFFFFFF to mean
-    /// "caught up, nothing left past the last trim", NOT "no history". Emitting the alarming "fully charge
-    /// it" line there falsely scared users whose strap had just synced fine. So pick by `rowsPersisted`:
-    /// > 0 gives a neutral caught-up line; 0 gives the genuine no-history guidance. Pure so a fixture pins both.
-    nonisolated static func noCursorLine(rowsPersisted: Int, continuedAfterRows: Bool = false) -> String {
+    /// The trim=0xFFFFFFFF sentinel line (#783/§8c). 0xFFFFFFFF means two different things depending on
+    /// whether THIS SYNC already banked rows. On the first end of a fresh offload it's the "no valid flash
+    /// cursor" state. But the #364 auto-continuation re-kicks SEND_HISTORICAL after a run that DID persist
+    /// rows, and the next end then carries 0xFFFFFFFF to mean "caught up, nothing left past the last
+    /// trim", NOT "no history". Emitting the alarming "fully charge it" line there falsely scared users
+    /// whose strap had just synced fine. So pick by the row counts (§8c: the line CARRIES them, so a
+    /// caught-up sync can never read like a wedged one): rows this run > 0, or rows earlier in the same
+    /// burst (`priorBurstRows`) > 0, gives a caught-up line naming the count; zero across the whole sync
+    /// gives the honest line - it names BOTH readings (nothing banked vs not answering) instead of
+    /// asserting the clock/charge diagnosis the trim reply does not measure, and puts the 5.0/MG in-app
+    /// restart (the fix that worked on a wedged strap where charging would not have, 2026-08-03) ahead of
+    /// the charge ritual. Pure so a fixture pins all three.
+    nonisolated static func noCursorLine(rowsPersisted: Int, priorBurstRows: Int = 0) -> String {
         if rowsPersisted > 0 {
-            return "Backfill: reached the end of available history (trim=0xFFFFFFFF) - caught up after persisting \(rowsPersisted) row(s) this run. Nothing more to offload."
+            let suffix = priorBurstRows > 0 ? " (\(rowsPersisted + priorBurstRows) this sync)" : ""
+            return "Backfill: reached the end of available history (trim=0xFFFFFFFF) - caught up after persisting \(rowsPersisted) row(s) this run\(suffix). Nothing more to offload."
         }
         // #42: the empty tail of an auto-continue burst (#364) that banked rows in an EARLIER session. The
         // strap synced fine — this pass just confirms we're caught up — so DON'T false-alarm "no banked
         // history / charge to 100%".
-        if continuedAfterRows {
-            return "Backfill: reached the end of available history (trim=0xFFFFFFFF) - caught up; the strap handed over its banked history earlier this sync. Nothing more to offload."
+        if priorBurstRows > 0 {
+            return "Backfill: reached the end of available history (trim=0xFFFFFFFF) - caught up: 0 new records after \(priorBurstRows) row(s) earlier this sync. Nothing more to offload."
         }
-        return "Backfill: strap reported no flash cursor (trim=0xFFFFFFFF) - it has no banked history to offload. This is a clock/charge state on the strap, not a decode problem; fully charge it and reconnect so it starts banking."
+        return "Backfill: strap reported no flash cursor (trim=0xFFFFFFFF) and handed over 0 records this sync. Either it has no banked history to offload, or it is not answering the offload - the reply alone cannot tell which. If this repeats, restart the strap from the Devices screen (5.0/MG), or fully charge it to 100% and reconnect."
     }
 
     /// #773: how far ahead of the wall clock a HISTORY_END's own timestamp may sit before we call the strap
@@ -655,9 +664,12 @@ final class Backfiller {
         // session (loggedNoCursor) and the ack still proceeds below.
         if trim == 0xFFFFFFFF, !loggedNoCursor {
             loggedNoCursor = true
-            log?(Backfiller.noCursorLine(rowsPersisted: sessionRowsPersisted, continuedAfterRows: continuedAfterRows))
+            log?(Backfiller.noCursorLine(rowsPersisted: sessionRowsPersisted, priorBurstRows: priorBurstRows))
             // Connection test mode: the no-cursor sentinel as a compact tagged line (gated zero-cost).
-            emitConnection(ConnectionTrace.noCursorLine())
+            // §8c: it carries the sync's row count too, so the tagged tail can't read a caught-up sync
+            // and a strap that answered nothing as the same terminal.
+            emitConnection(ConnectionTrace.noCursorLine(rowsThisSession: sessionRowsPersisted,
+                                                        priorRowsThisSync: priorBurstRows))
         }
 
         // #57: if an EARLIER chunk this session failed to persist, do NOT advance the cursor or ack — not

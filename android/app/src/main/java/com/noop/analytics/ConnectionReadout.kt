@@ -100,9 +100,18 @@ object ConnectionTrace {
             if (decodable) "decodable" else "UNMAPPED (no motion/HR decoded)"
 
     /** The trim / no-cursor sentinel line: the strap reported trim=0xFFFFFFFF, its "no valid flash
-     *  cursor" marker (a clock/charge state, not a decode bug). Mirrors the Swift formatter. */
-    fun noCursorLine(): String =
-        "offload trim=0xFFFFFFFF noCursor (strap has no banked history to offload)"
+     *  cursor" marker. The bare terminal reads identically for a fully-drained sync (healthy) and a
+     *  strap that answered nothing all session (wedged command channel), so the line carries what was
+     *  observed - the rows banked this sync ([rowsThisSession] from the current offload session plus
+     *  [priorRowsThisSync] from earlier sessions of the same auto-continue burst). Zero across the
+     *  whole sync names both readings instead of asserting either. Mirrors the Swift formatter. */
+    fun noCursorLine(rowsThisSession: Int, priorRowsThisSync: Int = 0): String {
+        val total = rowsThisSession + priorRowsThisSync
+        if (total > 0) {
+            return "offload trim=0xFFFFFFFF noCursor (caught up - 0 new records after $total this sync)"
+        }
+        return "offload trim=0xFFFFFFFF noCursor (nothing banked this sync - if this repeats, the strap may not be answering)"
+    }
 
     /** Compact ISO-8601 date-time (no fractional seconds), UTC, matching the Swift line. */
     internal fun isoDate(unix: Long): String {
@@ -203,11 +212,20 @@ object ConnectionReadout {
      *  GET_DATA_RANGE reply's newest banked record (strapNewestUnix, the fallback a WHOOP 5/MG needs
      *  since its GET_CLOCK reply never populates deviceClockUnix — see the Swift twin's doc comment for
      *  why). "no (RTC reads 1970/71)" on an epoch-era signal; "no (waiting for the strap clock)" before
-     *  either replies. Twin of the Swift labeller. */
-    fun clockLatchedLabel(deviceClockUnix: Long?, strapNewestUnix: Long? = null): String {
+     *  either replies. Twin of the Swift labeller.
+     *
+     *  In practice the strapNewestUnix fallback never fires on a 5/MG today: the 5/MG GET_DATA_RANGE
+     *  reply is handled with the sync side-effects gated (the Swift #695 feedsSync gate - the decode is
+     *  unvalidated on hardware), so callers have no newest to pass and a "no" there would be a standing
+     *  false negative over a strap that may be banking fine. [isWhoop5] makes the row honest for that
+     *  family: absent both signals it reads "unknown" - what NOOP has, not a conclusion it never
+     *  measured. Mirrors the Swift labeller. */
+    fun clockLatchedLabel(deviceClockUnix: Long?, strapNewestUnix: Long? = null,
+                          isWhoop5: Boolean = false): String {
         val ceiling = ConnectionTrace.RTC_EPOCH_CEILING_UNIX
         if (deviceClockUnix != null) return if (deviceClockUnix < ceiling) "no (RTC reads 1970/71)" else "yes"
         if (strapNewestUnix != null) return if (strapNewestUnix < ceiling) "no (RTC reads 1970/71)" else "yes"
+        if (isWhoop5) return "unknown (5/MG reports no usable data range)"
         return "no (waiting for the strap clock)"
     }
 

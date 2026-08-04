@@ -46,11 +46,28 @@ class ConnectionTraceTest {
         assertEquals("firmware layout=v30 UNMAPPED (no motion/HR decoded)", ConnectionTrace.firmwareLine(30, false))
     }
 
-    @Test fun noCursorLine() {
+    // S8c: the no-cursor terminal must carry what was observed (rows banked this sync), so a
+    // fully-drained sync and a strap that answered nothing all session no longer read identically.
+    @Test fun noCursorLineCaughtUpNamesTheSyncRowCount() {
         assertEquals(
-            "offload trim=0xFFFFFFFF noCursor (strap has no banked history to offload)",
-            ConnectionTrace.noCursorLine(),
+            "offload trim=0xFFFFFFFF noCursor (caught up - 0 new records after 41282 this sync)",
+            ConnectionTrace.noCursorLine(41_282),
         )
+        // The empty tail of an auto-continue burst: THIS session banked 0, earlier sessions banked plenty.
+        assertEquals(
+            "offload trim=0xFFFFFFFF noCursor (caught up - 0 new records after 41282 this sync)",
+            ConnectionTrace.noCursorLine(0, priorRowsThisSync = 41_282),
+        )
+    }
+
+    @Test fun noCursorLineNothingBankedNamesThePossibilityNotADiagnosis() {
+        val line = ConnectionTrace.noCursorLine(0)
+        assertEquals(
+            "offload trim=0xFFFFFFFF noCursor (nothing banked this sync - if this repeats, the strap may not be answering)",
+            line,
+        )
+        assertFalse("must not assert the strap-side state it cannot observe",
+            line.contains("no banked history"))
     }
 
     // #990: the -363 d drift that used to print "clockOk". Beyond the 48 h behind-tolerance the line
@@ -210,6 +227,27 @@ class ConnectionReadoutTest {
         assertEquals("no (waiting for the strap clock)", ConnectionReadout.clockLatchedLabel(null, null))
         // deviceClockUnix wins when BOTH signals are present (the WHOOP4 correlation is the more direct one).
         assertEquals("yes", ConnectionReadout.clockLatchedLabel(1_782_475_600L, 40_000_000L))
+    }
+
+    // S8c: on a 5/MG neither signal can exist today (the data-range reply's sync side-effects are gated
+    // pending hardware validation of the decode), so "no" there was a standing false negative. Absent
+    // both signals the 5/MG row must read "unknown" - what NOOP has, not what it concluded.
+    @Test fun clockLatchedLabelIsUnknownNotNoOnASignallessFiveMG() {
+        assertEquals(
+            "unknown (5/MG reports no usable data range)",
+            ConnectionReadout.clockLatchedLabel(null, null, isWhoop5 = true),
+        )
+        // Either real signal still wins over the unknown state (once the gate flips).
+        assertEquals("yes", ConnectionReadout.clockLatchedLabel(null, 1_782_475_600L, isWhoop5 = true))
+        assertEquals(
+            "no (RTC reads 1970/71)",
+            ConnectionReadout.clockLatchedLabel(null, 40_000_000L, isWhoop5 = true),
+        )
+        // A WHOOP 4.0 with no signal keeps the honest "waiting" state (the correlation WILL come).
+        assertEquals(
+            "no (waiting for the strap clock)",
+            ConnectionReadout.clockLatchedLabel(null, null, isWhoop5 = false),
+        )
     }
 
     @Test fun rtcWarningFiresOnEpochEraClockOrNewest() {

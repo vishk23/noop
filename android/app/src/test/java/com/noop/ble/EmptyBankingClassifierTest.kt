@@ -110,6 +110,87 @@ class EmptyBankingClassifierTest {
         assertEquals(null, WhoopBleClient.futureDatedStrapBanner(null, 1_783_843_824L))
     }
 
+    // ---- S8c per-terminal-reason empty-offload copy (emptyOffloadUserCopy) ----
+
+    // A COMPLETED-empty offload states what was observed (finished, nothing handed over) and must not
+    // assert the "clock has lost sync" diagnosis the old single string carried unmeasured.
+    @Test
+    fun completedEmptyCopyStatesObservationNotClockDiagnosis() {
+        val copy = WhoopBleClient.emptyOffloadUserCopy(
+            terminal = WhoopBleClient.EmptyOffloadTerminal.COMPLETED_EMPTY,
+            isWhoop5 = false, hasBankedBeforeOnThisInstall = false, consecutiveEmptySyncs = 3,
+        )
+        assertNotNull(copy)
+        assertTrue(copy!!.contains("without handing over any stored history"))
+        assertTrue(copy.contains("3 syncs in a row"))
+        assertFalse("a completed-empty offload measures no clock fault - it must not assert one",
+            copy.contains("clock has lost sync"))
+        assertTrue(copy.contains("Fully charge it to 100%"))
+        assertFalse(copy.contains("\u2014"))
+    }
+
+    // On a 5/MG the completed-empty remedy chain ends at the in-app Restart (a 4.0 has none, #275).
+    @Test
+    fun completedEmptyCopyOffersRestartOnlyOnFiveMG() {
+        val five = WhoopBleClient.emptyOffloadUserCopy(
+            terminal = WhoopBleClient.EmptyOffloadTerminal.COMPLETED_EMPTY,
+            isWhoop5 = true, hasBankedBeforeOnThisInstall = true, consecutiveEmptySyncs = 4,
+        )
+        assertTrue(five!!.contains("restart it from the Devices screen"))
+        val four = WhoopBleClient.emptyOffloadUserCopy(
+            terminal = WhoopBleClient.EmptyOffloadTerminal.COMPLETED_EMPTY,
+            isWhoop5 = false, hasBankedBeforeOnThisInstall = true, consecutiveEmptySyncs = 4,
+        )
+        assertFalse(four!!.contains("restart"))
+    }
+
+    // The 2026-08-03 field case: a 5/MG that HAS banked history on this install times out with zero
+    // response. That is a wedged command channel, not "no stored history" - the copy names the timeout
+    // and puts the in-app Restart BEFORE the charge ritual (the restart is what actually cleared it).
+    @Test
+    fun timedOutEmptyOnBankedBeforeFiveMGSuggestsRestartFirst() {
+        val copy = WhoopBleClient.emptyOffloadUserCopy(
+            terminal = WhoopBleClient.EmptyOffloadTerminal.TIMED_OUT_EMPTY,
+            isWhoop5 = true, hasBankedBeforeOnThisInstall = true, consecutiveEmptySyncs = 2,
+        )
+        assertNotNull(copy)
+        assertTrue(copy!!.contains("didn't answer the history request"))
+        assertTrue(copy.contains("has handed over history before"))
+        assertTrue("the in-app Restart comes before the charge ritual",
+            copy.indexOf("Restart it from the Devices screen") < copy.indexOf("fully charging"))
+        assertFalse("a timeout observed no answer at all - it must not claim the strap had nothing",
+            copy.contains("no stored history"))
+        assertFalse(copy.contains("\u2014"))
+    }
+
+    // A 5/MG never seen banking keeps the #580 experimental surface (null - not an error).
+    @Test
+    fun timedOutEmptyOnNeverBankedFiveMGStaysExperimental() {
+        assertEquals(null, WhoopBleClient.emptyOffloadUserCopy(
+            terminal = WhoopBleClient.EmptyOffloadTerminal.TIMED_OUT_EMPTY,
+            isWhoop5 = true, hasBankedBeforeOnThisInstall = false, consecutiveEmptySyncs = 5,
+        ))
+    }
+
+    // A WHOOP 4.0 timeout keeps the caller's existing "went quiet" copy (no in-app restart exists).
+    @Test
+    fun timedOutEmptyOnWhoop4ReturnsNull() {
+        assertEquals(null, WhoopBleClient.emptyOffloadUserCopy(
+            terminal = WhoopBleClient.EmptyOffloadTerminal.TIMED_OUT_EMPTY,
+            isWhoop5 = false, hasBankedBeforeOnThisInstall = true, consecutiveEmptySyncs = 2,
+        ))
+    }
+
+    // A single empty completion reads singular (no "(1 syncs in a row)" grammar slip).
+    @Test
+    fun completedEmptyCopySingleSyncOmitsStreakClause() {
+        val copy = WhoopBleClient.emptyOffloadUserCopy(
+            terminal = WhoopBleClient.EmptyOffloadTerminal.COMPLETED_EMPTY,
+            isWhoop5 = false, hasBankedBeforeOnThisInstall = false, consecutiveEmptySyncs = 1,
+        )
+        assertFalse(copy!!.contains("in a row"))
+    }
+
     @Test
     fun bankingCycleResetsTheMetadataOnlyStreak() {
         val tracker = EmptySyncTracker()

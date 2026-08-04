@@ -102,12 +102,22 @@ final class BackfillerSessionTallyTests: XCTestCase {
         XCTAssertFalse(line!.contains("\u{2014}"))
     }
 
-    // #783: trim=0xFFFFFFFF on a fresh run that banked NOTHING means "no banked history": the genuine
-    // clock/charge guidance with the "fully charge it" hint.
-    func testNoCursorLineNoRowsGivesNoHistoryGuidance() {
+    // #783/§8c: trim=0xFFFFFFFF on a fresh run that banked NOTHING gives the honest zero-rows line: it
+    // names BOTH readings (no banked history vs not answering) instead of asserting the clock/charge
+    // diagnosis the trim reply does not measure, and puts the 5.0/MG in-app restart ahead of charging
+    // (a restart is what cleared a wedged strap in the field where charging would not have, 2026-08-03).
+    func testNoCursorLineNoRowsNamesBothReadingsAndRestartFirst() {
         let line = Backfiller.noCursorLine(rowsPersisted: 0)
+        XCTAssertTrue(line.contains("0 records this sync"))
         XCTAssertTrue(line.contains("no banked history to offload"))
+        XCTAssertTrue(line.contains("not answering"))
+        XCTAssertTrue(line.contains("restart the strap"))
         XCTAssertTrue(line.contains("fully charge it"))
+        XCTAssertLessThan(line.range(of: "restart the strap")!.lowerBound,
+                          line.range(of: "fully charge it")!.lowerBound,
+                          "the in-app restart comes before the charge ritual")
+        XCTAssertFalse(line.contains("This is a clock/charge state"),
+                       "must not assert a diagnosis the trim reply does not measure")
     }
 
     // #783: trim=0xFFFFFFFF AFTER the auto-continuation has already persisted rows means "caught up",
@@ -121,10 +131,37 @@ final class BackfillerSessionTallyTests: XCTestCase {
         XCTAssertFalse(line.contains("fully charge"))
     }
 
-    // No em-dash leaks into either branch (project hard rule).
+    // §8c: the empty TAIL of an auto-continue burst whose earlier sessions banked rows is "caught up"
+    // and must SAY the burst's row count - the count is what separates it from a wedged strap.
+    func testNoCursorLineBurstTailNamesThePriorRowCount() {
+        let line = Backfiller.noCursorLine(rowsPersisted: 0, priorBurstRows: 41_282)
+        XCTAssertTrue(line.contains("caught up"))
+        XCTAssertTrue(line.contains("0 new records after 41282 row(s) earlier this sync"))
+        XCTAssertFalse(line.contains("no banked history"))
+        XCTAssertFalse(line.contains("fully charge"))
+    }
+
+    // §8c: rows this run AND earlier burst rows: the line reports both (this run + the sync total).
+    func testNoCursorLineRowsThisRunPlusBurstShowsSyncTotal() {
+        let line = Backfiller.noCursorLine(rowsPersisted: 240, priorBurstRows: 41_042)
+        XCTAssertTrue(line.contains("240 row(s) this run (41282 this sync)"))
+    }
+
+    // §8c: a burst whose EARLIER sessions also banked nothing is NOT "caught up after banking" - it
+    // must fall through to the honest zero-rows line (the old continuedAfterRows bool claimed the strap
+    // "handed over its banked history" even when the whole burst banked zero).
+    func testNoCursorLineEmptyBurstStillGetsTheHonestZeroRowsLine() {
+        let line = Backfiller.noCursorLine(rowsPersisted: 0, priorBurstRows: 0)
+        XCTAssertTrue(line.contains("0 records this sync"))
+        XCTAssertFalse(line.contains("caught up"))
+    }
+
+    // No em-dash leaks into any branch (project hard rule).
     func testNoCursorLineHasNoEmDash() {
         XCTAssertFalse(Backfiller.noCursorLine(rowsPersisted: 0).contains("\u{2014}"))
         XCTAssertFalse(Backfiller.noCursorLine(rowsPersisted: 5).contains("\u{2014}"))
+        XCTAssertFalse(Backfiller.noCursorLine(rowsPersisted: 0, priorBurstRows: 7).contains("\u{2014}"))
+        XCTAssertFalse(Backfiller.noCursorLine(rowsPersisted: 5, priorBurstRows: 7).contains("\u{2014}"))
     }
 
     // MARK: - #773 corrupt future-RTC detection

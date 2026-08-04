@@ -111,6 +111,77 @@ final class EmptyBankingClassifierTests: XCTestCase {
         XCTAssertNil(BLEManager.futureDatedStrapBanner(strapNewestTs: nil, wallNowUnix: 1_783_843_824))
     }
 
+    // MARK: - §8c per-terminal-reason empty-offload copy (emptyOffloadUserCopy)
+
+    // A COMPLETED-empty offload states what was observed (finished, nothing handed over) and must not
+    // assert the "clock has lost sync" diagnosis the old single string carried unmeasured. Clock-fault
+    // wording lives only where clock evidence exists (#324/#928 banner, #773/#547 drops).
+    func testCompletedEmptyCopyStatesObservationNotClockDiagnosis() {
+        let copy = BLEManager.emptyOffloadUserCopy(
+            terminal: .completedEmpty, isWhoop5: false,
+            hasBankedBeforeOnThisInstall: false, consecutiveEmptySyncs: 3)
+        XCTAssertNotNil(copy)
+        XCTAssertTrue(copy!.contains("without handing over any stored history"), copy!)
+        XCTAssertTrue(copy!.contains("3 syncs in a row"), copy!)
+        XCTAssertFalse(copy!.contains("clock has lost sync"),
+                       "a completed-empty offload measures no clock fault - it must not assert one")
+        XCTAssertTrue(copy!.contains("Fully charge it to 100%"), copy!)
+        XCTAssertFalse(copy!.contains("\u{2014}"))
+    }
+
+    // On a 5/MG the completed-empty remedy chain ends at the in-app Restart (a 4.0 has none, #275).
+    func testCompletedEmptyCopyOffersRestartOnlyOnFiveMG() {
+        let five = BLEManager.emptyOffloadUserCopy(
+            terminal: .completedEmpty, isWhoop5: true,
+            hasBankedBeforeOnThisInstall: true, consecutiveEmptySyncs: 4)
+        XCTAssertTrue(five!.contains("restart it from the Devices screen"), five!)
+        let four = BLEManager.emptyOffloadUserCopy(
+            terminal: .completedEmpty, isWhoop5: false,
+            hasBankedBeforeOnThisInstall: true, consecutiveEmptySyncs: 4)
+        XCTAssertFalse(four!.contains("restart"), four!)
+    }
+
+    // The 2026-08-03 field case: a 5/MG that HAS banked history on this install times out with zero
+    // response. That is a wedged command channel, not "no stored history" - the copy names the timeout
+    // and puts the in-app Restart BEFORE the charge ritual (the restart is what actually cleared it).
+    func testTimedOutEmptyOnBankedBeforeFiveMGSuggestsRestartFirst() {
+        let copy = BLEManager.emptyOffloadUserCopy(
+            terminal: .timedOutEmpty, isWhoop5: true,
+            hasBankedBeforeOnThisInstall: true, consecutiveEmptySyncs: 2)
+        XCTAssertNotNil(copy)
+        XCTAssertTrue(copy!.contains("didn't answer the history request"), copy!)
+        XCTAssertTrue(copy!.contains("has handed over history before"), copy!)
+        XCTAssertLessThan(copy!.range(of: "Restart it from the Devices screen")!.lowerBound,
+                          copy!.range(of: "fully charging")!.lowerBound,
+                          "the in-app Restart comes before the charge ritual")
+        XCTAssertFalse(copy!.contains("no stored history"),
+                       "a timeout observed no answer at all - it must not claim the strap had nothing")
+        XCTAssertFalse(copy!.contains("\u{2014}"))
+    }
+
+    // A 5/MG never seen banking keeps the #580 experimental surface (nil - not an error): many 5/MG
+    // firmwares genuinely serve no history, and that is not a fault.
+    func testTimedOutEmptyOnNeverBankedFiveMGStaysExperimental() {
+        XCTAssertNil(BLEManager.emptyOffloadUserCopy(
+            terminal: .timedOutEmpty, isWhoop5: true,
+            hasBankedBeforeOnThisInstall: false, consecutiveEmptySyncs: 5))
+    }
+
+    // A WHOOP 4.0 timeout keeps the caller's existing "went quiet" copy (no in-app restart exists).
+    func testTimedOutEmptyOnWhoop4ReturnsNil() {
+        XCTAssertNil(BLEManager.emptyOffloadUserCopy(
+            terminal: .timedOutEmpty, isWhoop5: false,
+            hasBankedBeforeOnThisInstall: true, consecutiveEmptySyncs: 2))
+    }
+
+    // A single empty completion reads singular (no "(1 syncs in a row)" grammar slip).
+    func testCompletedEmptyCopySingleSyncOmitsStreakClause() {
+        let copy = BLEManager.emptyOffloadUserCopy(
+            terminal: .completedEmpty, isWhoop5: false,
+            hasBankedBeforeOnThisInstall: false, consecutiveEmptySyncs: 1)
+        XCTAssertFalse(copy!.contains("in a row"), copy!)
+    }
+
     // A banking cycle between metadata-only completions resets the streak — no false alarm for a strap
     // that's genuinely caught up after banking earlier.
     func testBankingCycleResetsTheMetadataOnlyStreak() {

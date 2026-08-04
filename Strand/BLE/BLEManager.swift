@@ -201,8 +201,9 @@ struct BondRefusalGiveUp {
 }
 
 /// Decides when a completed sync that handed over only the strap's console/diagnostic output (no sensor
-/// records) is sustained enough to warn that the strap's clock has lost sync and it isn't banking to flash
-/// (#77 / #91 / #120). A SINGLE empty cycle is common on a perfectly healthy strap — the strap can hand
+/// records) is sustained enough to surface the empty-offload banner (#77 / #91 / #120; since §8c the
+/// banner states what was observed rather than asserting a clock diagnosis — see emptyOffloadUserCopy).
+/// A SINGLE empty cycle is common on a perfectly healthy strap — the strap can hand
 /// back a console-only window, especially under heavy live-HR polling — so warning on one cycle
 /// false-alarms users whose clock is fine (#126). We require CONSECUTIVE empty cycles; any cycle that banks
 /// real sensor records clears the streak. Pure value type → unit-testable without a CoreBluetooth seam.
@@ -219,7 +220,7 @@ struct EmptySyncTracker {
     /// sensor records this cycle (decoded, or undecodable-but-archived — either way the clock is banking).
     /// `consoleOnly` = it handed over only diagnostic frames and no sensor records. Returns true only once
     /// emptiness is SUSTAINED (≥ threshold consecutive console-only cycles) — the caller shows the
-    /// "clock has lost sync" banner only then. Any banking cycle, or a caught-up cycle with nothing to
+    /// empty-offload banner only then. Any banking cycle, or a caught-up cycle with nothing to
     /// offload, clears the streak.
     mutating func recordCompletedSync(bankedSensorRecords: Bool, consoleOnly: Bool) -> Bool {
         guard consoleOnly, !bankedSensorRecords else {
@@ -654,6 +655,12 @@ public final class BLEManager: NSObject, ObservableObject {
     /// (its else path, under the cap) and on disconnect — NOT unconditionally on every HISTORY_COMPLETE,
     /// so a strap that slices one offload into many completions can't reset the cap each slice (#25).
     private var consecutiveAutoContinues = 0
+    /// §8c: rows persisted across ALL completed sessions of the current auto-continue burst (#364), fed
+    /// to `Backfiller.begin(priorBurstRows:)` so the no-cursor terminal line can say "caught up - 0 new
+    /// records after N this sync" instead of reading identically to a wedged strap. Lifecycle mirrors
+    /// `consecutiveAutoContinues` exactly: folded in at each session end, cleared wherever the streak
+    /// clears (caught-up else path + disconnect).
+    private var burstRowsPersisted = 0
     /// #364 spin-detector: the trim cursor as of the END of the previous backfill session this
     /// connection. exitBackfilling compares the current Backfiller.lastAckedTrim against this to decide
     /// whether the just-ended session actually advanced the strap's trim (progress) or froze (stop
@@ -1758,10 +1765,12 @@ public final class BLEManager: NSObject, ObservableObject {
         }
         // Capture the family at begin() (not init): selectedModel is reliably set by connect() before any
         // backfill starts, whereas bootstrapStore() can build the Backfiller before the family is known.
-        // #42/#364: consecutiveAutoContinues > 0 means this offload is re-kicked after an EARLIER session in
-        // the same burst banked rows — tell the backfiller so its no-cursor END reads as "caught up", not
-        // "no banked history / charge to 100%". A fresh offload (count 0) keeps the honest guidance.
-        backfiller.begin(family: selectedModel.deviceFamily, continuedAfterRows: consecutiveAutoContinues > 0)
+        // #42/#364/§8c: consecutiveAutoContinues > 0 means this offload is re-kicked after an EARLIER
+        // session in the same burst — hand the backfiller that burst's row tally so its no-cursor END
+        // reads as "caught up - 0 new records after N this sync", not "no banked history / charge to
+        // 100%". A fresh offload (count 0, tally 0) keeps the honest zero-rows guidance.
+        backfiller.begin(family: selectedModel.deviceFamily,
+                         priorBurstRows: consecutiveAutoContinues > 0 ? burstRowsPersisted : 0)
         backfilling = true
         state.backfilling = true
         state.syncChunksThisSession = 0
@@ -1979,6 +1988,10 @@ public final class BLEManager: NSObject, ObservableObject {
         if (backfiller?.sessionDroppedImplausible ?? 0) > 0 {
             IntelligenceEngine.requestTimestampReheal()
         }
+        // §8c: fold this session's rows into the burst tally, so a LATER session of the same burst can
+        // stamp its no-cursor terminal with "0 new records after N this sync". Before the continuation
+        // decision below (which may clear the streak + tally when we're genuinely caught up).
+        burstRowsPersisted += backfiller?.sessionRowsPersisted ?? 0
         // #364 auto-continue spin-detector: did THIS session move the strap's trim cursor? Compare the
         // Backfiller's current high-water trim against where it stood when the previous session ended.
         // A frozen cursor (console-only / strap refusing to trim) ⇒ don't re-kick (it would spin forever).
@@ -2040,15 +2053,22 @@ public final class BLEManager: NSObject, ObservableObject {
             } else if bankedNothing {
                 // #77 / #214 family: the offload COMPLETED but the strap handed over no sensor records
                 // at all — either console/diagnostic output across many chunks, OR a near-empty
-                // metadata-only completion (zero rows persisted) — i.e. it isn't banking history to
-                // flash (its RTC has lost sync). Only escalate to the actionable banner once emptiness
-                // is SUSTAINED (#126): a single empty cycle on an otherwise-banking strap stays silent.
+                // metadata-only completion (zero rows persisted). Only escalate to the actionable banner
+                // once emptiness is SUSTAINED (#126): a single empty cycle on an otherwise-banking strap
+                // stays silent. §8c: the banner states what was observed (completed, nothing handed
+                // over) — the old "its clock has lost sync" wording asserted a diagnosis this path never
+                // measures; the paths that DO measure a clock fault (#324/#928 future-dated, #773/#547
+                // implausible timestamps) keep their own clock wording.
                 let detail = state.consoleChunksThisSession >= 3
                     ? "console-only across \(state.consoleChunksThisSession) chunks"
                     : "metadata-only, 0 sensor rows persisted"
                 log("Backfill: completed but the strap banked no sensor history (\(detail)); consecutive empty syncs = \(emptySyncTracker.consecutiveEmptySyncs).")
                 state.lastSyncError = sustainedEmpty
-                    ? "Synced, but your strap had no stored history to hand over - only its diagnostic output. This usually means its clock has lost sync, so it isn't saving data to flash. Fully charge it to 100%, then reconnect, and it should start banking again."
+                    ? BLEManager.emptyOffloadUserCopy(
+                        terminal: .completedEmpty,
+                        isWhoop5: isWhoop5,
+                        hasBankedBeforeOnThisInstall: du.object(forKey: "sync.lastWriteOkAt") != nil,
+                        consecutiveEmptySyncs: emptySyncTracker.consecutiveEmptySyncs)
                     : nil
             } else if let futureBanner = futureClockBanner {
                 // #324/#928: the strap banked records but its newest is dated implausibly in the FUTURE
@@ -2084,11 +2104,25 @@ public final class BLEManager: NSObject, ObservableObject {
             if selectedModel.deviceFamily == .whoop5 {
                 let crossed = whoop5EmptyOffload.recordOffload(bankedRecords: bankedThisOffload)
                 if whoop5EmptyOffload.historyEmpty {
-                    // Honest home state (#580): NOT a sync error — connected + live HR, history experimental.
-                    state.historySyncExperimental = true
-                    state.lastSyncError = nil
+                    // §8c: a sustained-empty timeout means the strap answered NOTHING — but that reads
+                    // two opposite ways, and `sync.lastWriteOkAt` (rows have persisted from this strap
+                    // before) is the evidence that separates them. Banked before ⇒ this is a wedged
+                    // command channel, not "history experimental": surface the timeout copy with the
+                    // in-app Restart first (the fix that worked in the field on 2026-08-03, where
+                    // charging would not have). Never banked ⇒ keep the honest #580 experimental state
+                    // (many 5/MG firmwares genuinely serve no history; not a fault, not an error).
+                    let wedgedCopy = BLEManager.emptyOffloadUserCopy(
+                        terminal: .timedOutEmpty,
+                        isWhoop5: true,
+                        hasBankedBeforeOnThisInstall:
+                            UserDefaults.standard.object(forKey: "sync.lastWriteOkAt") != nil,
+                        consecutiveEmptySyncs: whoop5EmptyOffload.consecutiveEmpty)
+                    state.historySyncExperimental = wedgedCopy == nil
+                    state.lastSyncError = wedgedCopy
                     if crossed {
-                        log("Backfill: WHOOP 5/MG offload empty \(whoop5EmptyOffload.consecutiveEmpty)× — history sync is experimental on 5.0; surfacing 'connected, history experimental' (not a sync error) and backing off the bounce loop.")
+                        log(wedgedCopy != nil
+                            ? "Backfill: WHOOP 5/MG offload empty \(whoop5EmptyOffload.consecutiveEmpty)× with NO response to the history request, on a strap that HAS banked history on this install — not 'history experimental'; surfacing the timed-out copy with the in-app Restart first (§8c)."
+                            : "Backfill: WHOOP 5/MG offload empty \(whoop5EmptyOffload.consecutiveEmpty)× — history sync is experimental on 5.0; surfacing 'connected, history experimental' (not a sync error) and backing off the bounce loop.")
                     }
                 } else {
                     // Either the first empty cycle (could be the strap waking flash — stay quiet, don't
@@ -2173,6 +2207,7 @@ public final class BLEManager: NSObject, ObservableObject {
                 // zeroing it here would immediately re-arm the cap and let a runaway strap spin again.
                 if count < BackfillContinuation.defaultMaxAutoContinues {
                     consecutiveAutoContinues = 0
+                    burstRowsPersisted = 0   // §8c: the burst is over; the next sync starts a fresh tally
                 }
                 return
             }
@@ -2267,6 +2302,53 @@ public final class BLEManager: NSObject, ObservableObject {
         let bankedSensorRecords = decodedChunks > 0 || archivedFrames > 0 || unarchivedFrames > 0
         let bankedNothing = !bankedSensorRecords && (consoleChunks >= 3 || rowsPersisted == 0)
         return (bankedSensorRecords, bankedNothing)
+    }
+
+    /// §8c: how an offload that surfaced NO sensor records ended. The two terminals are different
+    /// failures with different fixes, and the old single user string conflated them.
+    enum EmptyOffloadTerminal {
+        /// The strap ANSWERED and completed the offload (HISTORY_COMPLETE) but handed over no sensor
+        /// records - console/diagnostic output only, or a metadata-only completion. The command channel
+        /// works; nothing was banked.
+        case completedEmpty
+        /// The idle watchdog fired with ZERO offload progress - the strap never answered
+        /// SEND_HISTORICAL at all. A different failure: on 2026-08-03 a 5/MG in this state was cleared
+        /// by the in-app strap Restart where charging would not have been.
+        case timedOutEmpty
+    }
+
+    /// §8c signal 2: the user-facing copy for an empty offload, split by terminal reason. Pure and
+    /// unit-tested (EmptyBankingClassifierTests) like `classifyCompletedOffload` above. The strings say
+    /// what was OBSERVED (the strap completed empty / never answered) - not the "its clock has lost
+    /// sync" diagnosis the old copy asserted without measuring. Clock-fault wording stays where clock
+    /// evidence actually exists: the #324/#928 future-dated banner and the Backfiller's #773/#547
+    /// implausible-timestamp paths.
+    ///
+    /// Returns nil where the caller should keep a non-error surface:
+    /// - `.timedOutEmpty` on a 5/MG never seen banking on this install keeps the #580 "history sync
+    ///   experimental" state (many 5/MG firmwares genuinely serve no history; that is not a fault).
+    /// - `.timedOutEmpty` on a WHOOP 4.0 keeps the caller's existing "went quiet" copy (no in-app
+    ///   restart exists for a 4.0 - #275 found no safe reboot frame).
+    ///
+    /// `hasBankedBeforeOnThisInstall` is the `sync.lastWriteOkAt` evidence: rows have persisted from
+    /// this strap before, so "no stored history" / "experimental" would be the wrong reading - the
+    /// strap answering nothing is a wedged command channel, and the in-app Restart comes before the
+    /// charge ritual.
+    nonisolated static func emptyOffloadUserCopy(terminal: EmptyOffloadTerminal,
+                                                 isWhoop5: Bool,
+                                                 hasBankedBeforeOnThisInstall: Bool,
+                                                 consecutiveEmptySyncs: Int) -> String? {
+        switch terminal {
+        case .completedEmpty:
+            let streak = consecutiveEmptySyncs > 1 ? " (\(consecutiveEmptySyncs) syncs in a row now)" : ""
+            let remedy = isWhoop5
+                ? "Fully charge it to 100% and reconnect; if it still hands over nothing, restart it from the Devices screen."
+                : "Fully charge it to 100% and reconnect; if it still hands over nothing, share a strap log."
+            return "Synced, but the strap finished the offload without handing over any stored history - only its diagnostic output\(streak). " + remedy
+        case .timedOutEmpty:
+            guard isWhoop5, hasBankedBeforeOnThisInstall else { return nil }
+            return "Sync timed out - the strap didn't answer the history request at all this time, though it has handed over history before. Restart it from the Devices screen (it reconnects on its own), then sync again; fully charging it to 100% is the fallback."
+        }
     }
 
     /// #324/#928: the post-sync banner for a strap whose clock is set in the FUTURE. Unlike the
@@ -4472,6 +4554,7 @@ extension BLEManager: @preconcurrency CBCentralManagerDelegate {
         // #364: the auto-continue streak + spin-detector are per-connection — a fresh connection earns a
         // fresh budget of back-to-back re-kicks and starts its trim-advance comparison from scratch.
         consecutiveAutoContinues = 0
+        burstRowsPersisted = 0   // §8c: the burst row tally is per-connection, like the streak it mirrors
         lastSessionEndTrim = nil
         backfilling = false
         state.backfilling = false
@@ -5154,6 +5237,14 @@ extension BLEManager: @preconcurrency CBPeripheralDelegate {
     /// dump/backlog/newest/oldest/clock-drift (so a strap log can VALIDATE the decode) but leaves sync
     /// UNCHANGED, so 5/MG behaviour is byte-identical to before + the new diagnostic lines. Flip the 5/MG call
     /// to `feedsSync: true` once a real 5.0/MG strap confirms the newest/oldest decode is correct.
+    ///
+    /// KNOWN CONSEQUENCE (§8c): because `state.setStrapRange` sits behind this gate, a 5/MG never
+    /// populates `LiveState.strapRange` — so the ce958669/#261 `strapNewestUnix` fallback that was meant
+    /// to make the "Clock latched" readout work on a 5/MG structurally never receives input (before #695
+    /// the 5/MG reply was skipped entirely; after it, parsed but gated). The readout compensates by
+    /// showing "unknown (5/MG reports no usable data range)" for that family
+    /// (`ConnectionReadout.clockLatchedLabel(isWhoop5:)`); flipping `feedsSync` to true is what would
+    /// let it read a real yes/no there.
     private func handleDataRangeResponse(_ frame: [UInt8], cmdOff: Int, feedsSync: Bool) {
         // #451: the decoded "newest" can latch a stale/wrong-epoch field (claypilat saw 2024 when the real
         // newest was 2026). To tell a genuinely-stale strap apart from a frame-alignment bug in
@@ -5201,7 +5292,9 @@ extension BLEManager: @preconcurrency CBPeripheralDelegate {
                 log("Strap banked history span: \(d.string(from: Date(timeIntervalSince1970: TimeInterval(oldest)))) → newest (~\(spanDays) day\(spanDays == 1 ? "" : "s") of backlog, drained oldest-first)")
             }
             // UNIVERSAL clock-drift snapshot (RTC cluster #531/#767/#804/#812): bank the [oldest, newest]
-            // window onto LiveState UNCONDITIONALLY (observability, not gated) for the export assembler.
+            // window onto LiveState for the export assembler — feedsSync-gated like the other range
+            // side-effects (LiveState.strapRange feeds the Devices/Test Centre clock readouts, so an
+            // unvalidated 5/MG decode must not reach them either; see the KNOWN CONSEQUENCE note above).
             if feedsSync { state.setStrapRange(newestUnix: newest, oldestUnix: (oldest.map { $0 < newest } ?? false) ? oldest : nil) }
             // Connection test mode: promote the CLOCK-DRIFT picture to one upfront tagged line (#767/#754).
             if TestCentre.active(.connection) {

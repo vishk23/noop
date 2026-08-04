@@ -58,12 +58,20 @@ class BackfillerSessionTallyTest {
         )
     }
 
-    // #783: trim=0xFFFFFFFF on a fresh run that banked NOTHING means "no banked history": the genuine
-    // clock/charge guidance with the "fully charge it" hint.
-    @Test fun noCursorLineNoRowsGivesNoHistoryGuidance() {
+    // #783/S8c: trim=0xFFFFFFFF on a fresh run that banked NOTHING gives the honest zero-rows line: it
+    // names BOTH readings (no banked history vs not answering) instead of asserting the clock/charge
+    // diagnosis the trim reply does not measure, and puts the 5.0/MG in-app restart ahead of charging.
+    @Test fun noCursorLineNoRowsNamesBothReadingsAndRestartFirst() {
         val line = Backfiller.noCursorLine(0)
+        assertTrue(line.contains("0 records this sync"))
         assertTrue(line.contains("no banked history to offload"))
+        assertTrue(line.contains("not answering"))
+        assertTrue(line.contains("restart the strap"))
         assertTrue(line.contains("fully charge"))
+        assertTrue("the in-app restart comes before the charge ritual",
+            line.indexOf("restart the strap") < line.indexOf("fully charge"))
+        assertFalse("must not assert a diagnosis the trim reply does not measure",
+            line.contains("This is a clock/charge state"))
     }
 
     // #783: trim=0xFFFFFFFF AFTER the auto-continuation has already persisted rows means "caught up",
@@ -76,27 +84,38 @@ class BackfillerSessionTallyTest {
         assertFalse(line.contains("fully charge"))
     }
 
-    // #42: trim=0xFFFFFFFF on the EMPTY tail of an auto-continue burst (this session banked 0 rows, but an
-    // earlier session in the burst did \u2014 continuedAfterRows=true) means "caught up", NOT "no history". It
-    // must NOT emit the scary fully-charge guidance even though rowsPersisted is 0.
-    @Test fun noCursorLineContinuedAfterRowsGivesCaughtUpLine() {
-        val line = Backfiller.noCursorLine(0, continuedAfterRows = true)
+    // #42/S8c: trim=0xFFFFFFFF on the EMPTY tail of an auto-continue burst whose EARLIER sessions banked
+    // rows means "caught up" and must SAY the burst's row count - the count is what separates it from a
+    // wedged strap. It must NOT emit the scary fully-charge guidance even though rowsPersisted is 0.
+    @Test fun noCursorLineBurstTailNamesThePriorRowCount() {
+        val line = Backfiller.noCursorLine(0, priorBurstRows = 41_282)
         assertTrue(line.contains("caught up"))
+        assertTrue(line.contains("0 new records after 41282 row(s) earlier this sync"))
         assertFalse(line.contains("no banked history"))
         assertFalse(line.contains("fully charge"))
     }
 
-    // #42: continuedAfterRows only softens the ZERO-row tail; a genuinely empty FRESH run (default false)
-    // still gets the honest no-history guidance.
-    @Test fun noCursorLineFreshEmptyStillGivesNoHistoryGuidance() {
-        assertTrue(Backfiller.noCursorLine(0, continuedAfterRows = false).contains("no banked history"))
+    // S8c: rows this run AND earlier burst rows: the line reports both (this run + the sync total).
+    @Test fun noCursorLineRowsThisRunPlusBurstShowsSyncTotal() {
+        val line = Backfiller.noCursorLine(240, priorBurstRows = 41_042)
+        assertTrue(line.contains("240 row(s) this run (41282 this sync)"))
     }
 
-    // No em-dash leaks into either branch (project hard rule).
+    // S8c: a burst whose EARLIER sessions also banked nothing is NOT "caught up after banking" - it must
+    // fall through to the honest zero-rows line (the old continuedAfterRows bool claimed the strap
+    // "handed over its banked history" even when the whole burst banked zero).
+    @Test fun noCursorLineEmptyBurstStillGetsTheHonestZeroRowsLine() {
+        val line = Backfiller.noCursorLine(0, priorBurstRows = 0)
+        assertTrue(line.contains("0 records this sync"))
+        assertFalse(line.contains("caught up"))
+    }
+
+    // No em-dash leaks into any branch (project hard rule).
     @Test fun noCursorLineHasNoEmDash() {
         assertFalse(Backfiller.noCursorLine(0).contains("\u2014"))
         assertFalse(Backfiller.noCursorLine(5).contains("\u2014"))
-        assertFalse(Backfiller.noCursorLine(0, continuedAfterRows = true).contains("\u2014"))
+        assertFalse(Backfiller.noCursorLine(0, priorBurstRows = 7).contains("\u2014"))
+        assertFalse(Backfiller.noCursorLine(5, priorBurstRows = 7).contains("\u2014"))
     }
 
     // ---- #773 corrupt future-RTC detection ----

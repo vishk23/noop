@@ -105,10 +105,19 @@ public enum ConnectionTrace {
         "firmware layout=v\(version) \(decodable ? "decodable" : "UNMAPPED (no motion/HR decoded)")"
     }
 
-    /// The trim / no-cursor sentinel line: the strap reported trim=0xFFFFFFFF, its "no valid flash cursor"
-    /// marker, so it has no banked history to offload (a clock/charge state, not a decode bug).
-    public static func noCursorLine() -> String {
-        "offload trim=0xFFFFFFFF noCursor (strap has no banked history to offload)"
+    /// The trim / no-cursor sentinel line: the strap reported trim=0xFFFFFFFF, its "no valid flash
+    /// cursor" marker. The bare terminal reads identically for a fully-drained sync (healthy) and a
+    /// strap that answered nothing all session (wedged command channel) - conflating them cost an
+    /// hours-long misdiagnosis on 2026-08-03 - so the line carries what was observed: the rows banked
+    /// this sync. `rowsThisSession` is the current offload session's persisted rows;
+    /// `priorRowsThisSync` is what earlier sessions of the same auto-continue burst (#364) banked.
+    /// Zero across the whole sync names both readings instead of asserting either.
+    public static func noCursorLine(rowsThisSession: Int, priorRowsThisSync: Int = 0) -> String {
+        let total = rowsThisSession + priorRowsThisSync
+        if total > 0 {
+            return "offload trim=0xFFFFFFFF noCursor (caught up - 0 new records after \(total) this sync)"
+        }
+        return "offload trim=0xFFFFFFFF noCursor (nothing banked this sync - if this repeats, the strap may not be answering)"
     }
 
     /// Compact ISO-8601 date-time (no fractional seconds), UTC, for the strap-record timestamps. UTC keeps
@@ -220,13 +229,23 @@ public enum ConnectionReadout {
     /// working one, because the one signal it checked structurally never populates for that family. The
     /// data-range reply is an equal-weight proof the strap answered with a working clock, not a downgrade
     /// — `rtcWarning` below already trusts it the same way.
-    public static func clockLatchedLabel(deviceClockUnix: Int?, strapNewestUnix: Int? = nil) -> String {
+    ///
+    /// In practice the fallback ALSO never fires on a 5/MG today: the 5/MG GET_DATA_RANGE reply is
+    /// handled with `feedsSync: false` (#695 — its newest/oldest decode is unvalidated on hardware), so
+    /// `LiveState.setStrapRange` never runs for that family and callers have no `strapNewestUnix` to
+    /// pass. Until #695 flips, neither input can exist on a 5/MG, and a "no" there would be a standing
+    /// false negative (months of "no" over a strap demonstrably banking history — the 2026-08-03
+    /// report). `isWhoop5` makes the row honest for that family: absent both signals it reads "unknown",
+    /// stating what NOOP has (no usable data range), not a conclusion it never measured.
+    public static func clockLatchedLabel(deviceClockUnix: Int?, strapNewestUnix: Int? = nil,
+                                         isWhoop5: Bool = false) -> String {
         if let d = deviceClockUnix {
             return d < ConnectionTrace.rtcEpochCeilingUnix ? "no (RTC reads 1970/71)" : "yes"
         }
         if let n = strapNewestUnix {
             return n < ConnectionTrace.rtcEpochCeilingUnix ? "no (RTC reads 1970/71)" : "yes"
         }
+        if isWhoop5 { return "unknown (5/MG reports no usable data range)" }
         return "no (waiting for the strap clock)"
     }
 

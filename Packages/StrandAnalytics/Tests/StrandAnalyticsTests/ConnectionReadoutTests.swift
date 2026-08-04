@@ -44,9 +44,22 @@ final class ConnectionTraceTests: XCTestCase {
                        "firmware layout=v30 UNMAPPED (no motion/HR decoded)")
     }
 
-    func testNoCursorLine() {
-        XCTAssertEqual(ConnectionTrace.noCursorLine(),
-                       "offload trim=0xFFFFFFFF noCursor (strap has no banked history to offload)")
+    // §8c: the no-cursor terminal must carry what was observed (rows banked this sync), so a
+    // fully-drained sync and a strap that answered nothing all session no longer read identically.
+    func testNoCursorLineCaughtUpNamesTheSyncRowCount() {
+        XCTAssertEqual(ConnectionTrace.noCursorLine(rowsThisSession: 41_282),
+                       "offload trim=0xFFFFFFFF noCursor (caught up - 0 new records after 41282 this sync)")
+        // The empty tail of an auto-continue burst: THIS session banked 0, earlier sessions banked plenty.
+        XCTAssertEqual(ConnectionTrace.noCursorLine(rowsThisSession: 0, priorRowsThisSync: 41_282),
+                       "offload trim=0xFFFFFFFF noCursor (caught up - 0 new records after 41282 this sync)")
+    }
+
+    func testNoCursorLineNothingBankedNamesThePossibilityNotADiagnosis() {
+        let line = ConnectionTrace.noCursorLine(rowsThisSession: 0)
+        XCTAssertEqual(line,
+                       "offload trim=0xFFFFFFFF noCursor (nothing banked this sync - if this repeats, the strap may not be answering)")
+        XCTAssertFalse(line.contains("no banked history"),
+                       "must not assert the strap-side state it cannot observe")
     }
 
     // #990: the -363 d drift that used to print "clockOk". Beyond the 48 h behind-tolerance the line
@@ -207,6 +220,28 @@ final class ConnectionReadoutTests: XCTestCase {
         XCTAssertEqual(
             ConnectionReadout.clockLatchedLabel(deviceClockUnix: 1_782_475_600, strapNewestUnix: 40_000_000),
             "yes")
+    }
+
+    // §8c/#8b: on a 5/MG neither signal can exist today (the GET_DATA_RANGE reply is feedsSync-gated,
+    // #695), so "no" there was a standing false negative over a strap demonstrably banking history.
+    // Absent both signals the 5/MG row must read "unknown" - what NOOP has, not what it concluded.
+    func testClockLatchedLabelIsUnknownNotNoOnASignallessFiveMG() {
+        XCTAssertEqual(
+            ConnectionReadout.clockLatchedLabel(deviceClockUnix: nil, strapNewestUnix: nil, isWhoop5: true),
+            "unknown (5/MG reports no usable data range)")
+        // Either real signal still wins over the unknown state (e.g. once #695 flips feedsSync).
+        XCTAssertEqual(
+            ConnectionReadout.clockLatchedLabel(deviceClockUnix: nil, strapNewestUnix: 1_782_475_600,
+                                                isWhoop5: true),
+            "yes")
+        XCTAssertEqual(
+            ConnectionReadout.clockLatchedLabel(deviceClockUnix: nil, strapNewestUnix: 40_000_000,
+                                                isWhoop5: true),
+            "no (RTC reads 1970/71)")
+        // A WHOOP 4.0 with no signal keeps the honest "waiting" state (the correlation WILL come).
+        XCTAssertEqual(
+            ConnectionReadout.clockLatchedLabel(deviceClockUnix: nil, strapNewestUnix: nil, isWhoop5: false),
+            "no (waiting for the strap clock)")
     }
 
     func testRtcWarningFiresOnEpochEraClockOrNewest() {
