@@ -140,6 +140,13 @@ Swift, you MUST build the app yourself: `xcodebuild … build` locally, or run `
   canonical resolver (`DeviceFamily.forRegistryModel` on both platforms), never a scattered
   string compare — the wizard stores `"4.0"`, other paths `"WHOOP 4.0"`, and single-spelling checks
   silently miss straps. Reads must thread the registry's **active** strap id, not a raw BLE address.
+- **Sleep stage labels — same trap, same rule:** wake has TWO spellings in `stagesJSON`. The on-device
+  stagers, `OuraHypnogram` and `FitbitExportParser` write `"wake"`; the noop-cloud `sleepStage` enum
+  writes `"awake"`, folded only when `CloudEditApplier` applies an edit onto a device. So a
+  phone-pulled DB is uniformly `"wake"` and the same night from the cloud mirror is `"awake"`. Never
+  compare a stage to a bare literal — use `SleepStageVocabulary.isWake` / `.canonical`
+  (`StrandAnalytics`) and canonicalise where stages are DECODED, not at each comparison. (`SleepStageTotals`
+  / `HealthWriteback` keep exact-match folds on purpose — their minutes are stored and cross `.noopbak`.)
 - **Design system is law:** UI uses only design tokens — `StrandPalette` / `StrandFont` / shared
   components on Apple, `Palette` / `Metrics` on Android. No hardcoded colors, fonts, or spacing.
 - **Migrations:** add a versioned migration + a test; never mutate an existing migration. Watch for

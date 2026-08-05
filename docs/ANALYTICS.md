@@ -286,6 +286,20 @@ Consecutive same-stage epochs are merged into `StageSegment`s tiling `[start, en
 - `SleepSession` — `start`, `end`, `efficiency` (AASM `asleep / in-bed`, where `asleep = in-bed − wake`), `stages`, per-session `restingHR` (lowest 5-min rolling-mean HR) and `avgHRV` (mean RMSSD over 5-min tumbling windows).
 - `hypnogramMetrics(_:)` — AASM-style roll-up: TIB / TST / SPT / SOL / REM latency / WASO / efficiency / disturbances, plus deep/REM/light minutes and percentages.
 
+### Stage label vocabulary — wake has two spellings
+
+`sleepSession.stagesJSON` has several producers and they do **not** agree on how to spell wake. The on-device stagers write `"wake"` (`SleepStagerV2` renames its internal `"awake"` on the way out), as do `OuraHypnogram.decode` and `FitbitExportParser`; the noop-cloud server's `sleepStage` enum writes `"awake"`. `CloudEditApplier.mapServerStage` folds `"awake"` → `"wake"`, but **only when a cloud stage edit is applied onto a device** — so a database pulled off a phone is uniformly `"wake"`, while the same night read back from the cloud mirror carries `"awake"`.
+
+Comparing a stage against a bare `"wake"` literal is therefore correct for one producer and silently wrong for the other: it files every `"awake"` epoch as **sleep**, biasing wake down and sleep up. Use `SleepStageVocabulary.isWake(_:)` / `.canonical(_:)` (`Packages/StrandAnalytics`), which folds both spellings and any case, and canonicalise once at the point stages are decoded rather than at each comparison. This bit `Tools/SleepBench` — see its [README](../Tools/SleepBench/README.md#stage-label-vocabulary--read-this-before-touching-a-comparison) for the measured effect on a real night (a −21.2 pp wake-calibration error reported as 0.00, and 239 reference epochs silently dropped from the confusion matrix).
+
+Two consumers keep their own exact-match folds (`case "wake", "awake":`) on purpose: `SleepStageTotals` and `HealthWriteback`. Their Kotlin twins match exactly too, and the minutes they produce are stored and cross the `.noopbak` boundary — case-folding there would start counting a `"Wake"` that today contributes nothing, a silent one-platform change to stored values. On Android the equivalent UI-layer helper is `canonicalStage` (`SleepStageTimelineLogic.kt`), which folds to the opposite token (`"awake"`); the canonical token is never stored or hashed on either side, so the two legitimately differ.
+
+### Measuring the stagers — `Tools/SleepBench`
+
+`Tools/SleepBench` replays both stagers over real recorded nights and scores them against every independent reference a database carries: the wearer's manual restages (`userEdited = 1`, and specifically the `stagelock`-cursor subset whose *stages* a human authored), and the strap's own band `sleep_state`. It reports wake-minute error, 4-class and sleep/wake agreement, **per-stage fraction calibration** and first-REM latency — the last two because Cohen's kappa constrains neither how much of the night a recipe spends at each stage nor when it places it. That gap is not hypothetical: PR #348 raised kappa on all three benchmarks and was reverted 48 hours later by PR #437 for re-scoring a healthy night from 6% to 23% awake.
+
+Nothing under `Tools/` is covered by default CI, so run `swift test` there yourself when you change it. See [`Tools/SleepBench/README.md`](../Tools/SleepBench/README.md).
+
 ### Motion-corroborated wake — elevated-but-motionless HR is not wake (default ON)
 
 Both stagers (`SleepStager` V1 and the default `SleepStagerV2`) and the HR-led session confirmation (`confirmSleepWithHR`) previously called **wake** primarily off HR / HR-variability with no motion or posture cross-check. On a night whose resting HR is held elevated **without the wearer getting up** — a supplement protocol, a fever, a hot room, alcohol — that logic scored hot-but-motionless sleep as wake, over-calling WASO, mis-placing onset, and tanking efficiency and Rest. Two confirmed nights required manual relabeling (2026-07-13: 194 min WAKE vs ~67; 2026-07-14: onset 1:41 vs ~1:29 plus a 44-min WAKE block).
