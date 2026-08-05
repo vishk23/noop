@@ -286,6 +286,20 @@ Consecutive same-stage epochs are merged into `StageSegment`s tiling `[start, en
 - `SleepSession` — `start`, `end`, `efficiency` (AASM `asleep / in-bed`, where `asleep = in-bed − wake`), `stages`, per-session `restingHR` (lowest 5-min rolling-mean HR) and `avgHRV` (mean RMSSD over 5-min tumbling windows).
 - `hypnogramMetrics(_:)` — AASM-style roll-up: TIB / TST / SPT / SOL / REM latency / WASO / efficiency / disturbances, plus deep/REM/light minutes and percentages.
 
+### Stage label vocabulary — wake has two spellings
+
+The tree carries **two** stage vocabularies, deliberately (see `SleepStageVocabulary`): **segment `stage` strings** (`StageSegment.stage`, hypnogram rows) canonicalise to `"wake"` — `SleepStagerV2` models its own states as `"awake"` internally and renames on the way out — while **minutes-dictionary keys** (`SleepStageTotals`, `SleepWindowReclip`) canonicalise to `"awake"`.
+
+The bug this closes is the dictionary vocabulary reaching a **segment** comparison. Imports never pass through `SleepStagerV2`: Oura's phase table is `["deep","light","rem","awake"]`, generic wearable JSON carries whatever the source app wrote, and the noop-cloud `sleepStage` enum is `"awake"` too (folded by `CloudEditApplier` only when an edit is applied *onto* a device). A consumer written `stage == "wake"` silently misfiles those segments, and `stage != "wake"` — used to mean "asleep" — counts them as **sleep**, inflating efficiency and under-counting wake.
+
+Use `SleepStageVocabulary.isWake(_:)` on any segment stage string; minutes dictionaries are keyed `"awake"` by construction and do not need it. It is a **predicate, not a canonicaliser**, on purpose: it fixes comparisons without rewriting a stored string, so neither vocabulary moves and no persisted hypnogram changes meaning. Issue #979 converted eleven such comparisons; Android's UI-layer `canonicalStage` folds through the Kotlin twin so the alias rule has one definition per platform.
+
+### Measuring the stagers — `Tools/SleepBench`
+
+`Tools/SleepBench` replays both stagers over real recorded nights and scores them against every independent reference a database carries: the wearer's manual restages (`userEdited = 1`, and specifically the `stagelock`-cursor subset whose *stages* a human authored), and the strap's own band `sleep_state`. It reports wake-minute error, 4-class and sleep/wake agreement, **per-stage fraction calibration** and first-REM latency — the last two because Cohen's kappa constrains neither how much of the night a recipe spends at each stage nor when it places it. That gap is not hypothetical: PR #348 raised kappa on all three benchmarks and was reverted 48 hours later by PR #437 for re-scoring a healthy night from 6% to 23% awake.
+
+Nothing under `Tools/` is built or tested by any default CI job, which is how #979 could fix eleven call sites in the app while leaving the harness comparing bare `"wake"` literals with every check green — on a night whose reference spells wake `"awake"`, that reported a wake-calibration bias of 0.00 pp where the truth was −21.2 pp, and dropped 239 reference epochs out of the confusion matrix entirely. Run `swift test` there yourself when you change it. See [`Tools/SleepBench/README.md`](../Tools/SleepBench/README.md).
+
 ### Motion-corroborated wake — elevated-but-motionless HR is not wake (default ON)
 
 Both stagers (`SleepStager` V1 and the default `SleepStagerV2`) and the HR-led session confirmation (`confirmSleepWithHR`) previously called **wake** primarily off HR / HR-variability with no motion or posture cross-check. On a night whose resting HR is held elevated **without the wearer getting up** — a supplement protocol, a fever, a hot room, alcohol — that logic scored hot-but-motionless sleep as wake, over-calling WASO, mis-placing onset, and tanking efficiency and Rest. Two confirmed nights required manual relabeling (2026-07-13: 194 min WAKE vs ~67; 2026-07-14: onset 1:41 vs ~1:29 plus a 44-min WAKE block).

@@ -82,8 +82,14 @@ extension ReadOnlyDB {
         """
         try query(sql) { s in
             let stagesJSON = ReadOnlyDB.str(s, 5) ?? "[]"
-            let stages = (try? JSONDecoder().decode([StageSegment].self,
-                                                    from: Data(stagesJSON.utf8))) ?? []
+            // This column has several producers and they do NOT agree on how to spell wake: the on-device
+            // stager writes "wake", while Oura's phase table, generic wearable JSON and the noop-cloud
+            // stage-edit vocabulary write "awake". Fold to one spelling HERE, at the one point rows enter
+            // the harness, so no downstream comparison has to know which producer wrote the row. Safe
+            // because sleepbench is read-only — see `bucketLabel` for why this is harness-local.
+            let stages = ((try? JSONDecoder().decode([StageSegment].self,
+                                                     from: Data(stagesJSON.utf8))) ?? [])
+                .map { StageSegment(start: $0.start, end: $0.end, stage: bucketLabel($0.stage)) }
             var band: [Int] = []
             if let bj = ReadOnlyDB.str(s, 6) {
                 band = (try? JSONDecoder().decode([Int].self, from: Data(bj.utf8))) ?? []
