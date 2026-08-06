@@ -625,7 +625,8 @@ final class IntelligenceEngine: ObservableObject {
                 // and posted the highest skinTempDevC of the surrounding 12 days on a night with no
                 // physiological elevation. Built from EVENTS, never the decoded `battery_charging` bit,
                 // which read FALSE across that entire charge (see Strand/BLE/StrapChargeInference.swift).
-                let chargeIntervals = AnalyticsEngine.chargeIntervals(events: wristEvents, windowEnd: to)
+                let chargeIntervals = AnalyticsEngine.chargeIntervals(events: wristEvents,
+                                                                      windowStart: from, windowEnd: to)
 
                 // Calendar-day window for the ADDITIVE daily totals (steps + calories). The night window
                 // above is anchored to the current time-of-day and ends at dayStart+12h, so for a PAST

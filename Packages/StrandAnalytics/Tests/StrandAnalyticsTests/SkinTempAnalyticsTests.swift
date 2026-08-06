@@ -429,7 +429,7 @@ final class SkinTempAnalyticsTests: XCTestCase {
             event(t + 1_895, "CHARGING_OFF(8)"),
             event(t + 15_342, "BATTERY_PACK_REMOVED(22)"),
         ]
-        let intervals = AnalyticsEngine.chargeIntervals(events: events, windowEnd: t + 20_000)
+        let intervals = AnalyticsEngine.chargeIntervals(events: events, windowStart: t - 1, windowEnd: t + 20_000)
         XCTAssertEqual(intervals.count, 1, "the toggles merge into the single pack span: \(intervals)")
         XCTAssertEqual(intervals[0].start, t)
         XCTAssertEqual(intervals[0].end, t + 15_342)
@@ -440,17 +440,53 @@ final class SkinTempAnalyticsTests: XCTestCase {
     func testChargingOnlyEventsAndUnclosedSpan() {
         let t = 2_000_000
         let closed = AnalyticsEngine.chargeIntervals(
-            events: [event(t, "CHARGING_ON(7)"), event(t + 300, "CHARGING_OFF(8)")], windowEnd: t + 9_999)
+            events: [event(t, "CHARGING_ON(7)"), event(t + 300, "CHARGING_OFF(8)")], windowStart: t - 1, windowEnd: t + 9_999)
         XCTAssertEqual(closed.count, 1)
         XCTAssertEqual(closed[0].end, t + 300)
         // Still on the charger when the window ends → closes at windowEnd, never left open.
         let open = AnalyticsEngine.chargeIntervals(
-            events: [event(t, "BATTERY_PACK_CONNECTED(21)")], windowEnd: t + 5_000)
+            events: [event(t, "BATTERY_PACK_CONNECTED(21)")], windowStart: t - 1, windowEnd: t + 5_000)
         XCTAssertEqual(open.count, 1)
         XCTAssertEqual(open[0].end, t + 5_000)
         // Unrelated events contribute nothing.
         XCTAssertTrue(AnalyticsEngine.chargeIntervals(
-            events: [event(t, "WRIST_OFF(10)"), event(t + 10, "BOOT(1)")], windowEnd: t + 100).isEmpty)
+            events: [event(t, "WRIST_OFF(10)"), event(t + 10, "BOOT(1)")], windowStart: t - 1, windowEnd: t + 100).isEmpty)
+    }
+
+    /// THE LEADING EDGE, from the real 2026-07-30 night. `BATTERY_PACK_CONNECTED` fired at 04:42:44 UTC, ten
+    /// minutes BEFORE the 04:52:58 session start, and `BATTERY_PACK_REMOVED` at 08:58:26 during the session.
+    /// A session-bounded event read therefore sees ONLY the closer. Before this heal the whole interval was
+    /// dropped: charge coverage read 18 % instead of 55 %, and the funnel reported 35.46 °C for a night whose
+    /// real gated mean is 33.39 °C — a 2.07 °C miss in the one function whose contract is to explain that
+    /// exact mean. A closer with no opener now opens at `windowStart`.
+    func testCloserWithoutOpenerOpensAtWindowStart() {
+        let sessionStart = 1_785_387_178                    // 2026-07-30T04:52:58Z
+        let packRemoved = sessionStart + 14_728             // 08:58:26Z, 4h05m into the session
+        let sessionEnd = sessionStart + 26_710              // 12:18:08Z
+        let intervals = AnalyticsEngine.chargeIntervals(
+            events: [event(packRemoved, "BATTERY_PACK_REMOVED(22)")],
+            windowStart: sessionStart, windowEnd: sessionEnd)
+        XCTAssertEqual(intervals.count, 1, "the orphan closer must still produce an interval: \(intervals)")
+        XCTAssertEqual(intervals[0].start, sessionStart, "opens at the window edge, not at the closer")
+        XCTAssertEqual(intervals[0].end, packRemoved)
+        // 55 % of the night, matching the real coverage — not the 18 % a dropped interval left behind.
+        let covered = Double(intervals[0].end - intervals[0].start) / Double(sessionEnd - sessionStart)
+        XCTAssertEqual(covered, 0.55, accuracy: 0.01)
+    }
+
+    /// The heal must not fire twice. A repeated closer AFTER a properly matched pair is a no-op — re-opening
+    /// it back at `windowStart` would swallow the clean pre-charge stretch that the matched pair deliberately
+    /// left in.
+    func testRepeatedCloserAfterMatchedPairDoesNotReopenAtWindowStart() {
+        let t = 5_000_000
+        let intervals = AnalyticsEngine.chargeIntervals(
+            events: [event(t + 1_000, "BATTERY_PACK_CONNECTED(21)"),
+                     event(t + 2_000, "BATTERY_PACK_REMOVED(22)"),
+                     event(t + 3_000, "BATTERY_PACK_REMOVED(22)")],   // duplicate closer
+            windowStart: t, windowEnd: t + 9_000)
+        XCTAssertEqual(intervals.count, 1, "duplicate closer must not open a second interval: \(intervals)")
+        XCTAssertEqual(intervals[0].start, t + 1_000, "must not slide back to windowStart")
+        XCTAssertEqual(intervals[0].end, t + 2_000)
     }
 
     /// The events-missing fallback. On the real night the decoded `battery_charging` bit read FALSE on every

@@ -462,7 +462,7 @@ class SkinTempAnalyticsTest {
             event(t + 1_895, "CHARGING_OFF(8)"),
             event(t + 15_342, "BATTERY_PACK_REMOVED(22)"),
         )
-        val intervals = AnalyticsEngine.chargeIntervals(events, t + 20_000)
+        val intervals = AnalyticsEngine.chargeIntervals(events, t - 1, t + 20_000)
         assertEquals("the toggles merge into the single pack span: $intervals", 1, intervals.size)
         assertEquals(t, intervals[0].first)
         assertEquals(t + 15_342, intervals[0].second)
@@ -473,18 +473,62 @@ class SkinTempAnalyticsTest {
     fun chargingOnlyEventsAndUnclosedSpan() {
         val t = 2_000_000L
         val closed = AnalyticsEngine.chargeIntervals(
-            listOf(event(t, "CHARGING_ON(7)"), event(t + 300, "CHARGING_OFF(8)")), t + 9_999,
+            listOf(event(t, "CHARGING_ON(7)"), event(t + 300, "CHARGING_OFF(8)")), t - 1, t + 9_999,
         )
         assertEquals(1, closed.size)
         assertEquals(t + 300, closed[0].second)
-        val open = AnalyticsEngine.chargeIntervals(listOf(event(t, "BATTERY_PACK_CONNECTED(21)")), t + 5_000)
+        val open = AnalyticsEngine.chargeIntervals(listOf(event(t, "BATTERY_PACK_CONNECTED(21)")), t - 1, t + 5_000)
         assertEquals(1, open.size)
         assertEquals(t + 5_000, open[0].second)
         assertTrue(
             AnalyticsEngine.chargeIntervals(
-                listOf(event(t, "WRIST_OFF(10)"), event(t + 10, "BOOT(1)")), t + 100,
+                listOf(event(t, "WRIST_OFF(10)"), event(t + 10, "BOOT(1)")), t - 1, t + 100,
             ).isEmpty(),
         )
+    }
+
+    /**
+     * THE LEADING EDGE, from the real 2026-07-30 night. BATTERY_PACK_CONNECTED fired at 04:42:44 UTC, ten
+     * minutes BEFORE the 04:52:58 session start, and BATTERY_PACK_REMOVED at 08:58:26 during the session, so
+     * a session-bounded event read sees ONLY the closer. Before this heal the whole interval was dropped:
+     * charge coverage read 18 % instead of 55 %, and the funnel reported 35.46 °C for a night whose real
+     * gated mean is 33.39 °C. Byte-parity twin of Swift `testCloserWithoutOpenerOpensAtWindowStart`.
+     */
+    @Test
+    fun closerWithoutOpenerOpensAtWindowStart() {
+        val sessionStart = 1_785_387_178L                   // 2026-07-30T04:52:58Z
+        val packRemoved = sessionStart + 14_728L            // 08:58:26Z, 4h05m into the session
+        val sessionEnd = sessionStart + 26_710L             // 12:18:08Z
+        val intervals = AnalyticsEngine.chargeIntervals(
+            listOf(event(packRemoved, "BATTERY_PACK_REMOVED(22)")), sessionStart, sessionEnd,
+        )
+        assertEquals("the orphan closer must still produce an interval: $intervals", 1, intervals.size)
+        assertEquals("opens at the window edge, not at the closer", sessionStart, intervals[0].first)
+        assertEquals(packRemoved, intervals[0].second)
+        val covered = (intervals[0].second - intervals[0].first).toDouble() /
+            (sessionEnd - sessionStart).toDouble()
+        assertEquals(0.55, covered, 0.01)
+    }
+
+    /**
+     * The heal must not fire twice. A repeated closer AFTER a properly matched pair is a no-op — re-opening
+     * it back at windowStart would swallow the clean pre-charge stretch the matched pair deliberately left
+     * in. Byte-parity twin of Swift `testRepeatedCloserAfterMatchedPairDoesNotReopenAtWindowStart`.
+     */
+    @Test
+    fun repeatedCloserAfterMatchedPairDoesNotReopenAtWindowStart() {
+        val t = 5_000_000L
+        val intervals = AnalyticsEngine.chargeIntervals(
+            listOf(
+                event(t + 1_000, "BATTERY_PACK_CONNECTED(21)"),
+                event(t + 2_000, "BATTERY_PACK_REMOVED(22)"),
+                event(t + 3_000, "BATTERY_PACK_REMOVED(22)"),   // duplicate closer
+            ),
+            t, t + 9_000,
+        )
+        assertEquals("duplicate closer must not open a second interval: $intervals", 1, intervals.size)
+        assertEquals("must not slide back to windowStart", t + 1_000, intervals[0].first)
+        assertEquals(t + 2_000, intervals[0].second)
     }
 
     /**

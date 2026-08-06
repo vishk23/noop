@@ -524,7 +524,7 @@ object IntelligenceEngine {
             // drift to cold ambient — it HEATS the sensor to 38–40 °C, which passes both the worn-HR gate
             // (HR keeps streaming) and the 28–42 °C plausibility gate. Built from EVENTS, never the decoded
             // `battery_charging` bit, which read FALSE across an entire labelled 9.4 → 100 % charge.
-            val chargeIntervals = AnalyticsEngine.chargeIntervals(nightEvents, to)
+            val chargeIntervals = AnalyticsEngine.chargeIntervals(nightEvents, from, to)
 
             // Calendar-day window for the ADDITIVE daily totals (steps + calories). The night window
             // above is anchored to the current time-of-day and ends at dayStart+12h, so for a PAST

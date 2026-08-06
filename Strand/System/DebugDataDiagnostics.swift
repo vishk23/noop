@@ -155,6 +155,7 @@ enum DebugDataDiagnostics {
         lines.append(AnalyticsEngine.skinTempFunnel(
             [det], hr: hr, skinTemp: skin, family: family, anchorRaw: devAnchor,
             chargeIntervals: AnalyticsEngine.chargeIntervals(events: nightEvents,
+                                                             windowStart: cs.startTs,
                                                              windowEnd: cs.endTs)).summary)
 
         // #112/#103 — the 5/MG SpO2 CANDIDATE (@82), as one number a wearer can check against the figure

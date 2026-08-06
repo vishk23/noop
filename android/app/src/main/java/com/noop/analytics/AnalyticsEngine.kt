@@ -81,18 +81,47 @@ object AnalyticsEngine {
      * BATTERY_PACK_CONNECTED→REMOVED span (00:42→04:58 ET) containing FIFTEEN CHARGING_ON/OFF pairs, and the
      * sensor read 38–40 °C straight through every CHARGING_OFF gap, because the pack was still physically
      * attached and thermally coupled. Pairing CHARGING_ON/OFF alone would re-admit those gaps.
+     *
+     * BOTH ENDS ARE HEALED, and the leading one is not hypothetical. An opener with no closer runs to
+     * [windowEnd] (still on the charger when the read window ended); a CLOSER WITH NO OPENER runs back to
+     * [windowStart] — the pack was already attached when the window opened. Dropping that second case loses
+     * the whole interval, and it is the common shape: a charge started before bedtime and removed during the
+     * night straddles the start of any session-bounded read. On the labelled 2026-07-30 night the pack
+     * connected at 04:42:44 UTC, ten minutes BEFORE the 04:52:58 session start, so a session-bounded read saw
+     * only the closer: charge coverage read 18 % instead of 55 % and the nightly mean came out 35.46 °C
+     * instead of 33.39 °C — a 2.07 °C miss on the exact night this gate exists for.
+     *
+     * NOT mirrored onto [offWristIntervals], deliberately. A WRIST_ON with no preceding WRIST_OFF is
+     * ambiguous — the strap also emits one as a post-boot state announcement (2026-07-05T04:31:25Z, one
+     * second after a BOOT/RTC_LOST), and reading that as "off-wrist since windowStart" would invent
+     * off-wrist time and drop real sleep. Healing charge time only ever EXCLUDES more contaminated
+     * skin-temp samples, which is the safe direction; healing wear time would fabricate absence.
      */
-    fun chargeIntervals(events: List<EventRow>, windowEnd: Long): List<Pair<Long, Long>> {
+    fun chargeIntervals(
+        events: List<EventRow>,
+        windowStart: Long,
+        windowEnd: Long,
+    ): List<Pair<Long, Long>> {
         fun span(open: String, close: String): List<Pair<Long, Long>> {
             val out = ArrayList<Pair<Long, Long>>()
             var openedAt: Long? = null
+            var sawOpener = false
             for (e in events.filter { it.kind.startsWith(open) || it.kind.startsWith(close) }
                 .sortedBy { it.ts }) {
                 if (e.kind.startsWith(open)) {
+                    sawOpener = true
                     if (openedAt == null) openedAt = e.ts            // ignore repeated openers
                 } else {
                     val s = openedAt
-                    if (s != null && e.ts > s) out.add(s to e.ts)
+                    if (s != null && e.ts > s) {
+                        out.add(s to e.ts)
+                    } else if (!sawOpener && e.ts > windowStart) {
+                        // Closer with no opener anywhere before it ⇒ open at the window edge. Guarded on
+                        // [sawOpener] so a repeated closer after a matched pair stays a no-op rather than
+                        // re-opening the interval back at windowStart.
+                        out.add(windowStart to e.ts)
+                        sawOpener = true
+                    }
                     openedAt = null
                 }
             }

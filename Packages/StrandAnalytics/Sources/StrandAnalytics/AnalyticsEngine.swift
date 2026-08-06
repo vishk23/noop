@@ -52,19 +52,45 @@ public enum AnalyticsEngine {
     /// is therefore walked independently and the results merged, so the union is the strap's whole
     /// on-charger time however the two witnesses interleave.
     ///
-    /// Each opener runs to its matching closer, or to `windowEnd` if the strap was still on the charger when
-    /// the read window ended. Events need not be pre-sorted; kinds are formatted "NAME(n)" and matched by
-    /// prefix; repeated openers/closers without a partner are coalesced. Mirrors `offWristIntervals`.
-    public static func chargeIntervals(events: [WhoopEvent], windowEnd: Int) -> [(start: Int, end: Int)] {
+    /// BOTH ENDS ARE HEALED, and the leading one is not hypothetical. An opener with no closer runs to
+    /// `windowEnd` (still on the charger when the read window ended); a CLOSER WITH NO OPENER runs back to
+    /// `windowStart` — the pack was already attached when the window opened. Dropping that second case loses
+    /// the whole interval, and it is the common shape: a charge started before bedtime and removed during the
+    /// night straddles the start of any session-bounded read. On the labelled 2026-07-30 night the pack
+    /// connected at 04:42:44 UTC, ten minutes BEFORE the 04:52:58 session start, so a session-bounded read saw
+    /// only the closer: charge coverage read 18 % instead of 55 % and the nightly mean came out 35.46 °C
+    /// instead of 33.39 °C — a 2.07 °C miss on the exact night this gate exists for.
+    ///
+    /// Events need not be pre-sorted; kinds are formatted "NAME(n)" and matched by prefix; repeated
+    /// openers/closers without a partner are coalesced.
+    ///
+    /// NOT mirrored onto `offWristIntervals`, deliberately. A `WRIST_ON` with no preceding `WRIST_OFF` is
+    /// ambiguous — the strap also emits one as a post-boot state announcement (2026-07-05T04:31:25Z, one
+    /// second after a BOOT/RTC_LOST), and reading that as "off-wrist since windowStart" would invent
+    /// off-wrist time and drop real sleep. Healing charge time only ever EXCLUDES more contaminated
+    /// skin-temp samples, which is the safe direction; healing wear time would fabricate absence.
+    public static func chargeIntervals(events: [WhoopEvent],
+                                       windowStart: Int,
+                                       windowEnd: Int) -> [(start: Int, end: Int)] {
         func span(open: String, close: String) -> [(start: Int, end: Int)] {
             var out: [(start: Int, end: Int)] = []
             var openedAt: Int? = nil
+            var sawOpener = false
             for e in events.filter({ $0.kind.hasPrefix(open) || $0.kind.hasPrefix(close) })
                             .sorted(by: { $0.ts < $1.ts }) {
                 if e.kind.hasPrefix(open) {
+                    sawOpener = true
                     if openedAt == nil { openedAt = e.ts }          // ignore repeated openers
+                } else if let s = openedAt, e.ts > s {
+                    out.append((start: s, end: e.ts))
+                    openedAt = nil
+                } else if !sawOpener, e.ts > windowStart {
+                    // Closer with no opener anywhere before it ⇒ open at the window edge. Guarded on
+                    // `sawOpener` so a repeated closer after a matched pair stays a no-op rather than
+                    // re-opening the interval back at windowStart.
+                    out.append((start: windowStart, end: e.ts))
+                    sawOpener = true
                 } else {
-                    if let s = openedAt, e.ts > s { out.append((start: s, end: e.ts)) }
                     openedAt = nil
                 }
             }
@@ -108,7 +134,7 @@ public enum AnalyticsEngine {
     /// NOT YET WIRED into the live path: `WhoopStore` exposes no battery-sample read, so `IntelligenceEngine`
     /// currently supplies `chargeIntervals` from EVENTS alone (which is what the labelled night proves out).
     /// This is the ready, tested fallback for when a battery read exists — union its output with
-    /// `chargeIntervals(events:windowEnd:)`.
+    /// `chargeIntervals(events:windowStart:windowEnd:)`.
     public static func chargeIntervalsFromSoc(_ samples: [(ts: Int, soc: Double)],
                                               maxGapSeconds: Int = 15 * 60) -> [(start: Int, end: Int)] {
         let s = samples.sorted { $0.ts < $1.ts }
@@ -1043,7 +1069,7 @@ public enum AnalyticsEngine {
     /// This range does NOT catch on-charger contamination, and must not be relied on to. On a WHOOP 5/MG the
     /// battery pack charges the strap ON THE WRIST, so a charge HEATS the sensor to 38–40 °C — comfortably
     /// INSIDE this window — rather than letting it fall to ambient. That is what the explicit
-    /// `chargeIntervals` gate is for; see `chargeIntervals(events:windowEnd:)`.
+    /// `chargeIntervals` gate is for; see `chargeIntervals(events:windowStart:windowEnd:)`.
     static let skinTempMinC = 28.0
     static let skinTempMaxC = 42.0
 
@@ -1071,7 +1097,7 @@ public enum AnalyticsEngine {
                                      // byte-identical. Threaded straight to the funnel's conversion.
                                      anchorRaw: Double? = nil,
                                      // On-charger `[start, end)` spans to exclude, from
-                                     // `chargeIntervals(events:windowEnd:)`. Default empty keeps every
+                                     // `chargeIntervals(events:windowStart:windowEnd:)`. Default empty keeps every
                                      // pure-function caller/test byte-identical.
                                      chargeIntervals: [(start: Int, end: Int)] = [],
                                      minSamples: Int = minSkinTempSamples) -> Double? {
@@ -1236,7 +1262,7 @@ public enum AnalyticsEngine {
                                       // byte-identical.
                                       anchorRaw: Double? = nil,
                                       // On-charger `[start, end)` spans, from
-                                      // `chargeIntervals(events:windowEnd:)`. Default empty keeps every
+                                      // `chargeIntervals(events:windowStart:windowEnd:)`. Default empty keeps every
                                       // pure-function caller/test byte-identical.
                                       chargeIntervals: [(start: Int, end: Int)] = [],
                                       minSamples: Int = minSkinTempSamples) -> SkinTempFunnelDiagnostic {
