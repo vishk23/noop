@@ -633,6 +633,7 @@
     <string name="l10n_live_workout_screen_cadence_68af11f0">Trittfrequenz</string>
     <string name="l10n_live_workout_screen_cancel_77dfd213">Abbrechen</string>
     <string name="l10n_live_workout_screen_effort_8c974bc6">Anstrengung</string>
+    <string name="l10n_live_workout_screen_of_c5e92da0">von %1$d</string>
     <string name="l10n_live_workout_screen_end_this_workout_4869c76a">Workout beenden?</string>
     <string name="l10n_live_workout_screen_end_workout_3e8d6238">Workout beenden</string>
     <string name="l10n_live_workout_screen_peak_c83dbbd3">Spitze</string>
@@ -1746,6 +1747,8 @@
     </plurals>
     <string name="timeline_spo2_not_on_whoop5">Dieses Band sendet kein SpO₂ über Bluetooth. Importiere einen WHOOP-Export oder Health Connect, um es zu sehen.</string>
     <string name="timeline_resp_not_on_whoop5">Dieses Band sendet keinen Rohdaten-Atemstrom. Deine geschätzte Atemfrequenz erscheint im Health-Bildschirm.</string>
+    <string name="settings_disclosure_expanded">Erweitert</string>
+    <string name="settings_disclosure_collapsed">Reduziert</string>
     <string name="l10n_data_sources_screen_last_shared_6bf8389c">"Zuletzt geteilt "</string>
     <string name="l10n_data_sources_screen_sharing_paused_health_connect_permission_was_e8950315">Teilen pausiert – die Health-Connect-Berechtigung wurde entzogen. Zum erneuten Erteilen tippen.</string>
     <string name="l10n_data_sources_screen_last_share_didn_t_finish_noop_0d6c27f0">Letztes Teilen unvollständig – NOOP versucht es automatisch erneut.</string>
@@ -1895,4 +1898,6 @@
         <item quantity="other">Deine Basislinie wird aufgebaut. Noch etwa %1$d Nächte, bis deine Werte persönlich sind.</item>
     </plurals>
     <string name="l10n_app_changelog_widgets_stop_inventing_numbers_naps_count_4f7491bb">Widgets erfinden keine Zahlen mehr, Nickerchen zählen für die Schlafschuld, und die Android-Statusanzeigen sprechen deine Sprache</string>
+    <string name="l10n_sleep_screen_may_be_incomplete_7230dc27">Möglicherweise unvollständig</string>
+    <string name="l10n_sleep_screen_little_motion_was_recorded_over_f061b7e4">Über Nacht wurde wenig Bewegung aufgezeichnet, daher wurde diese Nacht möglicherweise nicht vollständig erfasst und die Schlafdauer kann zu kurz erscheinen. Stelle sicher, dass das Band vollständig synchronisiert wurde.</string>
 </resources>

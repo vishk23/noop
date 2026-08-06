@@ -10,13 +10,50 @@ import Foundation
 // (OuraStreamMapping) apply the anchor. Honest-data invariant: a short/malformed record decodes to
 // nil upstream, so these structs only ever hold real decoded values.
 
+/// WHICH optical channel decoded an `OuraIBI` (#1071).
+///
+/// The ring reports the SAME heartbeats on more than one tag. They are not different beats and not
+/// duplicate records — they are independent measurements of one beat train, so a consumer that folds
+/// them together holds two copies of every night and every variability statistic built on successive
+/// differences (RMSSD, SDNN) breaks. The tag is the only thing that separates them at ingest; after the
+/// fact the two are only separable by the accident that their quantisation grids differ.
+///
+/// The raw values are the DURABLE cross-platform storage codes (they reach `rrInterval.srcChannel` via
+/// `WhoopProtocol.RRSourceChannel`, which pins the same numbers, and the Kotlin twin `OuraIbiChannel`).
+/// Never renumber a case; only append.
+public enum OuraIBIChannel: Int, Equatable, Sendable, Codable, CaseIterable {
+    /// 0x80 `green_ibi_quality_event` (s6.4) — green LED, gated on the ring's own `quality == 1` flag
+    /// and a 300-2000 ms physiological window, and it runs for the WHOLE wear period.
+    case greenQuality = 1
+    /// 0x6E `spo2_ibi_and_amplitude_event` (s6.3) — the SpO2 measurement's own beat train, quantised to
+    /// an 8 ms grid with NO quality gate, and only present while an SpO2 measurement is running.
+    case spo2Ibi = 2
+    /// 0x60 `ibi_and_amplitude_event` (s6.1) — the bit-packed IBI + amplitude family.
+    case ibiAmplitude = 3
+    /// 0x44 `ibi_event` (s6 / s0) — the SAME bit-packed layout as 0x60 and decoded by the same routine,
+    /// but a DIFFERENT tag on the wire, so it gets its own code.
+    ///
+    /// Both tags stamped `ibiAmplitude` until now, which made them indistinguishable once stored. That
+    /// hid the question the scoring-channel choice turns on: when that channel covers 1.25x the
+    /// wall-clock it spans, is ONE tag repeating beats across its records, or are TWO tags reporting the
+    /// same beats to each other? No stored night could answer it, because the label collapsed them.
+    /// Separating the codes costs nothing and makes the next capture decisive. Labelling only — both
+    /// tags decode and are read exactly as before.
+    case ibiBare = 4
+}
+
 /// One decoded inter-beat interval (and optional amplitude), in milliseconds.
 public struct OuraIBI: Equatable, Sendable, Codable {
     public let ringTimestamp: UInt32
     public let ibiMs: Int
     public let amplitude: Int?
-    public init(ringTimestamp: UInt32, ibiMs: Int, amplitude: Int? = nil) {
+    /// Which optical channel measured this beat (#1071). Every decoder stamps its own; nil only for a
+    /// value built by something that is not one of them.
+    public let channel: OuraIBIChannel?
+    public init(ringTimestamp: UInt32, ibiMs: Int, amplitude: Int? = nil,
+                channel: OuraIBIChannel? = nil) {
         self.ringTimestamp = ringTimestamp; self.ibiMs = ibiMs; self.amplitude = amplitude
+        self.channel = channel
     }
 }
 
@@ -30,26 +67,47 @@ public struct OuraHR: Equatable, Sendable, Codable {
     }
 }
 
-/// One decoded HRV (RMSSD-derived) sample from the ring's own 0x5D tag (OURA_PROTOCOL.md s6.9).
-/// NOOP also reconstructs RMSSD itself from the IBI streams for its own scoring; this is the ring's
-/// open HRV tag, NOT Oura's encrypted readiness score.
+/// One decoded 5-minute HRV bucket from the ring's own 0x5D tag (OURA_PROTOCOL.md s6.9): the ring's
+/// OWN average HR and RMSSD for that bucket. The 0x5D body is a run of `(u8 avg HR bpm, u8 avg RMSSD ms)`
+/// pairs, one per 5 min; `index` is the pair's position in the record. This is the ring's open HRV tag,
+/// NOT Oura's encrypted readiness score. NOOP also reconstructs RMSSD from the IBI streams for its own
+/// scoring; this tag is the ring's own summary (validated overnight — the hr byte tracks sleeping HR).
 public struct OuraHRV: Equatable, Sendable, Codable {
     public let ringTimestamp: UInt32
-    public let timeMs: Int
-    public let b1: Int
-    public let b2: Int
-    public init(ringTimestamp: UInt32, timeMs: Int, b1: Int, b2: Int) {
-        self.ringTimestamp = ringTimestamp; self.timeMs = timeMs; self.b1 = b1; self.b2 = b2
+    /// 0-based pair index within the record; buckets are ~5 min apart (consumer applies the offset).
+    public let index: Int
+    /// The ring's average HR for the 5-min bucket, in bpm (u8, no scaling).
+    public let hrBpm: Int
+    /// The ring's average RMSSD for the 5-min bucket, in ms (u8, no scaling).
+    public let rmssdMs: Int
+    public init(ringTimestamp: UInt32, index: Int, hrBpm: Int, rmssdMs: Int) {
+        self.ringTimestamp = ringTimestamp; self.index = index; self.hrBpm = hrBpm; self.rmssdMs = rmssdMs
     }
 }
 
 /// One decoded SpO2 sample. `value` is the raw SpO2 reading; `unit` documents its scale.
+///
+/// A single 0x6F / 0x77 record carries MANY samples, all sharing the record's `ringTimestamp`.
+/// `index`/`count` carry the sample's position within its record so the consumer can give each one its
+/// own second — without them the position is lost at decode time and cannot be recovered downstream,
+/// which is exactly how 12 of every 13 samples were silently dropped on the `(deviceId, ts)` primary
+/// key (#1070). `ringTimestamp` is deliberately left at the RECORD's time: it is the wire anchor, and
+/// the per-sample offset is applied where the durable row is minted (`OuraStreamMapping`), the same
+/// split the hypnogram path already uses. `index` mirrors `OuraSleepPhase.index`.
+///
+/// Both default (`index: 0, count: 1` = "the only sample in its record"), so single-sample decoders
+/// like 0x7B keep the record's own second unchanged.
 public struct OuraSpO2: Equatable, Sendable, Codable {
     public let ringTimestamp: UInt32
     public let value: Int
     public let unit: String
-    public init(ringTimestamp: UInt32, value: Int, unit: String = "raw") {
+    /// 0-based position of this sample within its record; samples are 1 s apart (consumer applies it).
+    public let index: Int
+    /// Total samples decoded from the same record. `index` is always in `0..<count`.
+    public let count: Int
+    public init(ringTimestamp: UInt32, value: Int, unit: String = "raw", index: Int = 0, count: Int = 1) {
         self.ringTimestamp = ringTimestamp; self.value = value; self.unit = unit
+        self.index = index; self.count = count
     }
 }
 

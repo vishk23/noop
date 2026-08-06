@@ -724,6 +724,13 @@ struct SleepView: View {
             if stageStagingIsLowConfidence(night) {
                 stageLowConfidenceNote
             }
+            // #345 follow-up: when a night was staged on SPARSE motion coverage it can UNDER-detect — the
+            // gravity-only spine fragments and the sub-60-min pieces are dropped, so a real ~8h night can
+            // collapse to a fraction ("slept 8h, app shows 1h"). Say so honestly so the short total isn't
+            // read as fact. Distinct from the H9 note above (a plausible-duration night with an off split).
+            if stageStagingIsSparse(night) {
+                stageIncompleteNote
+            }
             // For an Oura-provided night, say plainly that this split is the ring's RAW on-device
             // classification — so the larger Awake / smaller Deep+REM here isn't misread as the polished
             // numbers the Oura app shows for the same night (the app post-processes the same stream).
@@ -782,6 +789,15 @@ struct SleepView: View {
             asleepMin: s.asleep, deepMin: s.deep, remMin: s.rem, efficiency: effPct / 100.0)
     }
 
+    /// True when this night was staged on SPARSE motion coverage — the persisted `stagingSparse` flag the
+    /// engine sets from `SleepStager.isGravitySparse` (#345). Such a night can UNDER-detect: the gravity-only
+    /// spine fragments and sub-60-min pieces are dropped, so a real night collapses to a fraction. Reads the
+    /// day's REAL stored blocks (each carries the day's value), never the synthetic merged `session`; a nil
+    /// flag (imported / pre-migration night) is never flagged. Mirror in Kotlin.
+    private func stageStagingIsSparse(_ night: Night) -> Bool {
+        night.sourceBlocks.contains { $0.stagingSparse == true }
+    }
+
     /// Pure H9 gate (unit-testable without a live view) — true when a night's staging is low-confidence:
     /// a high-efficiency night whose deep+REM share is below the restorative floor. Built on the engine's
     /// own `ScoreConfidence.rest(...)` so the UI flag and the persisted Rest confidence agree. `asleepMin`,
@@ -823,6 +839,22 @@ struct SleepView: View {
         .padding(.horizontal, 2)
         .accessibilityElement(children: .combine)
         .accessibilityLabel("Low confidence staging. This night scored high efficiency but very little deep or REM, more likely an estimate miss than a real restorative shortfall.")
+    }
+
+    /// The sparse-coverage caveat: a night staged on thin motion data can under-detect and collapse a real
+    /// night to a fraction ("slept 8h, shows 1h"). Honest + actionable — tells the user to make sure the
+    /// strap fully synced. Distinct from the H9 note (an off deep/REM split, not a short total). (#345)
+    private var stageIncompleteNote: some View {
+        HStack(alignment: .top, spacing: 8) {
+            SourceBadge("May be incomplete", tint: StrandPalette.statusWarning)
+            Text("Your strap recorded little movement overnight (common on WHOOP 4.0), so this night may be under-detected and the sleep total can read short. Make sure the strap fully synced; the numbers are kept as-is.")
+                .font(StrandFont.footnote)
+                .foregroundStyle(StrandPalette.textTertiary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .padding(.horizontal, 2)
+        // `.combine` builds the a11y label from the badge + body Text (no separate localized string).
+        .accessibilityElement(children: .combine)
     }
 
     /// Honest caveat for an Oura-provided night: the stage split shown here is the ring's RAW on-device
@@ -2989,9 +3021,9 @@ private struct AddNapSeed: Identifiable {
     }
 }
 
-/// A small sheet to hand-correct a night's bed (onset) and wake (end) times. Seeds both pickers with the
-/// current values; the wake picker is bounded to after the chosen bedtime. Hands the chosen unix-second
-/// (bed, wake) back via `onSave`. Pure presentation + a single async save — persistence lives in the repo.
+/// A small sheet to hand-correct a night's bed (onset) and wake (end) instants. Seeds both pickers with
+/// the current values, including each calendar date. Hands the chosen unix-second (bed, wake) back via
+/// `onSave`. Pure presentation + a single async save — persistence lives in the repo.
 private struct SleepTimeEditor: View {
     let onSave: (Int, Int) async -> Void
     /// Optional destructive delete (#68). Non-nil for an existing main-sleep / nap edit (the editor then
@@ -3026,9 +3058,9 @@ private struct SleepTimeEditor: View {
     @State private var confirmingDisjoint = false
 
     /// `title`/`blurb`/`bedLabel`/`wakeLabel` default to the edit-an-existing-night wording; the
-    /// "Add a nap" caller (#508) overrides them. The save logic + day-derived wake are identical either
-    /// way — adding a nap is just an edit whose "existing" window is a seed. `onDelete` (#68) is the
-    /// optional destructive action; `deleteLabel` lets the nap editor say "Delete this nap".
+    /// "Add a nap" caller (#508) overrides them. The save logic is identical either way — adding a nap
+    /// is just an edit whose "existing" window is a seed. `onDelete` (#68) is the optional destructive
+    /// action; `deleteLabel` lets the nap editor say "Delete this nap".
     init(bedTs: Int, wakeTs: Int,
          title: LocalizedStringKey = "Edit sleep times",
          blurb: LocalizedStringKey = "Correct when you went to bed and woke. Stages are re-derived from your data; the edit is kept through the next strap sync.",
@@ -3054,19 +3086,12 @@ private struct SleepTimeEditor: View {
         _wake = State(initialValue: Date(timeIntervalSince1970: TimeInterval(wakeTs)))
     }
 
-    /// The wake instant to save: the picked wake TIME-OF-DAY landed on the FIRST occurrence strictly after
-    /// bedtime (within 24h). The Woke picker is time-only — its calendar day is always DERIVED from bed
-    /// here — so a wake can never be dragged onto an unrelated day. That independent wake-date drag was
-    /// what silently re-bucketed a night onto the wrong day and split its stages/totals across two days
-    /// (the edit-scramble half of #406). For a normal 23:00→07:00 night this resolves 07:00 to the next
-    /// morning; for a short evening nap it resolves to the same evening.
-    private func resolvedWake() -> Date {
-        let cal = Calendar.current
-        let hm = cal.dateComponents([.hour, .minute], from: wake)
-        // `nextDate(after:matching:)` returns the first instant with that hour:minute within 24h after the
-        // anchor, so starting one minute past bed keeps wake strictly after bedtime and inside (bed, bed+24h].
-        return cal.nextDate(after: bed.addingTimeInterval(60), matching: hm, matchingPolicy: .nextTime)
-            ?? bed.addingTimeInterval(8 * 3600)
+    /// The current edit window after the same future/inverted/duration guards used by persistence.
+    private var validatedWindow: (start: Int, end: Int)? {
+        SleepEditGuard.clampedEditWindow(
+            start: Int(bed.timeIntervalSince1970),
+            end: Int(wake.timeIntervalSince1970),
+            now: Int(Date().timeIntervalSince1970))
     }
 
     /// The single save funnel: both the direct Save and the #940 disjoint confirm land here.
@@ -3079,6 +3104,8 @@ private struct SleepTimeEditor: View {
     }
 
     var body: some View {
+        let canSave = validatedWindow != nil
+
         VStack(alignment: .leading, spacing: NoopMetrics.gap) {
             Text(title).font(StrandFont.title2).foregroundStyle(StrandPalette.textPrimary)
             Text(blurb)
@@ -3096,10 +3123,10 @@ private struct SleepTimeEditor: View {
                         .font(StrandFont.body)
                         .tint(StrandPalette.restColor)
                     Divider().overlay(StrandPalette.hairline)
-                    // Time-only on purpose — the wake's calendar day is derived from bed (see resolvedWake),
-                    // so an edit can't move the night to a different day and scramble its stages/totals (#406).
-                    DatePicker(wakeLabel, selection: $wake,
-                               displayedComponents: [.hourAndMinute])
+                    // The wake date and time are both editable so corrections preserve the exact
+                    // endpoint selected by the user (#970).
+                    DatePicker(wakeLabel, selection: $wake, in: ...Date(),
+                               displayedComponents: [.date, .hourAndMinute])
                         .datePickerStyle(.compact)
                         .font(StrandFont.body)
                         .tint(StrandPalette.restColor)
@@ -3129,18 +3156,18 @@ private struct SleepTimeEditor: View {
                     // #940 guard 2: a corrected window that no longer touches the night's recorded
                     // coverage has no data to stage from. Silently accepting it fabricated an
                     // all-awake phantom night; ask first.
-                    let start = Int(bed.timeIntervalSince1970)
-                    let end = Int(resolvedWake().timeIntervalSince1970)
+                    guard let window = validatedWindow else { return }
                     if let coverage, SleepEditGuard.isDisjoint(
-                        newStart: start, newEnd: end,
+                        newStart: window.start, newEnd: window.end,
                         coverageStart: coverage.lowerBound, coverageEnd: coverage.upperBound) {
                         confirmingDisjoint = true
                     } else {
-                        commit(start: start, end: end)
+                        commit(start: window.start, end: window.end)
                     }
                 }
                 .buttonStyle(.noopPrimary)
-                .disabled(saving)
+                .disabled(saving || !canSave)
+                .opacity(canSave ? 1 : 0.55)
             }
         }
         .padding(NoopMetrics.screenPadding)
@@ -3162,8 +3189,11 @@ private struct SleepTimeEditor: View {
         .alert("Move this sleep?", isPresented: $confirmingDisjoint) {
             Button("Cancel", role: .cancel) { }
             Button("Move anyway") {
-                commit(start: Int(bed.timeIntervalSince1970),
-                       end: Int(resolvedWake().timeIntervalSince1970))
+                guard let window = SleepEditGuard.clampedEditWindow(
+                    start: Int(bed.timeIntervalSince1970),
+                    end: Int(wake.timeIntervalSince1970),
+                    now: Int(Date().timeIntervalSince1970)) else { return }
+                commit(start: window.start, end: window.end)
             }
         } message: {
             Text("This moves the night to a time with no recorded data. Stages can't be derived there, so it may show as empty until data covers it.")
