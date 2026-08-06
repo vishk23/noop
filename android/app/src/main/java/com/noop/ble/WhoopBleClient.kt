@@ -2331,11 +2331,8 @@ class WhoopBleClient(
 
     // --- Offload frame drain (preserves START/data/END arrival order; port of routeBackfillFrame) ---
 
-    /** Ordered queue of offload frames awaiting the serial Backfiller drain. */
-    private val backfillFrameQueue = ConcurrentLinkedQueue<ByteArray>()
-
-    @Volatile
-    private var backfillDraining = false
+    /** Ordered queue + generation-safe owner for the serial Backfiller drain. */
+    private val backfillDrain = BackfillDrainGate<ByteArray>()
 
     /** Periodic re-offload + idle-watchdog tokens (handler-posted; cancelled on disconnect). */
     private val periodicBackfillRunnable = Runnable { triggerPeriodicBackfill() }
@@ -4161,6 +4158,16 @@ class WhoopBleClient(
     private val bondWatchdogRunnable = Runnable { onBondWatchdog() }
 
     @SuppressLint("MissingPermission")
+    /** #1095 diagnostic: the 5/MG bond state at a watchdog fire, so a "connects + reads battery but never
+     *  streams health data" report is legible. `writeInFlight=true` here is the smoking gun — the
+     *  CLIENT_HELLO confirmed write never got its `onCharacteristicWrite` callback, i.e. the strap went
+     *  SILENT (no ACK, and no 5/15 bond refusal that would have surfaced the pairing hint), so the watchdog
+     *  is tearing the link down blind. `family=WHOOP5 encryptedBond=false` alongside confirms the 5/MG
+     *  never authenticated. Diagnostic-only string; no behaviour change. */
+    private fun bondWatchdogContext(): String =
+        "(family=$connectedFamily writeInFlight=$writeInFlight didBond=$didBond " +
+            "encryptedBond=${_state.value.encryptedBond})"
+
     private fun onBondWatchdog() {
         // Already bonded (or torn down) — nothing wedged; the cancel sites normally beat us here, but
         // a late post on a binder-pool thread could still fire, so re-check before bouncing.
@@ -4176,7 +4183,8 @@ class WhoopBleClient(
         val gaveUp = bondWatchdogBackoff.recordBounce()
         intentionalDisconnect = false
         if (gaveUp) {
-            log("Bond handshake never completed after ${bondWatchdogBackoff.consecutiveBounces} escalating tries — pausing auto-reconnect and surfacing the re-pair guide (#971)")
+            log("Bond handshake never completed after ${bondWatchdogBackoff.consecutiveBounces} escalating tries " +
+                bondWatchdogContext() + " — pausing auto-reconnect and surfacing the re-pair guide (#971)")
             autoReconnectPausedForBondLoop = true
             bondLoopPausedAtMs = System.currentTimeMillis()   // the #78 hole-4 salvage probe covers this pause too
             if (_state.value.reconnectGuide == null) {
@@ -4192,7 +4200,28 @@ class WhoopBleClient(
                 ) }
             }
         } else {
-            log("Bond handshake stuck for ${bondWatchdogBackoff.currentWindowMs() / 1000}s — bouncing link to retry (attempt ${bondWatchdogBackoff.consecutiveBounces}, #50/#971)")
+            log("Bond handshake stuck for ${bondWatchdogBackoff.currentWindowMs() / 1000}s — bouncing link to retry " +
+                "(attempt ${bondWatchdogBackoff.consecutiveBounces}, #50/#971) " + bondWatchdogContext())
+            // #1095: a 5/MG whose CLIENT_HELLO confirmed write never ACKs (writeInFlight still true, never
+            // bonded) gets NEITHER the 5/15-refusal pairing hint NOR — until the 4-bounce give-up — the
+            // re-pair guide, so it loops for ~46s with no advice. Surface a 5/MG-tailored re-pair guide on
+            // the 2nd such SILENT bounce (the usual cause is the official app still holding the strap).
+            // Guidance STRING ONLY — the loop is unchanged (the give-up still pauses at the cap, and its own
+            // `reconnectGuide == null` check won't overwrite this). Unpairing is the right first step for any
+            // 5/MG that connects but never bonds, so surfacing it early is safe even before the capture.
+            if (connectedFamily == DeviceFamily.WHOOP5 && !didBond && writeInFlight &&
+                bondWatchdogBackoff.consecutiveBounces >= 2 && _state.value.reconnectGuide == null
+            ) {
+                log("WHOOP 5/MG: CLIENT_HELLO never acknowledged across ${bondWatchdogBackoff.consecutiveBounces} silent bounces — surfacing the re-pair guide early (#1095)")
+                _state.update { it.copy(reconnectGuide = """
+                    Your WHOOP 5.0/MG connects and reads battery, but never finishes pairing with NOOP, so no health data comes through. This is almost always the official WHOOP app still holding the strap (a 5.0 pairs with one phone at a time), or a stale Bluetooth pairing:
+
+                    1. Quit the official WHOOP app (or turn off Bluetooth on that phone).
+                    2. Open Settings → Bluetooth, find your WHOOP, and Forget / Unpair it.
+                    3. Tap the band repeatedly until its LEDs flash blue (pairing mode).
+                    4. Come back here and tap Connect.
+                    """.trimIndent()) }
+            }
         }
         // Drop the link either way: even on give-up we tear down the wedged GATT so it stops holding the
         // radio. gatt.disconnect() throwing on a dead binder (#314) must not crash from a timer — fall
@@ -6527,16 +6556,19 @@ class WhoopBleClient(
      * END chunk assembly is never reordered. Port of `routeBackfillFrame` + the serial drain task.
      */
     private fun routeBackfillFrame(frame: ByteArray) {
-        backfillFrameQueue.add(frame)
-        if (backfillDraining) return
-        backfillDraining = true
+        val lease = backfillDrain.enqueue(frame) ?: return
         ioScope.launch {
-            // A throw from ingest() must NEVER leave backfillDraining stuck true (that would wedge the
+            var ownsDrain = true
+            // A throw from ingest() must NEVER leave the drain stuck owned (that would wedge the
             // offload — every later frame returns early and the queue never drains). finally guarantees
-            // the flag is cleared even if a chunk handler throws. (#77/#91 hardening.)
+            // the lease is released even if a chunk handler throws. (#77/#91 hardening.)
             try {
                 while (true) {
-                    val f = backfillFrameQueue.poll() ?: break
+                    val f = backfillDrain.pollOrRelease(lease)
+                    if (f == null) {
+                        ownsDrain = false
+                        break
+                    }
                     try {
                         backfiller.ingest(f)
                     } catch (t: Throwable) {
@@ -6548,7 +6580,7 @@ class WhoopBleClient(
                     }
                 }
             } finally {
-                backfillDraining = false
+                if (ownsDrain) backfillDrain.release(lease)
             }
         }
     }
@@ -6574,7 +6606,7 @@ class WhoopBleClient(
             backfilling = false
             _state.update { it.copy(backfilling = false, syncChunksThisSession = 0) }
             handler.removeCallbacks(backfillTimeoutRunnable)
-            backfillFrameQueue.clear()
+            backfillDrain.clear()
             log("Backfill: no history frames arrived — retrying request (attempt ${whoop5HistoryAttempts + 1})")
             // Bounded mid-attempt retry (whoop5HistoryAttempts < 2): AUTO_CONTINUE so the 90s event floor
             // can't suppress it — it's continuing THIS connect's offload, not a fresh periodic kick.
@@ -6770,7 +6802,7 @@ class WhoopBleClient(
             )
         } }
         handler.removeCallbacks(backfillTimeoutRunnable)
-        backfillFrameQueue.clear()
+        backfillDrain.clear()
         closeWhoop5BackfillCapture(flushSummary = true)
         log("Backfill: session ended — reason=$reason")
         // Inactivity reminder (#419): read-only hook on the natural offload completion (no cadence
@@ -7107,7 +7139,8 @@ class WhoopBleClient(
                 alreadyPausedForBondLoop = autoReconnectPausedForBondLoop,
             ) && bondWatchdogBackoff.recordBounce()
         ) {
-            log("Strap connects and subscribes but never finishes pairing, then self-drops before the bond watchdog fires (${bondWatchdogBackoff.consecutiveBounces} cycles) — pausing auto-reconnect and surfacing the re-pair guide (#982/#971)")
+            log("Strap connects and subscribes but never finishes pairing, then self-drops before the bond watchdog fires (${bondWatchdogBackoff.consecutiveBounces} cycles) " +
+                bondWatchdogContext() + " — pausing auto-reconnect and surfacing the re-pair guide (#982/#971)")
             autoReconnectPausedForBondLoop = true
             bondLoopPausedAtMs = System.currentTimeMillis()   // the #78 hole-4 salvage probe covers this pause too
             if (_state.value.reconnectGuide == null) {
@@ -7318,8 +7351,7 @@ class WhoopBleClient(
                 System.currentTimeMillis() - backfillStartedAtMs)} (interrupted)")
         }
         backfilling = false
-        backfillDraining = false
-        backfillFrameQueue.clear()
+        backfillDrain.reset()
         strapNewestTs = null
         offloadFramesThisSession = 0
         lastOffloadFrameAtMs = 0L   // #174: don't carry a stale cooldown reference into the next session

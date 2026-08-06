@@ -419,6 +419,23 @@ final class Repository: ObservableObject {
         widgetAnchor(days: days, logicalKey: logicalDayKey(now), localKey: localDayKey(now))
     }
 
+    /// #1051-shaped memo for the anchor resolve on the high-frequency live surfaces. Not @Published — pure
+    /// bookkeeping, never drives the UI (like `todayHistoryWideLoadedSeq`).
+    private var widgetAnchorMemo = WidgetAnchorMemo()
+
+    /// Memoized `widgetAnchor(days: self.days)` for the Live Activity's ~1-3 Hz `onReceive` closures, which
+    /// otherwise re-derive the anchor (two `DateFormatter` formats + up to two full-history scans) on every
+    /// live-HR tick. Recomputes only when `days` changes (`refreshSeq`) or the day rolls — byte-identical to
+    /// the static overload. Call THIS from the per-tick live surfaces; tests use the pure 3-arg overload.
+    func cachedWidgetAnchor(now: Date = Date()) -> DailyMetric? {
+        widgetAnchorMemo.resolve(
+            days: days,
+            seq: refreshSeq,
+            logicalKey: Self.logicalDayKey(now),
+            localKey: Self.localDayKey(now)
+        ) { Repository.widgetAnchor(days: $0, logicalKey: $1, localKey: $2) }
+    }
+
     /// The recovery-INDEPENDENT overnight-vitals carry (the durable fix for the v8 Today rollover blank):
     /// the freshest strictly-prior day that recorded any of HRV / resting HR / respiratory, so the recovery
     /// VITALS keep reading through the post-04:00 window before tonight's sleep is scored, WITHOUT being
@@ -1661,24 +1678,28 @@ final class Repository: ObservableObject {
 
     /// Map each device id to the strap family that wrote its rows (#938), for the family-aware skin-temp
     /// raw→°C conversion. Reads the registry ONCE; the model-label → family mapping (and the `.whoop5`
-    /// fallback for unknowns) lives in `DeviceFamily.forRegistryModel` (#171). Best-effort: an unreadable
+    /// fallback for unknowns) lives in `DeviceFamily.forRegistryDevice` (#171, #1086). Best-effort: an unreadable
     /// registry yields an empty map, so every caller falls back to `.whoop5`.
     private static func skinTempFamilies(store: WhoopStore, ids: [String]) -> [String: DeviceFamily] {
         let devices = (try? DeviceRegistryStore(dbQueue: store.registryWriter).all()) ?? []
         var out: [String: DeviceFamily] = [:]
         for id in ids {
-            out[id] = DeviceFamily.forRegistryModel(devices.first(where: { $0.id == id })?.model)
+            let d = devices.first(where: { $0.id == id })
+            // A non-WHOOP device (nil) shares the non-4.0 raw→°C branch, so it coalesces to `.whoop5` —
+            // the exact scale it got before; brand-awareness just stops it *claiming* to be a WHOOP (#1086).
+            out[id] = DeviceFamily.forRegistryDevice(model: d?.model, brand: d?.brand) ?? .whoop5
         }
         return out
     }
 
     /// Family of the ACTIVE strap (#623), for the deep timeline's family-specific empty-state copy. Reuses
-    /// the canonical `DeviceFamily.forRegistryModel` (#171) with its `.whoop5` fallback for nil/unknown/
+    /// the canonical `DeviceFamily.forRegistryDevice` (#171, #1086) with its `.whoop5` fallback for nil/unknown/
     /// ambiguous, matching Android's `FullDayChartScreen`. Best-effort: no store / unreadable registry → `.whoop5`.
     func activeStrapFamily() -> DeviceFamily {
         guard let store else { return .whoop5 }
         let devices = (try? DeviceRegistryStore(dbQueue: store.registryWriter).all()) ?? []
-        return DeviceFamily.forRegistryModel(devices.first(where: { $0.id == deviceId })?.model)
+        let d = devices.first(where: { $0.id == deviceId })
+        return DeviceFamily.forRegistryDevice(model: d?.model, brand: d?.brand) ?? .whoop5
     }
 
     /// Whether the active strap has EVER banked a sample of `metric` (#623) — distinguishes a strap that

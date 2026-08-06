@@ -463,6 +463,7 @@
     <string name="l10n_live_workout_screen_cadence_68af11f0">Cadence</string>
     <string name="l10n_live_workout_screen_cancel_77dfd213">Cancelar</string>
     <string name="l10n_live_workout_screen_effort_8c974bc6">Esfuerzo</string>
+    <string name="l10n_live_workout_screen_of_c5e92da0">de %1$d</string>
     <string name="l10n_live_workout_screen_end_this_workout_4869c76a">¿Finalizar entrenamiento?</string>
     <string name="l10n_live_workout_screen_end_workout_3e8d6238">Finalizar entrenamiento</string>
     <string name="l10n_live_workout_screen_peak_c83dbbd3">Pico</string>
@@ -1731,6 +1732,8 @@
     </plurals>
     <string name="timeline_spo2_not_on_whoop5">Esta correa no envía SpO₂ por Bluetooth. Importa una exportación de WHOOP o Health Connect para verlo.</string>
     <string name="timeline_resp_not_on_whoop5">Esta correa no envía datos de respiración sin procesar. Tu frecuencia respiratoria estimada aparece en la pantalla Salud.</string>
+    <string name="settings_disclosure_expanded">Expandido</string>
+    <string name="settings_disclosure_collapsed">Contraído</string>
     <string name="l10n_data_sources_screen_last_shared_6bf8389c">"Compartido por última vez "</string>
     <string name="l10n_data_sources_screen_sharing_paused_health_connect_permission_was_e8950315">Uso compartido en pausa: se revocó el permiso de Health Connect. Toca para volver a concederlo.</string>
     <string name="l10n_data_sources_screen_last_share_didn_t_finish_noop_0d6c27f0">El último uso compartido no se completó: NOOP lo reintentará automáticamente.</string>
@@ -1880,4 +1883,6 @@
         <item quantity="other">Construyendo tu línea base. Faltan unas %1$d noches para que tus puntuaciones sean personales.</item>
     </plurals>
     <string name="l10n_app_changelog_widgets_stop_inventing_numbers_naps_count_4f7491bb">Los widgets dejan de inventar números, las siestas cuentan para la deuda de sueño y los indicadores de Android hablan tu idioma</string>
+    <string name="l10n_sleep_screen_may_be_incomplete_7230dc27">Puede estar incompleto</string>
+    <string name="l10n_sleep_screen_little_motion_was_recorded_over_f061b7e4">Se registró poco movimiento durante la noche, por lo que esta noche puede haberse detectado de forma incompleta y el total de sueño puede parecer corto. Asegúrate de que la correa se haya sincronizado por completo.</string>
 </resources>

@@ -793,6 +793,7 @@ object AnalyticsEngine {
             restConfidence = restConfidence,
             sessionMotionByStart = sessionMotionByStart,
             sessionSleepStateByStart = sessionSleepStateByStart,
+            gravitySparse = gravitySparse,
         )
     }
 

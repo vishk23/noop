@@ -1069,6 +1069,12 @@ private fun Hero(
             // so the larger Awake / smaller Deep+REM here isn't misread as the polished numbers the Oura app
             // shows for the same night (the app post-processes the same stream). Mirrors iOS ouraRawStagesNote.
             if (activeIsOura) OuraRawStagesNote()
+            // #345 follow-up: a night staged on SPARSE motion coverage can UNDER-detect and read short
+            // ("slept 8h, shows 1h"). Say so honestly, gated on the persisted stagingSparse flag (the day's
+            // SleepStager.isGravitySparse verdict). `session` is the REAL main block (selectNight's edit
+            // anchor), so it carries the flag; nil (imported / pre-migration) is never flagged. Mirrors iOS
+            // SleepView.stageIncompleteNote.
+            if (session?.stagingSparse == true) SleepIncompleteNote()
         }
         // Naps card (#508/#518): the day's blocks OTHER than the main night, each editable / deletable
         // with the SAME mechanism main sleep uses, plus a Main / Nap(s) / Total split so what drives the
@@ -1162,6 +1168,24 @@ private fun OuraRawStagesNote() {
             "This split is the ring's raw on-device classification read over Bluetooth, not the adjusted " +
                 "stages the Oura app shows. Expect more Awake and less Deep/REM here than in the Oura app " +
                 "for the same night.",
+            style = NoopType.caption,
+            color = Palette.textTertiary,
+        )
+    }
+}
+
+/** The sparse-coverage caveat (#345): a night staged on thin motion data can under-detect and read short
+ *  ("slept 8h, shows 1h"). Honest + actionable. Mirrors iOS SleepView.stageIncompleteNote. */
+@Composable
+private fun SleepIncompleteNote() {
+    Row(
+        horizontalArrangement = Arrangement.spacedBy(8.dp),
+        verticalAlignment = Alignment.Top,
+        modifier = Modifier.padding(horizontal = 2.dp),
+    ) {
+        SourceBadge(text = uiString(R.string.l10n_sleep_screen_may_be_incomplete_7230dc27), tint = Palette.statusWarning)
+        Text(
+            uiString(R.string.l10n_sleep_screen_little_motion_was_recorded_over_f061b7e4),
             style = NoopType.caption,
             color = Palette.textTertiary,
         )
@@ -1877,27 +1901,49 @@ private fun NightNavHeader(
         }
     }
 
-    // Wake-up picker also mutates only the draft. Its calendar day is derived from the DRAFT bedtime,
-    // so editing bedtime first and wake second produces one coherent cross-midnight window (#515/#406).
+    // Wake-up editing mutates only the draft. Date and time are selected explicitly so a correction can
+    // preserve the exact endpoint date instead of deriving it from bedtime (#970).
     val draftForWake = sleepEditDraft
     if (editingWake && session != null && draftForWake != null) {
         val endCal = Calendar.getInstance().apply { timeInMillis = draftForWake.endTs * 1000L }
         DisposableEffect(Unit) {
-            val dialog = TimePickerDialog(
+            var dateChosen = false
+            val dateDialog = DatePickerDialog(
                 context,
-                { _, h, m ->
-                    sleepEditDraft = draftForWake.withWakeTime(hour = h, minute = m)
+                { _, year, month, day ->
+                    dateChosen = true
+                    val selectedDate = Calendar.getInstance().apply {
+                        timeInMillis = draftForWake.endTs * 1000L
+                        set(Calendar.YEAR, year); set(Calendar.MONTH, month); set(Calendar.DAY_OF_MONTH, day)
+                    }
+                    val timeDialog = TimePickerDialog(
+                        context,
+                        { _, h, m ->
+                            selectedDate.set(Calendar.HOUR_OF_DAY, h); selectedDate.set(Calendar.MINUTE, m)
+                            selectedDate.set(Calendar.SECOND, 0); selectedDate.set(Calendar.MILLISECOND, 0)
+                            sleepEditDraft = draftForWake.withWakeCandidate(selectedDate.timeInMillis / 1000L)
+                        },
+                        endCal.get(Calendar.HOUR_OF_DAY), endCal.get(Calendar.MINUTE), true,
+                    ).apply { setTitle("Wake-up time") }
+                    timeDialog.setOnDismissListener {
+                        editingWake = false
+                        if (sleepEditDraft != null) showTimeChoice = true
+                    }
+                    timeDialog.show()
                 },
-                endCal.get(Calendar.HOUR_OF_DAY),
-                endCal.get(Calendar.MINUTE),
-                true,
-            ).apply { setTitle("Wake-up time") }
-            dialog.setOnDismissListener {
-                editingWake = false
-                if (sleepEditDraft != null) showTimeChoice = true
+                endCal.get(Calendar.YEAR), endCal.get(Calendar.MONTH), endCal.get(Calendar.DAY_OF_MONTH),
+            ).apply {
+                datePicker.maxDate = System.currentTimeMillis()
+                setTitle("Wake-up date")
+                setOnDismissListener {
+                    if (editingWake && !dateChosen) {
+                        editingWake = false
+                        if (sleepEditDraft != null) showTimeChoice = true
+                    }
+                }
             }
-            dialog.show()
-            onDispose { runCatching { dialog.dismiss() } }
+            dateDialog.show()
+            onDispose { runCatching { dateDialog.dismiss() } }
         }
     }
 

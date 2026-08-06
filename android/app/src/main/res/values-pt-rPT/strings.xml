@@ -616,6 +616,7 @@
     <string name="l10n_live_workout_screen_cadence_68af11f0">Cadência</string>
     <string name="l10n_live_workout_screen_cancel_77dfd213">Cancelar</string>
     <string name="l10n_live_workout_screen_effort_8c974bc6">Esforço</string>
+    <string name="l10n_live_workout_screen_of_c5e92da0">de %1$d</string>
     <string name="l10n_live_workout_screen_end_this_workout_4869c76a">Terminar este treino?</string>
     <string name="l10n_live_workout_screen_end_workout_3e8d6238">Terminar treino</string>
     <string name="l10n_live_workout_screen_peak_c83dbbd3">Pico</string>
@@ -1728,6 +1729,8 @@
     <string name="l10n_data_sources_screen_last_shared_6bf8389c">"Última partilha "</string>
     <string name="l10n_data_sources_screen_sharing_paused_health_connect_permission_was_e8950315">Partilha pausada: a permissão do Health Connect foi revogada. Toca para conceder novamente.</string>
     <string name="l10n_data_sources_screen_last_share_didn_t_finish_noop_0d6c27f0">A última partilha não foi concluída – o NOOP tentará novamente automaticamente.</string>
+    <string name="settings_disclosure_expanded">Expandido</string>
+    <string name="settings_disclosure_collapsed">Recolhido</string>
     <string name="settings_streak_title">Sequência</string>
     <plurals name="settings_streak_run">
         <item quantity="one">%1$d dia seguido</item>
@@ -1874,4 +1877,6 @@
         <item quantity="other">A construir a tua linha de base. Cerca de %1$d mais noites até que a tua pontuação seja pessoal.</item>
     </plurals>
     <string name="l10n_app_changelog_widgets_stop_inventing_numbers_naps_count_4f7491bb">Os widgets deixam de inventar números, as sestas contam para a dívida de sono, e os indicadores Android falam a tua língua</string>
+    <string name="l10n_sleep_screen_may_be_incomplete_7230dc27">Pode estar incompleto</string>
+    <string name="l10n_sleep_screen_little_motion_was_recorded_over_f061b7e4">Foi registado pouco movimento durante a noite, por isso esta noite pode ter sido subdetetada e o total de sono pode parecer curto. Certifique-se de que a pulseira sincronizou totalmente.</string>
 </resources>

@@ -463,6 +463,7 @@
     <string name="l10n_live_workout_screen_cadence_68af11f0">Cadence</string>
     <string name="l10n_live_workout_screen_cancel_77dfd213">Annuler</string>
     <string name="l10n_live_workout_screen_effort_8c974bc6">Effort</string>
+    <string name="l10n_live_workout_screen_of_c5e92da0">sur %1$d</string>
     <string name="l10n_live_workout_screen_end_this_workout_4869c76a">Terminer l\'entraînement ?</string>
     <string name="l10n_live_workout_screen_end_workout_3e8d6238">Terminer l\'entraînement</string>
     <string name="l10n_live_workout_screen_peak_c83dbbd3">Pic</string>
@@ -1731,6 +1732,8 @@
     </plurals>
     <string name="timeline_spo2_not_on_whoop5">Ce bracelet n\'envoie pas de SpO₂ par Bluetooth. Importez un export WHOOP ou Health Connect pour le voir.</string>
     <string name="timeline_resp_not_on_whoop5">Ce bracelet n\'envoie aucun flux de respiration brut. Votre fréquence respiratoire estimée apparaît sur l\'écran Santé.</string>
+    <string name="settings_disclosure_expanded">Développé</string>
+    <string name="settings_disclosure_collapsed">Réduit</string>
     <string name="l10n_data_sources_screen_last_shared_6bf8389c">"Dernier partage "</string>
     <string name="l10n_data_sources_screen_sharing_paused_health_connect_permission_was_e8950315">Partage en pause — l’autorisation Health Connect a été révoquée. Touchez pour l’accorder à nouveau.</string>
     <string name="l10n_data_sources_screen_last_share_didn_t_finish_noop_0d6c27f0">Le dernier partage n’a pas abouti — NOOP réessaiera automatiquement.</string>
@@ -1880,4 +1883,6 @@
         <item quantity="other">Construction de votre référence. Encore environ %1$d nuits avant que vos scores soient personnels.</item>
     </plurals>
     <string name="l10n_app_changelog_widgets_stop_inventing_numbers_naps_count_4f7491bb">Les widgets n\'inventent plus de chiffres, les siestes comptent pour la dette de sommeil, et les indicateurs Android parlent votre langue</string>
+    <string name="l10n_sleep_screen_may_be_incomplete_7230dc27">Peut être incomplet</string>
+    <string name="l10n_sleep_screen_little_motion_was_recorded_over_f061b7e4">Peu de mouvement a été enregistré cette nuit ; cette nuit peut donc être sous-détectée et le total de sommeil peut sembler court. Assurez-vous que le bracelet est entièrement synchronisé.</string>
 </resources>

@@ -781,8 +781,29 @@ final class IntelligenceEngine: ObservableObject {
                     // from a cross-second one (it would not) — a rule that lived only in the comment above,
                     // so triaging an "HRV reads ~2x high" report required knowing it. Now the line says which.
                     let verdict = HRVAnalyzer.classifyCoverage(coverage: covVal, collapsed: colCovVal)
-                    hrvDiag = "hrv diag day=\(res.daily.day) rmssd=\(ms(h.rmssd))ms sdnn=\(ms(h.sdnn))ms "
+                    // #550 follow-up: having stated the conclusion, ACT on it. SDNN is a spread over every
+                    // interval, so an over-counted night inflates it directly — a ring whose banked R-R
+                    // covers 1.25x its wall-clock reads ~197 ms across a sleeping night, against a 40-100 ms
+                    // physiological range. Printing that number beside the verdict that says it cannot be
+                    // trusted invites it to be read as a measurement, so it is withheld instead; the
+                    // `rrIntegrity=` field on the same line says why. RMSSD/meanNN are NOT withheld — mean
+                    // rate survives an over-count, and RMSSD's dominant error was the emission order fixed
+                    // at the write path (#1072).
+                    // P7' follow-up: the over-count verdict is necessary but NOT sufficient. The
+                    // 2026-08-06 Oura night measured coverage 1.03 / `plausible` — no duplication at
+                    // all, its records tiling the timeline at a fill ratio of 0.990 — and still printed
+                    // SDNN 174 ms. A BANKED stream stamps a whole record of intervals on one timestamp,
+                    // so its stored values are a decomposition of a record period, not beat-to-beat
+                    // measurements: the per-record SUM is right to ~1% (meanNN and RHR stay correct and
+                    // WHOOP-validated) while the individual intervals are not. Gate on that too.
+                    let accVal = HRVAnalyzer.beatAccurateFraction(tsSec: ts, rrMs: sleepRr)
+                    let acc = String(format: "%.2f", accVal)
+                    let sdnnField = HRVAnalyzer.beatSpreadIsTrustworthy(verdict)
+                        && HRVAnalyzer.beatValuesAreTrustworthy(beatAccurateFraction: accVal)
+                        ? "\(ms(h.sdnn))ms" : "withheld"
+                    hrvDiag = "hrv diag day=\(res.daily.day) rmssd=\(ms(h.rmssd))ms sdnn=\(sdnnField) "
                         + "meanNN=\(ms(h.meanNN))ms rr=\(h.nInput)/\(h.nClean) rejected=\(rej)% coverage=\(cov) collapsedCov=\(colCov) dupBeats=\(dup) "
+                        + "beatAccurate=\(acc) "
                         + "rrIntegrity=\(verdict.rawValue)"
                 }
                 // ── Steps test mode: 5/MG raw-counter trace ──────────────────────────────────────────────
@@ -1629,9 +1650,12 @@ final class IntelligenceEngine: ObservableObject {
 
     /// The strap family that wrote `owner`'s skin-temp rows (#938), so the nightly funnel converts the raw
     /// register on the right scale. The model-label → family mapping (and the `.whoop5` fallback for
-    /// unknowns) lives in `DeviceFamily.forRegistryModel` (#171).
+    /// unknowns) lives in `DeviceFamily.forRegistryDevice` (#171, #1086).
     nonisolated static func skinTempFamily(forOwner owner: String, devices: [PairedDevice]) -> DeviceFamily {
-        DeviceFamily.forRegistryModel(devices.first(where: { $0.id == owner })?.model)
+        let d = devices.first(where: { $0.id == owner })
+        // Non-WHOOP owner (nil) shares the non-4.0 temp scale, so coalesce to `.whoop5` — same conversion
+        // as before; the brand-aware resolver just no longer mislabels the owner as a WHOOP (#1086).
+        return DeviceFamily.forRegistryDevice(model: d?.model, brand: d?.brand) ?? .whoop5
     }
 
     /// #137: re-score under-sampled manual workouts. A `manual` workout is scored from the live HR

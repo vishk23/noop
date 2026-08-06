@@ -87,8 +87,16 @@ object OuraDecoders {
      * decoded to an 82% beat-to-beat >200ms "jump" rate (not a heartbeat train). This byte-scatter
      * layout yields a coherent ~60 bpm train (10% jump rate). Validated against open_oura. Byte-identical
      * twin of Swift's decodeIBIAmplitude.
+     *
+     * @param channel which tag's record this is. 0x60 and 0x44 share this layout byte for byte, so they
+     *   share the decoder — but they are different tags on the wire, and the caller states which one it
+     *   routed here so the beat carries its true origin (#1071 follow-up). Defaults to 0x60's channel,
+     *   which is what every existing call site means.
      */
-    fun decodeIBIAmplitude(rec: OuraRecord): List<OuraIBI>? {
+    fun decodeIBIAmplitude(
+        rec: OuraRecord,
+        channel: OuraIbiChannel = OuraIbiChannel.IBI_AMPLITUDE,
+    ): List<OuraIBI>? {
         val b = rec.payload
         if (b.size < 14) return null   // fixed 14-byte packet (body bytes 6..19)
         val b12 = b[12] and 0xFF
@@ -107,7 +115,12 @@ object OuraDecoders {
         for (k in 0 until 6) {
             if (ibi[k] <= 0) continue                      // drop a zero IBI, never invent one
             val amp = ((b[6 + k] and 0xFF) shr 1) shl shift   // 7-bit mantissa << exponent
-            out.add(OuraIBI(ringTimestamp = rec.ringTimestamp, ibiMs = ibi[k], amplitude = amp))
+            out.add(
+                OuraIBI(
+                    ringTimestamp = rec.ringTimestamp, ibiMs = ibi[k], amplitude = amp,
+                    channel = channel,
+                ),
+            )
         }
         return if (out.isEmpty()) null else out
     }
@@ -181,7 +194,12 @@ object OuraDecoders {
             val ibi = (b[i + 1] and 0x07) or ((b[i] and 0xFF) shl 3)   // high byte first
             val quality = (b[i + 1] shr 3) and 0x03
             if (quality == 1 && ibi in 300..2000) {
-                out.add(OuraIBI(ringTimestamp = rec.ringTimestamp, ibiMs = ibi))
+                out.add(
+                    OuraIBI(
+                        ringTimestamp = rec.ringTimestamp, ibiMs = ibi,
+                        channel = OuraIbiChannel.GREEN_QUALITY,
+                    ),
+                )
             }
             i += 2
             sampleCount += 1
@@ -210,7 +228,12 @@ object OuraDecoders {
         while (idx >= 1) {
             val ibi = b[idx] * 8                          // 8-bit count x8 -> ms
             if (ibi > 0) {
-                out.add(OuraIBI(ringTimestamp = rec.ringTimestamp, ibiMs = ibi))
+                out.add(
+                    OuraIBI(
+                        ringTimestamp = rec.ringTimestamp, ibiMs = ibi,
+                        channel = OuraIbiChannel.SPO2_IBI,
+                    ),
+                )
             }
             idx -= 1
         }
@@ -220,21 +243,24 @@ object OuraDecoders {
     // MARK: - HRV / RMSSD (0x5D; s6.9)
 
     /**
-     * Decode the 0x5D hrv_event: samples each carrying a time_ms field + two int8 fields (b1, b2).
-     * Per OURA_PROTOCOL.md s6.9 the per-sample stride is time(2 LE) + b1(1) + b2(1) = 4 bytes.
-     * Returns null on a short body. NOOP consumes this as the ring's OWN RMSSD-derived HRV tag.
+     * Decode the 0x5D hrv_event: a run of (u8 avg HR bpm, u8 avg RMSSD ms) pairs, ONE per 5-min bucket
+     * (per open_oura decode_hrv / OURA_PROTOCOL.md s6.9). The previous layout read a 4-byte
+     * (u16 time, int8, int8) stride — a mis-framing that garbled the first (hr,rmssd) byte-pair into a
+     * bogus time_ms, sign-flipped the RMSSD byte, and only its b1 accidentally landed on a real HR byte.
+     * Both bytes are UNSIGNED (no scaling). Returns null on an empty or ODD-length body (no partial pair).
+     * Validated overnight: the hr byte tracks sleeping HR (~52 bpm, matching the #511 IBI-derived median).
+     * Twin of Swift decodeHRV.
      */
     fun decodeHRV(rec: OuraRecord): List<OuraHRV>? {
         val b = rec.payload
-        if (b.size < 4) return null
+        if (b.size < 2 || b.size % 2 != 0) return null   // N complete (hr, rmssd) pairs
         val out = ArrayList<OuraHRV>()
         var i = 0
-        while (i + 4 <= b.size) {
-            val timeMs = u16le(b, i)
-            val v1 = i8(b[i + 2])
-            val v2 = i8(b[i + 3])
-            out.add(OuraHRV(ringTimestamp = rec.ringTimestamp, timeMs = timeMs, b1 = v1, b2 = v2))
-            i += 4
+        var index = 0
+        while (i + 2 <= b.size) {
+            out.add(OuraHRV(ringTimestamp = rec.ringTimestamp, index = index, hrBpm = b[i], rmssdMs = b[i + 1]))
+            i += 2
+            index += 1
         }
         return if (out.isEmpty()) null else out
     }
@@ -269,10 +295,24 @@ object OuraDecoders {
         while (i < b.size) {
             val raw = b[i]
             if (raw == 0xFF) break                       // terminator
-            out.add(OuraSpO2(ringTimestamp = rec.ringTimestamp, value = raw))
+            // The samples are one PER SECOND, so each carries its position in the record: ringTimestamp
+            // stays the record's anchor and the consumer spreads them over their own seconds. Without the
+            // position the offset is unrecoverable downstream and 12 of every 13 samples collide away on
+            // the (deviceId, ts) primary key (#1070). Swift twin matches exactly.
+            out.add(OuraSpO2(ringTimestamp = rec.ringTimestamp, value = raw, index = out.size))
             i += 1
         }
-        return if (out.isEmpty()) null else out
+        return if (out.isEmpty()) null else stampSampleCount(out)
+    }
+
+    /**
+     * Fill in `count` (the number of samples the record yielded) on every sample of one record. The
+     * total is only known once the body has been walked, so the decoders stamp `index` inline and the
+     * count in one pass at the end. Twin of Swift `stampSampleCount`.
+     */
+    private fun stampSampleCount(samples: List<OuraSpO2>): List<OuraSpO2> {
+        val n = samples.size
+        return samples.map { it.copy(count = n) }
     }
 
     // MARK: - SpO2 stable, BIG-endian (0x7B; s6.6)
@@ -310,16 +350,18 @@ object OuraDecoders {
         }
         val out = ArrayList<OuraSpO2>()
         if (hasBase) {
-            out.add(OuraSpO2(ringTimestamp = rec.ringTimestamp, value = acc, unit = "dc_raw"))
+            out.add(OuraSpO2(ringTimestamp = rec.ringTimestamp, value = acc, unit = "dc_raw", index = 0))
         }
         while (i < b.size) {
             val v = i8(b[i])
             val mag = Math.abs(v) shl scale
             acc += if (v < 0) -mag else mag
-            out.add(OuraSpO2(ringTimestamp = rec.ringTimestamp, value = acc, unit = "dc_raw"))
+            // Same per-sample position as 0x6F (see #1070): this record is multi-sample too, and its
+            // samples reach the same (deviceId, ts)-keyed table, so they collide the same way.
+            out.add(OuraSpO2(ringTimestamp = rec.ringTimestamp, value = acc, unit = "dc_raw", index = out.size))
             i += 1
         }
-        return if (out.isEmpty()) null else out
+        return if (out.isEmpty()) null else stampSampleCount(out)
     }
 
     // MARK: - Temperature (0x46 / 0x69 / 0x75; s6.8)

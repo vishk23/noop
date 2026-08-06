@@ -637,8 +637,29 @@ object IntelligenceEngine {
                 // one (it would not) — a rule that lived only in the comments above, so triaging an
                 // "HRV reads ~2x high" report required knowing it. Now the line says which.
                 val verdict = HrvAnalyzer.classifyCoverage(covVal, colCovVal)
-                diag("hrv diag day=${res.daily.day} rmssd=${ms(h.rmssd)}ms sdnn=${ms(h.sdnn)}ms meanNN=${ms(h.meanNN)}ms " +
+                // #550 follow-up: having stated the conclusion, ACT on it. SDNN is a spread over every
+                // interval, so an over-counted night inflates it directly — a ring whose banked R-R covers
+                // 1.25x its wall-clock reads ~197 ms across a sleeping night, against a 40-100 ms
+                // physiological range. Printing that number beside the verdict that says it cannot be
+                // trusted invites it to be read as a measurement, so it is withheld instead; the
+                // `rrIntegrity=` field on the same line says why. RMSSD/meanNN are NOT withheld — mean rate
+                // survives an over-count, and RMSSD's dominant error was the emission order fixed at the
+                // write path (#1072). Twin of the Swift line.
+                // P7' follow-up: the over-count verdict is necessary but NOT sufficient. The 2026-08-06
+                // Oura night measured coverage 1.03 / PLAUSIBLE — no duplication at all, its records
+                // tiling the timeline at a fill ratio of 0.990 — and still printed SDNN 174 ms. A BANKED
+                // stream stamps a whole record of intervals on one timestamp, so its stored values are a
+                // decomposition of a record period, not beat-to-beat measurements: the per-record SUM is
+                // right to ~1% (meanNN and RHR stay correct and WHOOP-validated) while the individual
+                // intervals are not. Gate on that too. Twin of the Swift line.
+                val accVal = HrvAnalyzer.beatAccurateFraction(ts, sleepRr)
+                val acc = String.format(java.util.Locale.US, "%.2f", accVal)
+                val sdnnField =
+                    if (HrvAnalyzer.beatSpreadIsTrustworthy(verdict) &&
+                        HrvAnalyzer.beatValuesAreTrustworthy(accVal)) "${ms(h.sdnn)}ms" else "withheld"
+                diag("hrv diag day=${res.daily.day} rmssd=${ms(h.rmssd)}ms sdnn=$sdnnField meanNN=${ms(h.meanNN)}ms " +
                     "rr=${h.nInput}/${h.nClean} rejected=$rej% coverage=$cov collapsedCov=$colCov dupBeats=$dup " +
+                    "beatAccurate=$acc " +
                     "rrIntegrity=${verdict.raw}")
             }
 
@@ -921,6 +942,9 @@ object IntelligenceEngine {
                         restingHr = s.restingHR,
                         avgHrv = s.avgHRV,
                         stagesJSON = AnalyticsEngine.encodeStages(s.stages),
+                        // #345 follow-up: stamp the day's motion-coverage verdict so the Sleep tab can
+                        // caption a sparse (likely under-detected) night. Twin of Swift analyzeDay.
+                        stagingSparse = res.gravitySparse,
                     ),
                 )
             }

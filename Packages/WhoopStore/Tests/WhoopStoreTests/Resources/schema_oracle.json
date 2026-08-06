@@ -1,6 +1,6 @@
 {
   "_readme": "SHARED Room<->GRDB SCHEMA ORACLE (#775). Two byte-identical copies: Packages/WhoopStore/Tests/WhoopStoreTests/Resources/schema_oracle.json and android/app/src/test/resources/schema_oracle.json. SchemaOracleTests.swift compares GRDB's PRAGMA table_info/index_list against it; SchemaOracleTest.kt compares Room's exported schema JSON against it. `columns` is the iOS/GRDB shape in GRDB column order (macOS is the reference implementation); every way Android differs is spelled out in an `android` / `iosAbsent` / `androidColumnOrder` override naming a key in `divergenceReasons`. Adding a column, reordering one, or changing a type/nullability on one platform only fails both suites until it is either fixed or written down here. `grdbMigrationLineages` is the same idea for migration IDENTIFIERS: a fork that numbered its own migrations before upstream reached those numbers declares them there instead of renumbering \u2014 GRDB keys migrations by identifier string, so renaming one wedges a database that already ran it.",
-  "roomVersion": 25,
+  "roomVersion": 29,
   "grdbMigrations": [
     "v1",
     "v2",
@@ -36,7 +36,11 @@
     "v28-raw-imu",
     "v29-score-input-provenance",
     "v30-rr-ord",
-    "v31-deep-capture-channels"
+    "v31-deep-capture-channels",
+    "v32-rr-src-channel",
+    "v33-workout-steps",
+    "v34-sleep-staging-sparse",
+    "v35-rr-future-quarantine"
   ],
   "grdbMigrationLineages": {
     "fork-ios-only": {
@@ -1470,6 +1474,18 @@
           "affinity": "INTEGER",
           "notNull": false,
           "default": null
+        },
+        {
+          "name": "srcChannel",
+          "affinity": "INTEGER",
+          "notNull": false,
+          "default": null
+        },
+        {
+          "name": "tsSuspect",
+          "affinity": "INTEGER",
+          "notNull": false,
+          "default": null
         }
       ],
       "primaryKey": [
@@ -1647,6 +1663,12 @@
         {
           "name": "sleepStateJSON",
           "affinity": "TEXT",
+          "notNull": false,
+          "default": null
+        },
+        {
+          "name": "stagingSparse",
+          "affinity": "INTEGER",
           "notNull": false,
           "default": null
         }
@@ -1893,6 +1915,12 @@
           "default": null,
           "iosAbsent": true,
           "divergence": "workout-route-polyline-android-only"
+        },
+        {
+          "name": "steps",
+          "affinity": "INTEGER",
+          "notNull": false,
+          "default": null
         }
       ],
       "primaryKey": [
