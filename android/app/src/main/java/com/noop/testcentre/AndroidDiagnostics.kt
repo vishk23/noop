@@ -122,7 +122,18 @@ object AndroidDiagnostics {
             val windowSkin = repo.skinTempSamples(id, nowSec - 14L * 86400L, nowSec, Int.MAX_VALUE)
             val devAnchor = if (family == com.noop.protocol.DeviceFamily.WHOOP4)
                 com.noop.protocol.Whoop4SkinTemp.deviceAnchorRaw(windowSkin.map { it.raw }) else null
-            add(com.noop.analytics.AnalyticsEngine.skinTempFunnel(listOf(det), hr, skin, family, devAnchor).summary)
+            // Same on-charger exclusion the real computation applies, so this funnel keeps explaining the
+            // SAME mean the app uses (its whole contract) instead of diverging on any night with a charge
+            // in it. Twin of the Swift `DebugDataDiagnostics` line.
+            val nightEvents = repo.events(id, session.startTs, session.endTs, 50_000)
+            add(
+                com.noop.analytics.AnalyticsEngine.skinTempFunnel(
+                    listOf(det), hr, skin, family, devAnchor,
+                    com.noop.analytics.AnalyticsEngine.chargeIntervals(
+                        nightEvents, session.startTs, session.endTs,
+                    ),
+                ).summary,
+            )
 
             // #112/#103 — the 5/MG SpO2 CANDIDATE (@82), as one number a wearer can check against the
             // figure the WHOOP app reports for the same night. The candidate cannot be promoted while two
@@ -157,6 +168,21 @@ object AndroidDiagnostics {
                     add("SpO₂ candidate @82 (5/MG): no in-band readings inside this night's span.")
                 else -> add("SpO₂ candidate @82: not carried by a WHOOP 4.0 (raw red/IR ADC only).")
             }
+
+            // Three-state strap liveness for the night, from the strap's own STRAP_CONDITION_REPORT
+            // heartbeat. This is what tells a reader WHICH kind of absence they are looking at: a night that
+            // reports aliveNotWorn has no missing data to hunt for (the strap was off the wrist and
+            // correctly recorded nothing), while one that reports silent may still have data sitting
+            // un-offloaded in the strap. Every other line in this export describes what WAS collected; this
+            // one describes why something was not. Reuses `nightEvents` — no extra read. Diagnostic only;
+            // nothing scores it. Twin of the Swift `DebugDataDiagnostics` line.
+            add(
+                com.noop.analytics.StrapLiveness.summarize(
+                    com.noop.analytics.StrapLiveness.timeline(
+                        nightEvents, hr, session.startTs, session.endTs,
+                    ),
+                ).summary,
+            )
         }.onFailure { add("(funnels unavailable: ${it.message})") }
     }
 

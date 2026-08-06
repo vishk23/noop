@@ -182,6 +182,16 @@ enum DebugDataDiagnostics {
         } else {
             lines.append("SpO₂ candidate @82: not carried by a WHOOP 4.0 (raw red/IR ADC only).")
         }
+
+        // Three-state strap liveness for the night, from the strap's own STRAP_CONDITION_REPORT heartbeat.
+        // This is what tells a reader WHICH kind of absence they are looking at: a night that reports
+        // aliveNotWorn has no missing data to hunt for (the strap was off the wrist and correctly recorded
+        // nothing), while one that reports silent may still have data sitting un-offloaded in the strap.
+        // Every other line in this export describes what WAS collected; this one describes why something
+        // was not. Reuses `nightEvents` — no extra read. Diagnostic only; nothing scores it.
+        let liveness = StrapLiveness.timeline(events: nightEvents, hr: hr,
+                                              windowStart: cs.startTs, windowEnd: cs.endTs)
+        lines.append(StrapLiveness.summarize(liveness).summary)
         return lines
     }
 
