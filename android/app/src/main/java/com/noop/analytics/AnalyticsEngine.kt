@@ -68,6 +68,93 @@ object AnalyticsEngine {
         return intervals
     }
 
+    /**
+     * Pair the strap's own charge events into [start, end) intervals, for gates that must exclude
+     * on-charger time (today: the nightly skin-temp mean). Mirrors Swift `chargeIntervals`.
+     *
+     * WHY THE EVENTS AND NOT THE `battery_charging` BIT: that bit is decoded at an UNVERIFIED offset on the
+     * 5/MG and is known-wrong in the field — across the labelled 2026-07-29→30 charge below it read FALSE on
+     * every one of ~150 readings while SoC climbed 9.4 → 100 %.
+     *
+     * TWO EVENT PAIRS, UNIONED — and the pack pair is the load-bearing one. On a WHOOP 5/MG the battery pack
+     * slides onto the strap and stays there while the charge current cycles: the real night carried ONE
+     * BATTERY_PACK_CONNECTED→REMOVED span (00:42→04:58 ET) containing FIFTEEN CHARGING_ON/OFF pairs, and the
+     * sensor read 38–40 °C straight through every CHARGING_OFF gap, because the pack was still physically
+     * attached and thermally coupled. Pairing CHARGING_ON/OFF alone would re-admit those gaps.
+     */
+    fun chargeIntervals(events: List<EventRow>, windowEnd: Long): List<Pair<Long, Long>> {
+        fun span(open: String, close: String): List<Pair<Long, Long>> {
+            val out = ArrayList<Pair<Long, Long>>()
+            var openedAt: Long? = null
+            for (e in events.filter { it.kind.startsWith(open) || it.kind.startsWith(close) }
+                .sortedBy { it.ts }) {
+                if (e.kind.startsWith(open)) {
+                    if (openedAt == null) openedAt = e.ts            // ignore repeated openers
+                } else {
+                    val s = openedAt
+                    if (s != null && e.ts > s) out.add(s to e.ts)
+                    openedAt = null
+                }
+            }
+            val s = openedAt
+            if (s != null && windowEnd > s) out.add(s to windowEnd)
+            return out
+        }
+        return mergeIntervals(
+            span("BATTERY_PACK_CONNECTED", "BATTERY_PACK_REMOVED") + span("CHARGING_ON", "CHARGING_OFF"),
+        )
+    }
+
+    /** Sort + coalesce overlapping/abutting [start, end) intervals into a minimal disjoint set. */
+    internal fun mergeIntervals(raw: List<Pair<Long, Long>>): List<Pair<Long, Long>> {
+        val sorted = raw.filter { it.second > it.first }.sortedBy { it.first }
+        val out = ArrayList<Pair<Long, Long>>()
+        for (iv in sorted) {
+            val last = out.lastOrNull()
+            if (last != null && iv.first <= last.second) {
+                out[out.size - 1] = last.first to maxOf(last.second, iv.second)
+            } else {
+                out.add(iv)
+            }
+        }
+        return out
+    }
+
+    /**
+     * A charge run must sustain at least this rise rate (percentage points per HOUR) to be inferred from
+     * state-of-charge alone. A WHOOP 5 charges at roughly 50 pp/h (the real night averaged ~20 pp/h
+     * including its current-off gaps) against a ~1.65 pp/h discharge, so 6 pp/h sits an order of magnitude
+     * clear of both. Deliberately a RATE, not a fixed per-reading step: a fixed 1.0 pp per-reading threshold
+     * never fires, because at the real ~30 s cadence a genuine charge steps only ~0.2–0.8 pp.
+     */
+    internal const val CHARGE_RISE_PCT_PER_HOUR: Double = 6.0
+
+    /**
+     * Infer charge [start, end) intervals from a rising state-of-charge series — the fallback for when the
+     * strap's charge EVENTS are missing. Additive to [chargeIntervals]; union the two. Readings more than
+     * [maxGapSeconds] apart never join a run. Mirrors Swift `chargeIntervalsFromSoc`.
+     *
+     * NOT YET WIRED into the live path on either platform (no battery-sample read exists); the events path
+     * is what supplies [chargeIntervals] today.
+     */
+    internal fun chargeIntervalsFromSoc(
+        samples: List<Pair<Long, Double>>,
+        maxGapSeconds: Long = 15L * 60L,
+    ): List<Pair<Long, Long>> {
+        val s = samples.sortedBy { it.first }
+        if (s.size < 2) return emptyList()
+        val out = ArrayList<Pair<Long, Long>>()
+        for (i in 1 until s.size) {
+            val prev = s[i - 1]
+            val cur = s[i]
+            val dt = cur.first - prev.first
+            if (dt <= 0 || dt > maxGapSeconds) continue
+            if ((cur.second - prev.second) / (dt.toDouble() / 3600.0) < CHARGE_RISE_PCT_PER_HOUR) continue
+            out.add(prev.first to cur.first)
+        }
+        return mergeIntervals(out)
+    }
+
     // ─────────────────────────────────────────────────────────────────────────
     // Day-string helper (UTC YYYY-MM-DD), mirrors Swift AnalyticsEngine.isoDay.
     // ─────────────────────────────────────────────────────────────────────────
@@ -196,6 +283,12 @@ object AnalyticsEngine {
         // a session is dropped only when its off-wrist coverage reaches maxOffWristSleepFraction. Default
         // empty keeps pure-function callers/tests event-free; IntelligenceEngine passes the night window's intervals.
         wristOff: List<Pair<Long, Long>> = emptyList(),
+        // On-charger [start, end) intervals (unix seconds), paired from the strap's
+        // BATTERY_PACK_CONNECTED/REMOVED + CHARGING_ON/OFF events by [chargeIntervals]. Excluded from the
+        // nightly skin-temp mean: the 5/MG pack charges the strap ON THE WRIST and HEATS the sensor to
+        // 38–40 °C, which passes both the worn-HR and the 28–42 °C plausibility gates. Default empty keeps
+        // pure-function callers/tests byte-identical; IntelligenceEngine passes the night window's intervals.
+        chargeIntervals: List<Pair<Long, Long>> = emptyList(),
         // Personal sleep need (hours) for the Rest "duration vs need" component. null → 8 h default.
         // IntelligenceEngine refines it from the user's recent average asleep hours. (Charge/Effort/Rest)
         sleepNeedHours: Double? = null,
@@ -430,7 +523,8 @@ object AnalyticsEngine {
         // mean is harvested; IntelligenceEngine seeds the baseline from those means and re-derives the
         // deviation in pass 2 (mirrors avgHrv→recovery). Computed BEFORE Charge so the Charge skin-temp
         // penalty can read it. APPROXIMATE. (PR #85)
-        val nightlySkinTempC = wornNightlySkinTempC(matched, hr, skinTemp, skinTempFamily, skinTempAnchorRaw)
+        val nightlySkinTempC =
+            wornNightlySkinTempC(matched, hr, skinTemp, skinTempFamily, skinTempAnchorRaw, chargeIntervals)
         val skinTempDevC: Double? = nightlySkinTempC?.let { v ->
             baselines.skinTemp?.takeIf { it.usable }?.let { round2(Baselines.deviation(v, it).delta) }
         }
@@ -683,10 +777,11 @@ object AnalyticsEngine {
     /**
      * Wear-gated mean in-bed skin temperature (°C) for the night, or null when too few worn samples.
      * A sample counts when (a) its timestamp falls inside a detected in-bed [sessions] span, (b) a
-     * concurrent HR sample reads a worn, alive BPM (the strap streams HR only on-wrist), and (c) the
-     * value is in the plausible worn range — so an on-charger interval drifting to ambient (which still
-     * passes the strap's looser 20–45 decode gate, e.g. the ~22 °C off-wrist decode fixture) can't
-     * poison the nightly mean.
+     * concurrent HR sample reads a worn, alive BPM (the strap streams HR only on-wrist), (c) it is not
+     * inside a [chargeIntervals] span, and (d) the value is in the plausible worn range — so neither an
+     * off-wrist interval drifting to ambient (which still passes the strap's looser 20–45 decode gate,
+     * e.g. the ~22 °C off-wrist decode fixture) NOR an on-wrist charge heating the sensor can poison the
+     * nightly mean.
      *
      * The raw→°C conversion is DEVICE-FAMILY-AWARE (#938): 5/MG stores CENTIDEGREES (°C = raw/100), but
      * the WHOOP 4.0 v24 field@72 is a RAW ADC on a different scale — running it through /100 read every
@@ -702,8 +797,12 @@ object AnalyticsEngine {
         // Per-device WHOOP 4.0 worn anchor raw (#938); null → the global Whoop4SkinTemp.ANCHOR_RAW, keeping
         // 5/MG + pure-function callers byte-identical. Threaded straight to the funnel's conversion.
         anchorRaw: Double? = null,
+        // On-charger [start, end) spans from [chargeIntervals]. Default empty keeps every pure-function
+        // caller/test byte-identical.
+        chargeIntervals: List<Pair<Long, Long>> = emptyList(),
         minSamples: Int = MIN_SKIN_TEMP_SAMPLES_INLINE,
-    ): Double? = skinTempFunnel(sessions, hr, skinTemp, family, anchorRaw, minSamples).mean
+    ): Double? =
+        skinTempFunnel(sessions, hr, skinTemp, family, anchorRaw, chargeIntervals, minSamples).mean
 
     /**
      * Nightly means of the WHOOP 4.0 raw SpO2 PPG channels (red/IR ADC) over the detected in-bed
@@ -774,8 +873,13 @@ object AnalyticsEngine {
         return Pair((sum / kept).toInt(), kept)
     }
 
-    /** Plausible worn skin-temperature range (°C). Off-wrist/charging samples drift to ambient and are
-     *  excluded; the strap's own decode gate is the looser 20–45. (PR #85) */
+    /** Plausible worn skin-temperature range (°C). Off-wrist samples drift to ambient and are excluded;
+     *  the strap's own decode gate is the looser 20–45. (PR #85)
+     *
+     *  This range does NOT catch on-charger contamination, and must not be relied on to. On a WHOOP 5/MG
+     *  the battery pack charges the strap ON THE WRIST, so a charge HEATS the sensor to 38–40 °C —
+     *  comfortably INSIDE this window — rather than letting it fall to ambient. That is what the explicit
+     *  [chargeIntervals] gate is for. */
     private const val SKIN_TEMP_MIN_C: Double = 28.0
     private const val SKIN_TEMP_MAX_C: Double = 42.0
 
@@ -784,8 +888,8 @@ object AnalyticsEngine {
     /**
      * Why nightly skin temp funneled toward absent for one night. Counts are over the night's raw skin-temp
      * samples; each sample is attributed to the FIRST gate that dropped it, in the SAME order
-     * [wornNightlySkinTempC] applies (not-worn → out-of-window → out-of-range → kept), so the four drop
-     * buckets plus [kept] sum to [totalSamples]. Pure + deterministic; shares the exact gate logic with the
+     * [wornNightlySkinTempC] applies (not-worn → out-of-window → charging → out-of-range → kept), so the
+     * four drop buckets plus [kept] sum to [totalSamples]. Pure + deterministic; shares the exact gate logic with the
      * real computation, so it explains the SAME mean the app uses. Mirrors Swift `SkinTempFunnelDiagnostic`.
      * (#752)
      */
@@ -793,6 +897,10 @@ object AnalyticsEngine {
         val totalSamples: Int,
         val droppedNotWorn: Int,
         val droppedOutOfWindow: Int,
+        /** Worn + in-window, but the strap was ON THE CHARGER. On a 5/MG the pack charges the strap on the
+         *  wrist and HEATS the sensor to 38–40 °C, which passes both the worn-HR and the 28–42 °C gates,
+         *  so this is the only bucket that can catch it. */
+        val droppedCharging: Int = 0,
         val droppedOutOfRange: Int,
         val kept: Int,
         val minSamples: Int,
@@ -820,7 +928,7 @@ object AnalyticsEngine {
                 var s = "skin-temp-funnel: $totalSamples samples → kept $kept/$minSamples " +
                     "(mean=${mean?.let { String.format(java.util.Locale.US, "%.2f°C", it) } ?: "absent"}); " +
                     "dropped[notWorn=$droppedNotWorn, outOfWindow=$droppedOutOfWindow, " +
-                    "outOfRange=$droppedOutOfRange]"
+                    "charging=$droppedCharging, outOfRange=$droppedOutOfRange]"
                 if (rawMin != null && rawMedian != null && rawMax != null) {
                     s += "\nskin-temp-raw: raw[min=$rawMin p50=$rawMedian max=$rawMax] inBand=$inBandCount/$totalSamples"
                     if (resolvedAnchorRaw != null && medianMappedC != null) {
@@ -849,6 +957,9 @@ object AnalyticsEngine {
         // Per-device WHOOP 4.0 worn anchor raw (#938 second capture); null → the global
         // Whoop4SkinTemp.ANCHOR_RAW, so 5/MG + pure-function callers are byte-identical.
         anchorRaw: Double? = null,
+        // On-charger [start, end) spans from [chargeIntervals]. Default empty keeps every pure-function
+        // caller/test byte-identical.
+        chargeIntervals: List<Pair<Long, Long>> = emptyList(),
         minSamples: Int = MIN_SKIN_TEMP_SAMPLES_INLINE,
     ): SkinTempFunnelDiagnostic {
         val total = skinTemp.size
@@ -875,6 +986,7 @@ object AnalyticsEngine {
             return SkinTempFunnelDiagnostic(
                 totalSamples = total, droppedNotWorn = 0,
                 droppedOutOfWindow = if (sessions.isEmpty()) total else 0,
+                droppedCharging = 0,
                 droppedOutOfRange = 0, kept = 0, minSamples = minSamples, mean = null,
                 rawMin = rawMin, rawMedian = rawMedian, rawMax = rawMax,
                 inBandCount = inBandCount, resolvedAnchorRaw = usedAnchor, medianMappedC = medianMappedC,
@@ -886,10 +998,21 @@ object AnalyticsEngine {
         var kept = 0
         var notWorn = 0
         var outOfWindow = 0
+        var onCharger = 0
         var outOfRange = 0
+        // Coalesced once so the per-sample check is over a minimal disjoint set (the real night's 15
+        // CHARGING_ON/OFF pairs collapse into the one pack span that contains them).
+        val charge = mergeIntervals(chargeIntervals)
         for (t in skinTemp) {
             if (t.ts !in wornSeconds) { notWorn++; continue }
             if (sessions.none { t.ts in it.start..it.end }) { outOfWindow++; continue }
+            // ON-CHARGER — the gate the worn-HR and 28–42 °C checks above CANNOT do. The 5/MG battery pack
+            // charges the strap on the wrist: HR keeps streaming (so it reads "worn") and the sensor is
+            // HEATED to 38–40 °C (so the range gate passes it). Evidence: on the 2026-07-29→30 night a
+            // 4h05m pack-connected span overlapping 55% of the in-bed window read 38–40 °C, dragging the
+            // nightly mean to 36.0 °C and posting the highest skinTempDevC of the surrounding 12 days on a
+            // night with no physiological elevation at all.
+            if (charge.any { t.ts >= it.first && t.ts < it.second }) { onCharger++; continue }
             // WHOOP 4.0 ONLY (#938 second capture): drop raws outside the plausible worn ADC band BEFORE the
             // anchor map. The no-contact floor (~509) and the 11-bit saturation ceiling (2047) are doff /
             // charging transients, not worn skin — with a per-device anchor a floor or pegged raw could
@@ -909,6 +1032,7 @@ object AnalyticsEngine {
         val mean = if (kept >= minSamples) sum / kept else null
         return SkinTempFunnelDiagnostic(
             totalSamples = total, droppedNotWorn = notWorn, droppedOutOfWindow = outOfWindow,
+            droppedCharging = onCharger,
             droppedOutOfRange = outOfRange, kept = kept, minSamples = minSamples, mean = mean,
             rawMin = rawMin, rawMedian = rawMedian, rawMax = rawMax,
             inBandCount = inBandCount, resolvedAnchorRaw = usedAnchor, medianMappedC = medianMappedC,

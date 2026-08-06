@@ -353,4 +353,121 @@ final class SkinTempAnalyticsTests: XCTestCase {
         XCTAssertNil(f.resolvedAnchorRaw, "5/MG centidegree path has no anchor")
         XCTAssertEqual(f.rawMedian, 3400)
     }
+
+    // MARK: - on-wrist charging contamination
+
+    private func event(_ ts: Int, _ kind: String) -> WhoopEvent {
+        WhoopEvent(ts: ts, kind: kind, payload: [:])
+    }
+
+    /// The WHOOP 5/MG battery pack slides onto the strap while it stays ON THE WRIST, so a charge does NOT
+    /// drift to cold ambient — it HEATS the sensor. Reproduces the real shape of VK's 2026-07-29→30 night
+    /// (device evidence): worn HR throughout, one in-bed span, ~39 °C while the pack is attached and
+    /// ~33.5 °C after it comes off. Every pre-existing gate ADMITS the hot samples (worn HR streams, the
+    /// timestamps are in-bed, and 39 °C sits inside the 28–42 °C window), so without a charge gate the
+    /// nightly mean is dragged up by the artifact.
+    func testChargeIntervalDroppedSoNightlyMeanReflectsUnchargedPortionOnly() throws {
+        let start = 13_000_000
+        let chargeStart = start + 600            // pack on 10 min in…
+        let chargeEnd = start + 3_600            // …and off 50 min later
+        let sess = [session(start: start, durSec: 4_800)]
+        let hrs = (0..<4_800).map { hr(start + $0) }    // worn the WHOLE time, charging included
+        let temps = (0..<4_800).map { t -> SkinTempSample in
+            let ts = start + t
+            let onCharger = ts >= chargeStart && ts < chargeEnd
+            return skin(ts, rawX100: onCharger ? 3_900 : 3_350)   // 39.0 °C vs 33.5 °C
+        }
+        let charge = [(start: chargeStart, end: chargeEnd)]
+
+        // Baseline: without the charge gate the artifact is admitted and inflates the mean.
+        let contaminated = try XCTUnwrap(AnalyticsEngine.wornNightlySkinTempC(sess, hr: hrs, skinTemp: temps))
+        XCTAssertGreaterThan(contaminated, 34.0, "the 39 °C on-charger span must be what poisons the mean")
+
+        // Fixed: the charge window drops out and the mean is exactly the uncharged portion's 33.5 °C.
+        let mean = try XCTUnwrap(AnalyticsEngine.wornNightlySkinTempC(
+            sess, hr: hrs, skinTemp: temps, chargeIntervals: charge))
+        XCTAssertEqual(mean, 33.5, accuracy: 1e-9)
+
+        // …and the funnel attributes the loss to the charge bucket, with every sample still accounted for.
+        let f = AnalyticsEngine.skinTempFunnel(sess, hr: hrs, skinTemp: temps, chargeIntervals: charge)
+        XCTAssertEqual(f.droppedCharging, 3_000, "the whole [chargeStart, chargeEnd) span drops")
+        XCTAssertEqual(f.kept, 1_800)
+        XCTAssertEqual(f.droppedNotWorn, 0, "HR streams throughout — this is NOT an off-wrist night")
+        XCTAssertEqual(f.droppedOutOfRange, 0, "39 °C is inside 28–42 °C — the range gate cannot catch this")
+        let accounted: Int = f.droppedNotWorn + f.droppedOutOfWindow + f.droppedCharging
+            + f.droppedOutOfRange + f.kept
+        XCTAssertEqual(accounted, f.totalSamples)
+        XCTAssertTrue(f.summary.contains("charging=3000"), "the summary names the charge gate: \(f.summary)")
+    }
+
+    /// No charge intervals ⇒ byte-identical to the pre-change behaviour (the default-empty contract every
+    /// existing caller and test relies on).
+    func testEmptyChargeIntervalsAreByteIdenticalToPriorBehaviour() throws {
+        let start = 14_000_000
+        let sess = [session(start: start, durSec: 600)]
+        let hrs = (0..<600).map { hr(start + $0) }
+        let temps = (0..<600).map { skin(start + $0, rawX100: 3_400) }
+        let defaulted = try XCTUnwrap(AnalyticsEngine.wornNightlySkinTempC(sess, hr: hrs, skinTemp: temps))
+        let explicitEmpty = try XCTUnwrap(AnalyticsEngine.wornNightlySkinTempC(
+            sess, hr: hrs, skinTemp: temps, chargeIntervals: []))
+        XCTAssertEqual(defaulted, explicitEmpty)
+        XCTAssertEqual(AnalyticsEngine.skinTempFunnel(sess, hr: hrs, skinTemp: temps).droppedCharging, 0)
+    }
+
+    /// THE TRAP this fix has to survive, straight from the real night: CHARGING_ON/CHARGING_OFF toggled 15
+    /// times inside ONE continuous BATTERY_PACK_CONNECTED→REMOVED span, and the sensor stayed hot through
+    /// every CHARGING_OFF gap — the pack is still physically attached and thermally coupled, the charge
+    /// current merely paused. Pairing CHARGING_ON/OFF alone would re-admit those gaps; the pack span must
+    /// cover the whole window.
+    func testPackSpanCoversChargingOffGaps() {
+        let t = 1_785_386_564
+        let events = [
+            event(t, "BATTERY_PACK_CONNECTED(21)"),
+            event(t, "CHARGING_ON(7)"),
+            event(t + 898, "CHARGING_OFF(8)"),        // current pauses…
+            event(t + 1_520, "CHARGING_ON(7)"),       // …and resumes 10 min later, pack never removed
+            event(t + 1_895, "CHARGING_OFF(8)"),
+            event(t + 15_342, "BATTERY_PACK_REMOVED(22)"),
+        ]
+        let intervals = AnalyticsEngine.chargeIntervals(events: events, windowEnd: t + 20_000)
+        XCTAssertEqual(intervals.count, 1, "the toggles merge into the single pack span: \(intervals)")
+        XCTAssertEqual(intervals[0].start, t)
+        XCTAssertEqual(intervals[0].end, t + 15_342)
+    }
+
+    /// CHARGING_ON without a pack event still opens an interval (a 4.0 puck emits no pack events), and a
+    /// span still open at the end of the read window closes at `windowEnd` — mirroring `offWristIntervals`.
+    func testChargingOnlyEventsAndUnclosedSpan() {
+        let t = 2_000_000
+        let closed = AnalyticsEngine.chargeIntervals(
+            events: [event(t, "CHARGING_ON(7)"), event(t + 300, "CHARGING_OFF(8)")], windowEnd: t + 9_999)
+        XCTAssertEqual(closed.count, 1)
+        XCTAssertEqual(closed[0].end, t + 300)
+        // Still on the charger when the window ends → closes at windowEnd, never left open.
+        let open = AnalyticsEngine.chargeIntervals(
+            events: [event(t, "BATTERY_PACK_CONNECTED(21)")], windowEnd: t + 5_000)
+        XCTAssertEqual(open.count, 1)
+        XCTAssertEqual(open[0].end, t + 5_000)
+        // Unrelated events contribute nothing.
+        XCTAssertTrue(AnalyticsEngine.chargeIntervals(
+            events: [event(t, "WRIST_OFF(10)"), event(t + 10, "BOOT(1)")], windowEnd: t + 100).isEmpty)
+    }
+
+    /// The events-missing fallback. On the real night the decoded `battery_charging` bit read FALSE on every
+    /// reading while SoC climbed 9.4 → 100 %, and the per-reading steps (~0.2–0.8 pp at a ~30 s cadence)
+    /// never cleared `StrapChargeInference`'s fixed 1.0 pp threshold — so this is a RATE test (pp per hour),
+    /// which separates a ~20 pp/h charge from a ~1.65 pp/h discharge at any cadence.
+    func testSocRiseInfersChargeWhenEventsAreMissing() {
+        let t = 3_000_000
+        // 9.4 % → 100 % over 4.5 h in 30 s steps: exactly the real night's shape.
+        let rising = stride(from: 0, through: 16_200, by: 30).map { (ts: t + $0, soc: 9.4 + Double($0) * 0.0056) }
+        let inferred = AnalyticsEngine.chargeIntervalsFromSoc(rising)
+        XCTAssertEqual(inferred.count, 1, "a sustained rise is ONE charge interval: \(inferred)")
+        XCTAssertLessThanOrEqual(inferred[0].start, t + 60)
+        XCTAssertGreaterThanOrEqual(inferred[0].end, t + 16_000)
+        // A normal overnight discharge must NOT be mistaken for a charge.
+        let falling = stride(from: 0, through: 28_800, by: 30).map { (ts: t + $0, soc: 90.0 - Double($0) * 0.00046) }
+        XCTAssertTrue(AnalyticsEngine.chargeIntervalsFromSoc(falling).isEmpty,
+                      "a ~1.65 pp/h discharge is not a charge")
+    }
 }

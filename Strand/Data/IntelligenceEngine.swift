@@ -617,6 +617,15 @@ final class IntelligenceEngine: ObservableObject {
                 // still open at the window end closes at `to`. Empty when the strap emitted no wrist events.
                 let wristEvents = (try? await store.events(deviceId: owner, from: from, to: to, limit: 50_000)) ?? []
                 let wristOff = AnalyticsEngine.offWristIntervals(events: wristEvents, windowEnd: to)
+                // On-charger intervals for the nightly skin-temp gate, from the SAME event read above (no
+                // extra query). The WHOOP 5/MG battery pack charges the strap ON THE WRIST, so a charge does
+                // not drift to cold ambient — it HEATS the sensor to 38–40 °C, which passes both the worn-HR
+                // gate (HR keeps streaming) and the 28–42 °C plausibility gate. On 2026-07-29→30 a 4h05m
+                // pack-connected span covering 55% of the in-bed window pushed the nightly mean to 36.0 °C
+                // and posted the highest skinTempDevC of the surrounding 12 days on a night with no
+                // physiological elevation. Built from EVENTS, never the decoded `battery_charging` bit,
+                // which read FALSE across that entire charge (see Strand/BLE/StrapChargeInference.swift).
+                let chargeIntervals = AnalyticsEngine.chargeIntervals(events: wristEvents, windowEnd: to)
 
                 // Calendar-day window for the ADDITIVE daily totals (steps + calories). The night window
                 // above is anchored to the current time-of-day and ends at dayStart+12h, so for a PAST
@@ -716,6 +725,7 @@ final class IntelligenceEngine: ObservableObject {
                                                      spo2: spo2,                   // #93
                                                      profile: up, baselines: baselines1, maxHROverride: maxHR,
                                                      tzOffsetSeconds: tzOffset, wristOff: wristOff,
+                                                     chargeIntervals: chargeIntervals,
                                                      sleepNeedHours: sleepNeedHours,
                                                      sleepConsistency: sleepConsistency,
                                                      habitualMidsleepSec: habitualMidsleepSec,

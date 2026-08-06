@@ -517,7 +517,14 @@ object IntelligenceEngine {
             // only when its off-wrist coverage reaches maxOffWristSleepFraction, so a real night with a
             // short off-wrist tail survives. Pairing needs WRIST_ON too (to bound each interval); a span
             // still open at the window end closes at `to`. Empty when the strap emitted no wrist events.
-            val wristOff = AnalyticsEngine.offWristIntervals(repo.events(owner, from, to, STREAM_LIMIT), to)
+            val nightEvents = repo.events(owner, from, to, STREAM_LIMIT)
+            val wristOff = AnalyticsEngine.offWristIntervals(nightEvents, to)
+            // On-charger intervals for the nightly skin-temp gate, from the SAME event read (no extra
+            // query). The WHOOP 5/MG battery pack charges the strap ON THE WRIST, so a charge does not
+            // drift to cold ambient — it HEATS the sensor to 38–40 °C, which passes both the worn-HR gate
+            // (HR keeps streaming) and the 28–42 °C plausibility gate. Built from EVENTS, never the decoded
+            // `battery_charging` bit, which read FALSE across an entire labelled 9.4 → 100 % charge.
+            val chargeIntervals = AnalyticsEngine.chargeIntervals(nightEvents, to)
 
             // Calendar-day window for the ADDITIVE daily totals (steps + calories). The night window
             // above is anchored to the current time-of-day and ends at dayStart+12h, so for a PAST
@@ -573,6 +580,7 @@ object IntelligenceEngine {
                 maxHROverride = maxHROverride,
                 tzOffsetSeconds = tzOffsetSeconds,
                 wristOff = wristOff,
+                chargeIntervals = chargeIntervals,
                 habitualMidsleepSec = habitualMidsleepSec,
                 bandSleepState = bandSleepState,
                 // 7.0.0: thread the V2 toggle into the NORMAL staging path so it affects detected nights,

@@ -1,5 +1,6 @@
 package com.noop.analytics
 
+import com.noop.data.EventRow
 import com.noop.data.HrSample
 import com.noop.data.SkinTempSample
 import com.noop.protocol.DeviceFamily
@@ -381,5 +382,128 @@ class SkinTempAnalyticsTest {
         assertEquals(AnalyticsEngine.wornNightlySkinTempC(sess, hrs, temps), f.mean)
         assertNull("5/MG centidegree path has no anchor", f.resolvedAnchorRaw)
         assertEquals(3400, f.rawMedian)
+    }
+
+    // ── on-wrist charging contamination (twin of Swift SkinTempAnalyticsTests) ──────────────────────
+
+    private fun event(ts: Long, kind: String) =
+        EventRow(deviceId = dev, ts = ts, kind = kind, payloadJSON = "{}")
+
+    /**
+     * The WHOOP 5/MG battery pack slides onto the strap while it stays ON THE WRIST, so a charge does NOT
+     * drift to cold ambient — it HEATS the sensor. Reproduces the real shape of the 2026-07-29→30 night:
+     * worn HR throughout, one in-bed span, ~39 °C while the pack is attached and ~33.5 °C after it comes
+     * off. Every pre-existing gate ADMITS the hot samples, so without a charge gate the nightly mean is
+     * dragged up by the artifact.
+     */
+    @Test
+    fun chargeIntervalDroppedSoNightlyMeanReflectsUnchargedPortionOnly() {
+        val start = 13_000_000L
+        val chargeStart = start + 600
+        val chargeEnd = start + 3_600
+        val sess = listOf(session(start, 4_800))
+        val hrs = (0 until 4_800).map { hr(start + it) }     // worn the WHOLE time, charging included
+        val temps = (0 until 4_800).map {
+            val ts = start + it
+            skin(ts, if (ts in chargeStart until chargeEnd) 3_900 else 3_350)   // 39.0 °C vs 33.5 °C
+        }
+        val charge = listOf(chargeStart to chargeEnd)
+
+        val contaminated = AnalyticsEngine.wornNightlySkinTempC(sess, hrs, temps)!!
+        assertTrue("the 39 °C on-charger span must be what poisons the mean", contaminated > 34.0)
+
+        val mean = AnalyticsEngine.wornNightlySkinTempC(
+            sess, hrs, temps, DeviceFamily.WHOOP5, null, charge,
+        )!!
+        assertEquals(33.5, mean, 1e-9)
+
+        val f = AnalyticsEngine.skinTempFunnel(
+            sess, hrs, temps, DeviceFamily.WHOOP5, null, charge,
+        )
+        assertEquals(3_000, f.droppedCharging)
+        assertEquals(1_800, f.kept)
+        assertEquals("HR streams throughout — this is NOT an off-wrist night", 0, f.droppedNotWorn)
+        assertEquals("39 °C is inside 28–42 °C — the range gate cannot catch this", 0, f.droppedOutOfRange)
+        assertEquals(
+            f.totalSamples,
+            f.droppedNotWorn + f.droppedOutOfWindow + f.droppedCharging + f.droppedOutOfRange + f.kept,
+        )
+        assertTrue("the summary names the charge gate: ${f.summary}", f.summary.contains("charging=3000"))
+    }
+
+    /** No charge intervals ⇒ byte-identical to the pre-change behaviour. */
+    @Test
+    fun emptyChargeIntervalsAreByteIdenticalToPriorBehaviour() {
+        val start = 14_000_000L
+        val sess = listOf(session(start, 600))
+        val hrs = (0 until 600).map { hr(start + it) }
+        val temps = (0 until 600).map { skin(start + it, 3_400) }
+        val defaulted = AnalyticsEngine.wornNightlySkinTempC(sess, hrs, temps)!!
+        val explicitEmpty = AnalyticsEngine.wornNightlySkinTempC(
+            sess, hrs, temps, DeviceFamily.WHOOP5, null, emptyList(),
+        )!!
+        assertEquals(defaulted, explicitEmpty, 0.0)
+        assertEquals(0, AnalyticsEngine.skinTempFunnel(sess, hrs, temps).droppedCharging)
+    }
+
+    /**
+     * THE TRAP, straight from the real night: CHARGING_ON/CHARGING_OFF toggled 15 times inside ONE
+     * continuous BATTERY_PACK_CONNECTED→REMOVED span, and the sensor stayed hot through every
+     * CHARGING_OFF gap — the pack is still physically attached, the charge current merely paused.
+     */
+    @Test
+    fun packSpanCoversChargingOffGaps() {
+        val t = 1_785_386_564L
+        val events = listOf(
+            event(t, "BATTERY_PACK_CONNECTED(21)"),
+            event(t, "CHARGING_ON(7)"),
+            event(t + 898, "CHARGING_OFF(8)"),
+            event(t + 1_520, "CHARGING_ON(7)"),
+            event(t + 1_895, "CHARGING_OFF(8)"),
+            event(t + 15_342, "BATTERY_PACK_REMOVED(22)"),
+        )
+        val intervals = AnalyticsEngine.chargeIntervals(events, t + 20_000)
+        assertEquals("the toggles merge into the single pack span: $intervals", 1, intervals.size)
+        assertEquals(t, intervals[0].first)
+        assertEquals(t + 15_342, intervals[0].second)
+    }
+
+    /** CHARGING_ON alone still opens an interval; a span open at the window end closes at windowEnd. */
+    @Test
+    fun chargingOnlyEventsAndUnclosedSpan() {
+        val t = 2_000_000L
+        val closed = AnalyticsEngine.chargeIntervals(
+            listOf(event(t, "CHARGING_ON(7)"), event(t + 300, "CHARGING_OFF(8)")), t + 9_999,
+        )
+        assertEquals(1, closed.size)
+        assertEquals(t + 300, closed[0].second)
+        val open = AnalyticsEngine.chargeIntervals(listOf(event(t, "BATTERY_PACK_CONNECTED(21)")), t + 5_000)
+        assertEquals(1, open.size)
+        assertEquals(t + 5_000, open[0].second)
+        assertTrue(
+            AnalyticsEngine.chargeIntervals(
+                listOf(event(t, "WRIST_OFF(10)"), event(t + 10, "BOOT(1)")), t + 100,
+            ).isEmpty(),
+        )
+    }
+
+    /**
+     * The events-missing fallback: a RATE test (pp per hour), which separates a ~20 pp/h charge from a
+     * ~1.65 pp/h discharge at any cadence — unlike a fixed per-reading step, which never fires at the
+     * real ~30 s cadence.
+     */
+    @Test
+    fun socRiseInfersChargeWhenEventsAreMissing() {
+        val t = 3_000_000L
+        val rising = (0..16_200 step 30).map { (t + it) to (9.4 + it * 0.0056) }
+        val inferred = AnalyticsEngine.chargeIntervalsFromSoc(rising)
+        assertEquals("a sustained rise is ONE charge interval: $inferred", 1, inferred.size)
+        assertTrue(inferred[0].first <= t + 60)
+        assertTrue(inferred[0].second >= t + 16_000)
+        val falling = (0..28_800 step 30).map { (t + it) to (90.0 - it * 0.00046) }
+        assertTrue(
+            "a ~1.65 pp/h discharge is not a charge",
+            AnalyticsEngine.chargeIntervalsFromSoc(falling).isEmpty(),
+        )
     }
 }
