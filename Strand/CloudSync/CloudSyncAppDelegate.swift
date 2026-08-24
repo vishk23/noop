@@ -118,10 +118,46 @@ final class CloudSyncAppDelegate: NSObject, UIApplicationDelegate {
     /// configured on this device).
     func application(_ application: UIApplication, didReceiveRemoteNotification userInfo: [AnyHashable: Any],
                       fetchCompletionHandler completionHandler: @escaping (UIBackgroundFetchResult) -> Void) {
+        // Breadcrumb, same diagnosis-only idiom as `registrationBreadcrumbKey`. Registration and
+        // DELIVERY fail independently: a phone can hold a valid token and register cleanly while iOS
+        // still never hands the push over (a force-quit app is never woken for content-available,
+        // Low Power Mode, Background App Refresh off). The server side cannot tell the two apart
+        // either — APNs answers 200 for a token it has not yet marked Unregistered, so
+        // `request_sync` reports a delivered push in both cases. Without a receipt written HERE the
+        // only observable is "the sync didn't happen", which is equally consistent with the push
+        // never arriving and with the sync bailing after it did (exactly the ambiguity of
+        // 2026-08-24's stale-mirror incident).
+        //
+        // The breadcrumb also records `backgroundTimeRemaining` at both ends of the
+        // `beginBackgroundTask` call below, because the size of this window is the whole question for
+        // this lane and it is not a documented constant: a push-woken app gets a short budget, and a
+        // full sync here has to fit a WAL checkpoint plus a ~150MB `.noopbak` export
+        // (`CloudSyncUploader.upload`) plus the upload itself inside it. Measured, not assumed.
+        let budgetBefore = application.backgroundTimeRemaining
+        UserDefaults.standard.set("received (budget \(Self.fmtBudget(budgetBefore))) \(Date())",
+                                  forKey: Self.receiptBreadcrumbKey)
         guard let model = Self.model else {
+            UserDefaults.standard.set("received-but-no-model \(Date())", forKey: Self.receiptBreadcrumbKey)
             completionHandler(.noData)
             return
         }
+        // Hold an expiration-handled background assertion for the whole sync: it is what keeps the
+        // export + upload alive past the bare push-wake budget, and it means a suspension mid-sync
+        // is an EXPLICIT expiration (recorded below) rather than a silent freeze that abandons the
+        // `CloudSyncGate` hold until `CloudSyncGate.staleHoldS` reclaims it half an hour later.
+        // Ended on BOTH exits: normal completion in the Task below, and expiration here.
+        endPushBackgroundTask() // a REDELIVERED push must not leak the previous assertion
+        pushBackgroundTask = application.beginBackgroundTask(withName: "cloudsync.push") { [weak self] in
+            // Fires when iOS is about to reclaim the assertion. Record it — "expired" vs a missing
+            // `sync ran=` is exactly the distinction that says whether the window is the binding
+            // constraint — then release, or iOS kills the app outright for holding past expiry.
+            // UserDefaults is thread-safe; the release hops to the main actor that owns the identifier.
+            UserDefaults.standard.set("EXPIRED mid-sync \(Date())", forKey: CloudSyncAppDelegate.receiptBreadcrumbKey)
+            Task { @MainActor in self?.endPushBackgroundTask() }
+        }
+        UserDefaults.standard.set(
+            "received (budget \(Self.fmtBudget(budgetBefore)) -> \(Self.fmtBudget(application.backgroundTimeRemaining))) \(Date())",
+            forKey: Self.receiptBreadcrumbKey)
         let cloudSync = CloudSyncModel()
         let intelligence = model.intelligence
         let repository = model.repo
@@ -134,8 +170,35 @@ final class CloudSyncAppDelegate: NSObject, UIApplicationDelegate {
             // staleness gate belongs to the OS-initiated BGAppRefresh path, not to an explicit
             // server-side request for fresh data.
             let ran = await cloudSync.syncFromPush(repo: repository)
+            UserDefaults.standard.set("sync ran=\(ran) \(Date())", forKey: Self.receiptBreadcrumbKey)
             completionHandler(ran ? .newData : .noData)
+            self.endPushBackgroundTask()
         }
+    }
+
+    /// UserDefaults key for the push-DELIVERY breadcrumb above — the receive-side counterpart to
+    /// `registrationBreadcrumbKey`. Diagnosis-only; surfaced read-only by the Test Centre's
+    /// replication card so a silent push failure is attributable without a debugger.
+    static let receiptBreadcrumbKey = "cloudsync.push.lastReceipt"
+
+    /// The assertion taken in `didReceiveRemoteNotification`, held for the life of that sync.
+    /// `.invalid` whenever none is outstanding, which is what makes `endPushBackgroundTask`
+    /// idempotent — it is deliberately called on several paths that can race.
+    private var pushBackgroundTask: UIBackgroundTaskIdentifier = .invalid
+
+    /// Idempotent release. Ending an already-ended (or never-taken) identifier is an API misuse that
+    /// throws, hence the guard rather than an unconditional `endBackgroundTask`.
+    private func endPushBackgroundTask() {
+        guard pushBackgroundTask != .invalid else { return }
+        UIApplication.shared.endBackgroundTask(pushBackgroundTask)
+        pushBackgroundTask = .invalid
+    }
+
+    /// `backgroundTimeRemaining` is `.greatestFiniteMagnitude` while the app is foregrounded (no
+    /// budget applies), which would otherwise render as a meaningless 1.7976931348623157e+308 in the
+    /// breadcrumb and hide the one case that matters — a real, finite, small background window.
+    private static func fmtBudget(_ seconds: TimeInterval) -> String {
+        seconds > 86_400 ? "foreground" : String(format: "%.0fs", seconds)
     }
 }
 #endif // os(iOS)

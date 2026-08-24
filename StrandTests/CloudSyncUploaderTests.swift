@@ -412,4 +412,58 @@ final class LitersFallbackPolicyTests: XCTestCase {
         XCTAssertTrue(text.contains("retry"), "must say it will retry, not read as a dead end")
     }
 }
+
+/// The process-wide sync gate's stale-hold reclaim (2026-08-24): a sync that dies without releasing
+/// — a suspension mid-push, a hung liters FFI call — must not block every later sync for the life
+/// of a process that `bluetooth-central` keeps alive for days. Fresh actor instances per test (the
+/// production singleton would leak state between tests); `now` injected, never slept on.
+final class CloudSyncGateTests: XCTestCase {
+    private let t0: TimeInterval = 1_756_000_000
+
+    override func tearDown() {
+        // The reclaim path writes a diagnosis breadcrumb; don't leave test junk in the dev Mac's
+        // real app container (StrandTests runs inside the full app via TEST_HOST).
+        UserDefaults.standard.removeObject(forKey: CloudSyncGate.reclaimBreadcrumbKey)
+        super.tearDown()
+    }
+
+    func testSecondBeginIsRefusedWhileHeld() async {
+        let gate = CloudSyncGate()
+        let claim = await gate.begin(now: t0)
+        XCTAssertNotNil(claim)
+        let second = await gate.begin(now: t0 + CloudSyncGate.staleHoldS - 1)
+        XCTAssertNil(second, "a live hold under staleHoldS must refuse a second sync")
+    }
+
+    func testEndReleasesForTheNextBegin() async {
+        let gate = CloudSyncGate()
+        let claim = await gate.begin(now: t0)
+        await gate.end(claim!)
+        let next = await gate.begin(now: t0 + 1)
+        XCTAssertNotNil(next, "a released gate must admit the next sync immediately")
+    }
+
+    func testStaleHoldIsReclaimed() async {
+        let gate = CloudSyncGate()
+        _ = await gate.begin(now: t0)
+        let reclaimed = await gate.begin(now: t0 + CloudSyncGate.staleHoldS)
+        XCTAssertNotNil(reclaimed, "a hold at/past staleHoldS is presumed abandoned and reclaimed")
+    }
+
+    func testAbandonedClaimCannotReleaseAReclaimedGate() async {
+        let gate = CloudSyncGate()
+        let abandoned = await gate.begin(now: t0)
+        let reclaimed = await gate.begin(now: t0 + CloudSyncGate.staleHoldS)
+        XCTAssertNotNil(reclaimed)
+        // The presumed-dead sync resumes and releases — it must NOT unlock the gate out from
+        // under the sync that legitimately holds it now.
+        await gate.end(abandoned!)
+        let third = await gate.begin(now: t0 + CloudSyncGate.staleHoldS + 60)
+        XCTAssertNil(third, "a stale claim's end() must be a no-op while the reclaimer still runs")
+        // The reclaimer's own end() is the one that counts.
+        await gate.end(reclaimed!)
+        let fourth = await gate.begin(now: t0 + CloudSyncGate.staleHoldS + 120)
+        XCTAssertNotNil(fourth)
+    }
+}
 #endif // CLOUD_SYNC
