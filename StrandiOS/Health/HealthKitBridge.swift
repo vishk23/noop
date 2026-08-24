@@ -1,6 +1,7 @@
 #if os(iOS)
 import Foundation
 import HealthKit
+import UIKit
 import WhoopStore
 import StrandAnalytics
 import StrandImport
@@ -28,6 +29,33 @@ final class HealthKitBridge: ObservableObject {
     @Published private(set) var auth: AuthState = .unknown
     @Published private(set) var lastSync: Date?
     @Published private(set) var syncing = false
+    /// Coalesces a fresh-data notification that arrives while another HealthKit pass owns the bridge.
+    /// Without this, a strap offload finishing during the foreground read/write pass was deferred until
+    /// the next app open even though the newly-banked rows were already available locally.
+    private var writeBackPending = false
+    /// How many days the last COMPLETED sync covered, so an observer wake can tell whether a sync that
+    /// just ran already read its window. Paired with `lastSync` (the time). Reset to 0 by a failed sync,
+    /// so a failure never lets a later wake be skipped on the strength of it.
+    private var lastSyncDays = 0
+    /// How long an observer wake will accept a just-completed sync instead of running its own.
+    ///
+    /// Six sample types carry `enableBackgroundDelivery(frequency: .hourly)`, and two of them —
+    /// `.heartRate` and `.activeEnergyBurned` — get new samples continuously on a worn Apple Watch, so in
+    /// practice several observers wake within moments of each other every hour. Each wake used to run a
+    /// FULL sync: ~15 HealthKit aggregate queries plus a write-back, no matter which type woke it.
+    ///
+    /// Scoping the queries to the woken type is NOT an option: the rows are upserted with
+    /// `ON CONFLICT DO UPDATE SET x = excluded.x` on every column, a full replace, so a sync that skipped
+    /// a query would write NULL over that day's stored value and wipe it. Coalescing is safe instead
+    /// because it changes nothing about what a sync reads — it only declines to repeat one.
+    ///
+    /// Skipping is lossless: `sync` re-reads AGGREGATES for a window, so a sync that already covered this
+    /// wake's days has ingested its samples. The anchor exists only to name the window (see
+    /// `fetchTouchedDayWindow`), which is why it is still advanced on a skip.
+    ///
+    /// The Android side has had this shape all along — `syncHealthConnectIfStale` gates its Health Connect
+    /// import on a staleness interval. This brings iOS in line.
+    private static let observerCoalesceWindow: TimeInterval = 15 * 60
     /// The most recent failure surfaced by `sync` / `writeBack`. Cleared on a successful run. UI binds
     /// here so an Apple Health auth revoke, quota hit, or invalid sample is visible instead of silent.
     @Published private(set) var lastError: String?
@@ -71,22 +99,12 @@ final class HealthKitBridge: ObservableObject {
 
     private var writeTypes: Set<HKSampleType> {
         var s = Set<HKSampleType>()
-        for id in HealthKitBridge.quantityWriteIds + HealthKitBridge.highResQuantityWriteIds {
+        for id in HealthKitBridge.quantityWriteIds + HealthKitBridge.highResQuantityWriteIds
+            where !HealthKitBridge.writeDenied.contains(id) {
             if let t = HKObjectType.quantityType(forIdentifier: id) { s.insert(t) }
         }
         if let sleep = HKObjectType.categoryType(forIdentifier: .sleepAnalysis) { s.insert(sleep) }
         s.insert(HKObjectType.workoutType())
-        return s
-    }
-
-    /// The write set as it existed before the high-res write-back (4 nightly vitals + sleep). A
-    /// returning user granted THIS set; `refreshAuthIfPreviouslyGranted` must resume off it — checking
-    /// the full `writeTypes` would leave every pre-existing grant stuck at `.unknown` after the update
-    /// because the new types are still `.notDetermined`.
-    private var legacyCoreWriteTypes: Set<HKSampleType> {
-        var s = Set<HKSampleType>()
-        for id in HealthKitBridge.quantityWriteIds { if let t = HKObjectType.quantityType(forIdentifier: id) { s.insert(t) } }
-        if let sleep = HKObjectType.categoryType(forIdentifier: .sleepAnalysis) { s.insert(sleep) }
         return s
     }
 
@@ -99,19 +117,113 @@ final class HealthKitBridge: ObservableObject {
         .basalEnergyBurned, .vo2Max,
         // Body composition — READ-ONLY (#20). Imported under the apple-health source like the file
         // importer already ingests; deliberately NOT in quantityWriteIds (we never write these back).
-        .bodyMass, .bodyFatPercentage, .leanBodyMass, .bodyMassIndex
+        .bodyMass, .bodyFatPercentage, .leanBodyMass, .bodyMassIndex,
+        // Water — READ-ONLY (#949), so drinks logged in a dedicated hydration app (or by a smart bottle)
+        // show up without being typed in twice. Lands in the hydration source rather than apple-health,
+        // because the hydration screen is what consumes it. Never written back.
+        .dietaryWater,
+        // Caffeine — READ-ONLY (#949). Feeds the caffeine window's decay estimate, which already stores
+        // time + optional mg per intake, so a Health sample maps onto it directly. Apple exposes this as
+        // its own narrow type; Health Connect has no caffeine-only scope (caffeine is a field on
+        // NutritionRecord, behind READ_NUTRITION — the whole food log), which is why Android is not
+        // matched here. Never written back.
+        .dietaryCaffeine
     ]
     private static let quantityWriteIds: [HKQuantityTypeIdentifier] = [
         .restingHeartRate, .heartRateVariabilitySDNN, .oxygenSaturation, .respiratoryRate
     ]
+
+    /// Whether a strap-derived nightly SpO2 is written back to HealthKit as `.oxygenSaturation`.
+    ///
+    /// FALSE, deliberately, and it is not an oversight to be tidied away.
+    ///
+    /// This export loop reads only the computed/imported NOOP device rows — Oura never passes through
+    /// it — so before `spo2Pct` was populated for WHOOP nights this branch never fired even once.
+    /// Turning the field on therefore does not "resume" an export; it STARTS one, and what it would
+    /// start writing is a number nobody has checked against a reference oximeter.
+    ///
+    /// Why that bar is higher here than for the in-app card. A value in the app is read in context,
+    /// next to its own provenance, by the person who built it. A HealthKit sample is different in
+    /// kind: it lands in the system health record under Apple's own Blood Oxygen heading, sits
+    /// alongside clinically-sourced readings with nothing distinguishing it, syncs to iCloud, and is
+    /// readable by every other app the user has authorised. Deleting it later is fiddly and does not
+    /// recall what already propagated.
+    ///
+    /// The evidence genuinely does not reach that bar yet. The decode is well supported —
+    /// distribution, run structure, sleep gating, night-to-night stability, and agreement with this
+    /// user's own Oura-era medians — but ALL of it says "this byte is a real oxygen measurement",
+    /// none of it says "97 means 97". Upstream declines to promote the same metric for the same
+    /// reason: two straps were checked against the WHOOP app and moved in OPPOSITE directions.
+    ///
+    /// Flip this to `true` once paired reference-oximeter nights exist and the bias is characterised
+    /// (and, if the bias is a fixed offset, correct for it before writing rather than here).
+    static let exportsSpo2ToHealthKit = false
+
+    /// Identifiers that must NEVER enter a `requestAuthorization(toShare:)` set, filtered out of every
+    /// write set below (#1366). HealthKit reserves some quantity types to Apple Watch —
+    /// `.appleSleepingWristTemperature`, the only type that fits a worn wrist skin temperature, is one —
+    /// and asking to SHARE such a type does not fail softly: it raises an uncatchable ObjC
+    /// `NSInvalidArgumentException` ("Authorization to share the following types is disallowed") that
+    /// terminates the app on launch (verified on device, iOS 27). Swift `try/catch` cannot intercept an
+    /// `NSException`, so the ONLY defense is to keep read-only ids out of the share set. Filtering here
+    /// makes that structural: a read-only id added to a write list by mistake is dropped from the ask
+    /// instead of bricking launch, turning a ship-and-crash into a no-op.
+    private static let writeDenied: Set<HKQuantityTypeIdentifier> = [.appleSleepingWristTemperature]
     // High-res write-back shares: the continuous 1-minute HR stream, and the energy/distance samples
-    // attached to written workouts. Kept out of `quantityWriteIds` so `legacyCoreWriteTypes` (the
-    // auth-resume set) stays exactly what pre-update users granted.
+    // attached to written workouts. Kept separate from the four nightly-vital ids so the permission
+    // expansion and each independently-authorized writer remain explicit.
     private static let highResQuantityWriteIds: [HKQuantityTypeIdentifier] = [
         .heartRate, .activeEnergyBurned, .distanceWalkingRunning, .distanceCycling
     ]
 
     // MARK: - Authorization
+
+    /// UserDefaults key holding the read set the user was last asked about.
+    private static let readTypeSignatureKey = "noop.health.readTypeSignature"
+
+    /// UserDefaults key gating the one-time 90-day hourly-step backfill (see the hourly collection
+    /// below). Set once the first hourly-step HealthKit query actually returns rows; every later
+    /// `sync()` only walks the same window the daily collectors already use.
+    private static let hourlyStepsBackfilledKey = "applehealth.hourlySteps.backfilled"
+
+    /// A stable fingerprint of the read types currently requested.
+    private static var readTypeSignature: String {
+        quantityReadIds.map(\.rawValue).sorted().joined(separator: ",")
+    }
+
+    private static func persistReadTypeSignature() {
+        UserDefaults.standard.set(readTypeSignature, forKey: readTypeSignatureKey)
+    }
+
+    /// Re-request authorization when the app has STARTED reading a type it never used to (#949).
+    ///
+    /// HealthKit never reports read authorization, and `requestAuthorization` is only called from the
+    /// connect button. So a read type added in an update stays `.notDetermined` for everyone who granted
+    /// access before it existed, and its queries return empty forever — indistinguishable from "you have
+    /// no water in Health", and silent. Water and caffeine would have done nothing at all for every
+    /// existing user, which is most of them.
+    ///
+    /// Comparing a stored fingerprint of the read set catches that. Re-requesting is cheap and quiet:
+    /// HealthKit presents the sheet ONLY for types that are still undetermined, so a user whose set is
+    /// unchanged sees no UI, and a returning user is asked about exactly the new ones. The signature is
+    /// stored only on success, so a failed request is retried rather than silently swallowed.
+    private func requestNewReadTypesIfNeeded() async {
+        // FOREGROUND only. `sync` is also driven by background observer wakes, and asking there would
+        // spend the one request we get where no sheet can be presented — if that call reported success
+        // without showing anything, the signature would be stored and the user never asked at all.
+        guard auth == .authorized,
+              UIApplication.shared.applicationState == .active,
+              UserDefaults.standard.string(forKey: HealthKitBridge.readTypeSignatureKey)
+                  != HealthKitBridge.readTypeSignature
+        else { return }
+        do {
+            try await store.requestAuthorization(toShare: writeTypes, read: readTypes)
+            HealthKitBridge.persistReadTypeSignature()
+        } catch {
+            // Leave the signature unset so the next sync tries again. Not surfaced in `lastError`: the
+            // user did not ask for this, and the rest of the sync is unaffected.
+        }
+    }
 
     /// Request read + write permission. HealthKit never reveals whether *read* was granted, so we
     /// treat a successful request as `.authorized` and let queries return empty if the user declined.
@@ -135,6 +247,8 @@ final class HealthKitBridge: ObservableObject {
             // the authoritative signal; the `.notDetermined` fallback only matters when that check can't
             // run, which on iOS means an App Store build that by definition has the entitlement.
             auth = .authorized
+            // This grant covered the CURRENT read set, so record it — see `requestNewReadTypesIfNeeded`.
+            HealthKitBridge.persistReadTypeSignature()
         } catch {
             // A thrown error here is on a build that carries the entitlement (guarded above), so it's a
             // genuine denial / request failure — keep the normal `.denied` "enable in Settings" path,
@@ -156,7 +270,10 @@ final class HealthKitBridge: ObservableObject {
     /// status, so no system permission sheet is shown.
     func refreshAuthIfPreviouslyGranted() {
         guard auth == .unknown, HKHealthStore.isHealthDataAvailable() else { return }
-        let granted = legacyCoreWriteTypes.allSatisfy { store.authorizationStatus(for: $0) == .sharingAuthorized }
+        // Share authorization is per type. Resume when at least one write type is granted so a person
+        // who intentionally declined (for example) workouts still gets sleep/vitals exported after a
+        // relaunch. Requiring every legacy type made partial grants look wholly disconnected.
+        let granted = writeTypes.contains { store.authorizationStatus(for: $0) == .sharingAuthorized }
         if granted {
             auth = .authorized
             // A returning user who already granted access should get the live stream re-armed for this
@@ -169,8 +286,13 @@ final class HealthKitBridge: ObservableObject {
             // share status, so declining any checkbox just skips that feature.
             // Raw request, NOT requestAuthorization(): that method reclassifies a thrown error as
             // `.denied`, which must never demote a bridge that just resumed a valid legacy grant.
+            //
+            // FOREGROUND only, for the same reason `requestNewReadTypesIfNeeded` is: this resume is now
+            // also called from the offload write-back (#1021), which runs in processes that were never
+            // foregrounded. Asking there would spend the one request we get where no sheet can be
+            // presented. The status read above is unaffected, so a legacy grant still resumes.
             let newTypesPending = writeTypes.contains { store.authorizationStatus(for: $0) == .notDetermined }
-            if newTypesPending {
+            if newTypesPending, UIApplication.shared.applicationState == .active {
                 Task { try? await store.requestAuthorization(toShare: writeTypes, read: readTypes) }
             }
         }
@@ -250,15 +372,49 @@ final class HealthKitBridge: ObservableObject {
     /// keeps every per-day average correct and idempotent — `sync` upserts are keyed by day.
     private func syncFromObserver(type: HKSampleType) async {
         guard auth == .authorized else { return }
-        let touched = await fetchTouchedDayWindow(type: type)
-        // No new samples since the last anchor (a spurious wake): nothing to do.
-        guard let touched else { return }
+        // #1578: counted before any early return, so the ratio of wakes to syncs is honest. Coalescing
+        // cuts the work per wake, not the wakes — this is what shows whether the wake itself is the cost.
+        HealthSyncStats.recordWake()
+        let (touched, newAnchor) = await fetchTouchedDayWindow(type: type)
+        // No new samples since the last anchor (a spurious wake): nothing to ingest, so advancing the
+        // anchor now loses nothing and skips a redundant re-query next wake.
+        guard let touched else {
+            HealthSyncStats.recordEmptyWake()
+            if let newAnchor { persistAnchor(newAnchor, for: type) }
+            return
+        }
         let cal = Calendar.current
         let daysBack = cal.dateComponents([.day], from: cal.startOfDay(for: touched),
                                           to: cal.startOfDay(for: Date())).day ?? 0
         // Clamp to a sane window: at least today, and never re-walk more than a month from one wake.
         let window = max(1, min(31, daysBack + 1))
-        await sync(days: window)
+        // A sync completed moments ago and covered at least this wake's window, so a second full pass
+        // would burn ~15 HealthKit aggregate queries and a write-back to re-derive rows that sync just
+        // wrote. Stand down. This is what collapses the hourly burst of six observers into one sync.
+        // FOREGROUND catch-up deliberately does not consult this: an explicit resume should always read.
+        // `age >= 0` is not defensive noise. This is WALL-CLOCK time, and it can move backwards — an NTP
+        // correction, or a user changing the date. A negative age satisfies `< window`, so every wake would
+        // skip; and because `lastSync` is only written by a sync that RAN, the skipping would keep it stale
+        // and background Health ingestion would stay dead until a foreground catch-up (which ignores this
+        // gate) broke the loop. Cheap to exclude, so exclude it.
+        let sinceLastSync = lastSync.map { Date().timeIntervalSince($0) }
+        if let age = sinceLastSync, age >= 0, age < Self.observerCoalesceWindow,
+           window <= lastSyncDays {
+            HealthSyncStats.recordCoalesced()
+            // Deliberately do NOT advance the anchor here. Samples that landed AFTER that sync's reads but
+            // before this wake are not in the store yet, and advancing past them would leave them to be
+            // picked up only incidentally — by whatever later sync happens to re-read the same day. Leaving
+            // the anchor put means the next wake sees the same window and syncs it for certain. The cost is
+            // one more delta query on that wake, which is the cheap half; the ~15 aggregate reads and the
+            // write-back are what this is avoiding.
+            return
+        }
+        // Advance the anchor ONLY after the ingestion commits (@bhelm). If sync() bails (another sync holds
+        // `syncing`, or the store is unavailable), the anchor stays put so the next wake re-fetches this
+        // window and re-ingests — sync re-reads aggregates, so the replay is idempotent.
+        if await sync(days: window), let newAnchor {
+            persistAnchor(newAnchor, for: type)
+        }
     }
 
     /// Advance this type's stored anchor over any new samples and return the OLDEST sample date seen,
@@ -266,29 +422,36 @@ final class HealthKitBridge: ObservableObject {
     /// deltas are neither re-ingested nor missed across launches. We don't consume the samples here —
     /// `sync(days:)` re-reads the aggregate for the affected window — the anchor's only job is to tell
     /// us how far back the change reached.
-    private func fetchTouchedDayWindow(type: HKSampleType) async -> Date? {
+    private func fetchTouchedDayWindow(type: HKSampleType) async -> (oldest: Date?, newAnchor: HKQueryAnchor?) {
         let key = HealthKitBridge.anchorDefaultsKey(for: type)
         let priorAnchor: HKQueryAnchor? = {
             guard let data = UserDefaults.standard.data(forKey: key) else { return nil }
             return try? NSKeyedUnarchiver.unarchivedObject(ofClass: HKQueryAnchor.self, from: data)
         }()
 
-        return await withCheckedContinuation { (cont: CheckedContinuation<Date?, Never>) in
+        return await withCheckedContinuation { (cont: CheckedContinuation<(Date?, HKQueryAnchor?), Never>) in
             let q = HKAnchoredObjectQuery(
                 type: type, predicate: Self.notNoopAuthored,
                 anchor: priorAnchor, limit: HKObjectQueryNoLimit
             ) { _, samples, _, newAnchor, _ in
-                // Persist the advanced anchor so the next wake only sees genuinely-new samples. Skip the
-                // write on a query error (newAnchor nil) so we don't blow away a good cursor.
-                if let newAnchor,
-                   let data = try? NSKeyedArchiver.archivedData(withRootObject: newAnchor, requiringSecureCoding: true) {
-                    UserDefaults.standard.set(data, forKey: key)
-                }
+                // Return the advanced anchor but do NOT persist it here: the caller commits it only after
+                // the ensuing sync has actually stored the window (@bhelm). Persisting in this callback,
+                // before ingestion was known to run, advanced the cursor past samples a later-bailed
+                // sync() never stored — silently losing days for the background/watch-only path.
                 let oldest = (samples ?? []).map { $0.startDate }.min()
-                cont.resume(returning: oldest)
+                cont.resume(returning: (oldest, newAnchor))
             }
             store.execute(q)
         }
+    }
+
+    /// Commit a type's advanced HealthKit anchor to UserDefaults. Called only once the sync that consumes
+    /// the window has committed (or when there was nothing to ingest), so a bailed sync leaves the prior
+    /// anchor in place for the next observer wake to re-fetch. Skips a nil-archive rather than clobber a
+    /// good cursor. (@bhelm)
+    private func persistAnchor(_ anchor: HKQueryAnchor, for type: HKSampleType) {
+        guard let data = try? NSKeyedArchiver.archivedData(withRootObject: anchor, requiringSecureCoding: true) else { return }
+        UserDefaults.standard.set(data, forKey: HealthKitBridge.anchorDefaultsKey(for: type))
     }
 
     /// UserDefaults key for a type's persisted HealthKit anchor. Namespaced so it can't collide with
@@ -302,15 +465,32 @@ final class HealthKitBridge: ObservableObject {
     /// Pull the last `days` of Apple Health into the on-device store under the `apple-health` source,
     /// then write NOOP's own computed metrics back into Health. Safe to call repeatedly (idempotent
     /// upserts keyed by day).
-    func sync(days: Int = 30) async {
-        guard auth == .authorized, !syncing else { return }
+    @discardableResult
+    func sync(days: Int = 30) async -> Bool {
+        guard auth == .authorized else { return false }
+        guard !syncing else {
+            // A full sync includes write-back. If new strap data is landing concurrently, guarantee one
+            // final write-only reconciliation after the current owner releases the bridge.
+            writeBackPending = true
+            return false
+        }
         syncing = true
-        defer { syncing = false }
-        guard let store = await repo.storeHandle() else { return }
+        // #1578: time the whole pass — the ~15 aggregate reads, the upserts and the write-back. Recorded in
+        // `defer` so an early or thrown exit still contributes; a pass that cost time and then failed is
+        // exactly the one a drain report needs to show.
+        let passStart = Date()
+        defer {
+            HealthSyncStats.recordSync(millis: Int(Date().timeIntervalSince(passStart) * 1000))
+            finishHealthPass()
+        }
+        // Before reading: pick up any read type this version added that the user was never asked about
+        // (#949). No-op once the stored signature matches, which is every sync after the first.
+        await requestNewReadTypesIfNeeded()
+        guard let store = await repo.storeHandle() else { return false }
 
         let cal = Calendar.current
         let end = Date()
-        guard let start = cal.date(byAdding: .day, value: -days, to: cal.startOfDay(for: end)) else { return }
+        guard let start = cal.date(byAdding: .day, value: -days, to: cal.startOfDay(for: end)) else { return false }
 
         var byDay: [String: DayAgg] = [:]
         func agg(_ day: String) -> DayAgg { byDay[day] ?? DayAgg() }
@@ -363,6 +543,18 @@ final class HealthKitBridge: ObservableObject {
             var a = agg(day); a.bmi = v; byDay[day] = a
         }
 
+        // Water logged in other apps (#949). A cumulative day SUM, like steps — HealthKit re-adds every
+        // sample in the day on each sync, so the figure this produces is a full replacement rather than a
+        // delta, which is exactly what `setImportedHydration` wants. `notNoopAuthored` (applied inside
+        // `collect`) keeps NOOP's own drinks out, so a tap in NOOP can never come back as an import.
+        //
+        // The result is KEPT here, unlike every aggregate above: the write below replaces the stored
+        // figure, so a failed query must not be mistaken for an authoritative zero and wipe the window.
+        let waterReadOk = await collect(.dietaryWater, unit: .literUnit(with: .milli),
+                                        start: start, end: end, op: .cumulativeSum) { day, v in
+            var a = agg(day); a.waterMl = v; byDay[day] = a
+        }
+
         // Sleep minutes per day (asleep stages summed; attributed to wake day).
         await collectSleep(start: start, end: end) { day, asleepMin, deepMin, remMin, coreMin in
             var a = agg(day)
@@ -382,7 +574,8 @@ final class HealthKitBridge: ObservableObject {
                         deepMin: a.deepMin, remMin: a.remMin, lightMin: a.coreMin, disturbances: nil,
                         restingHr: a.restingHr.map { Int($0.rounded()) }, avgHrv: a.hrv,
                         recovery: nil, strain: nil, exerciseCount: nil,
-                        spo2Pct: a.spo2, skinTempDevC: nil, respRateBpm: a.respRate)
+                        spo2Pct: a.spo2, skinTempDevC: nil, respRateBpm: a.respRate,
+                        avgSdnn: a.hrv)   // Apple's HRV IS SDNN — mirror it into the SDNN field too
         }
         // Flatten to the generic metricSeries the shared Apple Health screen, the Today apple-health
         // sparklines, and the Metric Explorer read from — repo.series(key:source:"apple-health")
@@ -433,15 +626,150 @@ final class HealthKitBridge: ObservableObject {
             try await store.upsertDailyMetrics(dmRows, deviceId: appleDeviceId)
             try await store.upsertMetricSeries(points, deviceId: appleDeviceId)
             if !workoutRows.isEmpty { try await store.upsertWorkouts(workoutRows, deviceId: appleDeviceId) }
+            // Imported water (#949) goes to the hydration source, not apple-health, because the hydration
+            // screen is what reads it. Every day in the window is written — including the ones with no
+            // water at all, as 0 — so deleting a drink in the source app takes it away here on the next
+            // sync instead of stranding the old figure. `byDay` only holds days that had SOME metric, so
+            // the zero-fill has to come from the date range rather than from its keys.
+            //
+            // Gated on the hydration toggle, which is opt-in and default OFF: an import must not quietly
+            // populate a feature the user has turned off, and skipping it avoids writing a window of rows
+            // nothing will read.
+            if waterReadOk, UserDefaults.standard.bool(forKey: HydrationStore.enabledKey) {
+                var waterByDay: [String: Double] = [:]
+                var cursor = cal.startOfDay(for: start)
+                while cursor <= end {
+                    waterByDay[HealthKitBridge.dayString(cursor)] = 0
+                    guard let next = cal.date(byAdding: .day, value: 1, to: cursor) else { break }
+                    cursor = next
+                }
+                for (day, a) in byDay { if let ml = a.waterMl { waterByDay[day] = ml } }
+                await repo.setImportedHydration(waterByDay)
+            }
+            // Imported caffeine (#949) — only the last `CaffeineLogStore.retentionHours`, because the
+            // store prunes past that on load and the decay estimate is long dead by then. Reading the
+            // full 30-day sync window would hand over hundreds of samples for them all to be dropped.
+            //
+            // The caffeine card is manual-first and shows nothing until something is logged, so unlike
+            // hydration there is no separate opt-in toggle to gate on: an empty Health cupboard still
+            // leaves the card exactly as quiet as it is today.
+            if let caffeineStart = cal.date(byAdding: .hour,
+                                            value: -Int(CaffeineLogStore.retentionHours), to: end) {
+                // nil means the READ failed; only an actual empty result is allowed to clear the set.
+                if let imported = await collectCaffeine(start: caffeineStart, end: end) {
+                    CaffeineLogStore.shared.replaceImported(imported)
+                }
+            }
+            // Hourly step counts (v38-apple-step-hour). `appleDaily.steps` above flattens a whole day to
+            // one total, so an hour the phone spent dead/on a desk is invisible — the day just reads low.
+            // Walk the same window at HOURLY granularity into `appleStepHour` so a UI can show the shape
+            // of the day. First run ever (flag unset) widens to 90 days back: HealthKit keeps hourly
+            // statistics historically, so this answers PAST days retroactively rather than only from the
+            // day it ships; later syncs re-cover the normal start...end window like the daily collectors.
+            //
+            // Collected HERE (not earlier) so a transient HealthKit error throws into the existing catch
+            // below and the backfill flag is never set — a failed first run retries next sync instead of
+            // permanently skipping the one-time 90-day widen.
+            let hourlyStepsBackfilled = UserDefaults.standard.bool(forKey: Self.hourlyStepsBackfilledKey)
+            let hourlyStepsStart: Date = hourlyStepsBackfilled ? start
+                : (cal.date(byAdding: .day, value: -90, to: cal.startOfDay(for: end)) ?? start)
+            let hourlySteps = try await collectHourlySteps(start: hourlyStepsStart, end: end)
+            // Only mark the backfill done once hourly data actually lands. HealthKit returns EMPTY (not
+            // an error) when step read-access is denied, and users grant Health scopes incrementally — so
+            // gating on non-empty, not merely on no-throw, stops a deny-then-grant sequence from burning
+            // the one-time 90-day widen before the user ever authorises steps. A genuinely step-less
+            // window just re-scans next sync: cheap, bounded, self-healing.
+            if !hourlySteps.isEmpty {
+                try await store.upsertAppleStepHours(hourlySteps, deviceId: appleDeviceId)
+                if !hourlyStepsBackfilled {
+                    UserDefaults.standard.set(true, forKey: Self.hourlyStepsBackfilledKey)
+                }
+            }
             try await writeBack(whoopStore: store)
             lastSync = Date()
+            // Record the window alongside the time: an observer wake may only stand down for a sync that
+            // actually covered ITS days (see `observerCoalesceWindow`). Set on the success path only.
+            lastSyncDays = days
             lastError = nil
+            return true
         } catch {
+            // A failed sync must never let a later wake skip on the strength of it — the rows it would
+            // have written are not there. Clearing the window means `window <= lastSyncDays` cannot hold.
+            lastSyncDays = 0
             lastError = String(localized: "Apple Health sync failed: \(error.localizedDescription)")
+            return false
         }
     }
 
+    /// Write-back only, for when fresh strap data lands (#1021).
+    ///
+    /// `sync` is the two-way pass and runs on foreground entry, which is the wrong moment: the same
+    /// scenePhase block kicks the strap offload, so the write raced the data it was meant to publish and
+    /// last night's sleep only reached Health on the NEXT app open. `AppModel.refreshAfterCompletedBackfill`
+    /// is the real "new data landed" signal - the same one #980 already publishes the widget from - and it
+    /// also fires for a backfill that completes while the app is backgrounded.
+    ///
+    /// Deliberately not `sync()`: that would re-read 30 days out of Health and re-run the hydration /
+    /// caffeine imports on every offload, to write the same rows. The Android twin is the same shape -
+    /// `WhoopBleClient` calls `HealthConnectWriter.write` after the backfill, not a full re-sync.
+    ///
+    /// `lastSync` is left alone: it marks the last full two-way pass, and a write-only run advancing it
+    /// would misreport when NOOP last READ from Health.
+    ///
+    /// Shares the `syncing` flag with `sync()` on purpose: two write-backs must never interleave, because
+    /// the vitals dedup deletes our prior samples for a key before saving the fresh batch. A call that
+    /// arrives while another pass owns the bridge is coalesced into one final reconciliation rather than
+    /// being dropped until the next app open.
+    @discardableResult
+    func writeBackAfterNewData() async -> Bool {
+        // A backfill routinely completes in a process that was never foregrounded (a background offload,
+        // or a BLE relaunch) - the case this exists for. `auth` is still `.unknown` there, because the
+        // only resume runs on scenePhase == .active, so without this the guard below would silently drop
+        // exactly the writes this is meant to deliver. Idempotent, and never prompts: it reads share
+        // status, and its re-request for new types is foreground-gated.
+        refreshAuthIfPreviouslyGranted()
+        // No authorization is a successful no-op for a background task. The scheduler is cancelled by
+        // its app-owned operation after observing this state, so it does not keep waking unnecessarily.
+        guard auth == .authorized else { return true }
+        guard !syncing else {
+            writeBackPending = true
+            return true
+        }
+        syncing = true
+        defer { finishHealthPass() }
+        guard let store = await repo.storeHandle() else { return false }
+        do {
+            try await writeBack(whoopStore: store)
+            lastError = nil
+            return true
+        } catch {
+            lastError = String(localized: "Apple Health sync failed: \(error.localizedDescription)")
+            return false
+        }
+    }
+
+    /// Release the single-flight gate and service one coalesced fresh-data signal. Scheduling a new task
+    /// (rather than recursing in the defer) guarantees the current pass has fully returned first.
+    private func finishHealthPass() {
+        syncing = false
+        guard writeBackPending else { return }
+        writeBackPending = false
+        Task { await writeBackAfterNewData() }
+    }
+
     // MARK: - Write back (NOOP → Health)
+
+    /// Public re-entry point for the merged write-back, for callers OTHER than `sync(days:)` — namely
+    /// `CloudSyncModel.pullNow` (Strand/CloudSync/CloudSyncModel.swift), which needs to re-export
+    /// Apple Health after a cloud edit touches sleep/workouts/HR without also re-running the read-side
+    /// HealthKit pull `sync` does. A thin, otherwise-unchanged wrapper around the private `writeBack`
+    /// below — same auth guard, same dedup semantics per feature (see `writeBack`'s doc comment).
+    /// Guarded the same way `writeBack` itself is (`auth == .authorized`); a caller built on a fresh
+    /// `HealthKitBridge` instance should call `refreshAuthIfPreviouslyGranted()` first so a previously
+    /// granted user's re-export doesn't silently no-op against a default `.unknown` auth state.
+    func rerunWriteBack(whoopStore: WhoopStore, days: Int) async throws {
+        try await writeBack(whoopStore: whoopStore, days: days)
+    }
 
     /// Write NOOP's strap-derived data into Apple Health: sleep sessions with full stage segments,
     /// the continuous 1-minute heart-rate stream, strap/manual workouts, and the nightly vitals
@@ -535,10 +863,19 @@ final class HealthKitBridge: ObservableObject {
             if let rhr = row.restingHr {
                 add(.restingHeartRate, HKUnit.count().unitDivided(by: .minute()), Double(rhr), row.day, at)
             }
-            if let hrv = row.avgHrv {
-                add(.heartRateVariabilitySDNN, .secondUnit(with: .milli), hrv, row.day, at)
+            // Export the GENUINE SDNN (v31) when present — the strap's `avgHrv` is RMSSD, which HealthKit
+            // has no field for, so writing it under `.heartRateVariabilitySDNN` mislabels it. `avgSdnn` is the
+            // 5-min SDNN index, deliberately window-matched to Apple's own short-window SDNN samples so the
+            // written values sit consistently in the user's Health SDNN history (a whole-night SD would land
+            // 2-3× high). WHOOP rows backfill `avgSdnn` from stored raw R-R on the next re-score; Apple rows'
+            // `avgHrv` already IS SDNN. The `avgHrv` fallback fires for those two before re-scoring, and
+            // permanently for summary-only sources (Oura) that give RMSSD with no raw R-R to derive SDNN from
+            // — HealthKit's single HRV type leaves no better label there.
+            if let sdnn = row.avgSdnn ?? row.avgHrv {
+                add(.heartRateVariabilitySDNN, .secondUnit(with: .milli), sdnn, row.day, at)
             }
-            if let spo2 = row.spo2Pct {
+            // DELIBERATELY NOT EXPORTED while `exportsSpo2ToHealthKit` is false — see the constant.
+            if HealthKitBridge.exportsSpo2ToHealthKit, let spo2 = row.spo2Pct {
                 add(.oxygenSaturation, .percent(), spo2 / 100, row.day, at)
             }
             if let rr = row.respRateBpm {
@@ -800,6 +1137,7 @@ final class HealthKitBridge: ObservableObject {
         var activeKcal: Double?; var basalKcal: Double?; var vo2max: Double?
         var weightKg: Double?; var bodyFatPct: Double?; var leanMassKg: Double?; var bmi: Double?
         var asleepMin: Double?; var deepMin: Double?; var remMin: Double?; var coreMin: Double?
+        var waterMl: Double?
     }
 
     /// Excludes NOOP's own write-back samples from reads, so the two-way sync never reads its own
@@ -810,21 +1148,78 @@ final class HealthKitBridge: ObservableObject {
         NSCompoundPredicate(notPredicateWithSubpredicate: HKQuery.predicateForObjects(from: [HKSource.default()]))
     }
 
-    private func collect(_ id: HKQuantityTypeIdentifier, unit: HKUnit, start: Date, end: Date,
-                         op: HKStatisticsOptions, sink: @escaping (String, Double) -> Void) async {
-        guard let type = HKQuantityType.quantityType(forIdentifier: id) else { return }
+    /// Returns TRUE when the query completed, FALSE when HealthKit handed back an error.
+    ///
+    /// Every aggregate caller ignores this: a failed type simply contributes nothing to `DayAgg` and the
+    /// affected fields stay nil, so no row is written for them. It matters only for a caller whose write
+    /// REPLACES rather than adds (#949 imported water), where "read nothing" and "there is nothing" are
+    /// the same empty result — and treating a failed query as an authoritative zero would wipe the
+    /// stored figure for the whole window.
+    @discardableResult
+    /// Hourly cumulative step counts over `[start, end)`, mirroring `collect()`'s
+    /// `HKStatisticsCollectionQuery` shape but bucketed by HOUR instead of day, so a backfill can show
+    /// the shape of a day rather than one flattened total. `anchorDate` is local midnight — the same
+    /// anchor `collect()` uses for its daily buckets — so hour buckets fall on local-clock hour
+    /// boundaries, not UTC ones.
+    ///
+    /// WHAT A MISSING HOUR MEANS. Only hours with at least one step sample produce a row (HealthKit's
+    /// `sumQuantity()` is nil for an empty bucket). So an absent hour means "no steps were recorded" —
+    /// which covers a dead/left-behind phone AND an hour the wearer simply sat still. Step data carries
+    /// no separate "was recording" signal, so a consumer must not label a gap as "phone off" on its own;
+    /// it is evidence, not proof. Rows are never fabricated for empty hours.
+    ///
+    /// Throws on a HealthKit query error (distinguished from a genuinely-empty window, which returns
+    /// zero rows) so a transient failure propagates to `sync()`'s existing `catch` instead of being
+    /// mistaken for "no data".
+    private func collectHourlySteps(start: Date, end: Date) async throws -> [(ts: Int, steps: Int)] {
+        guard let type = HKQuantityType.quantityType(forIdentifier: .stepCount) else { return [] }
         let cal = Calendar.current
         let anchor = cal.startOfDay(for: start)
         let predicate = NSCompoundPredicate(andPredicateWithSubpredicates: [
             HKQuery.predicateForSamples(withStart: start, end: end, options: .strictStartDate),
             Self.notNoopAuthored,
         ])
-        await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
+        return try await withCheckedThrowingContinuation { (cont: CheckedContinuation<[(ts: Int, steps: Int)], Error>) in
+            let q = HKStatisticsCollectionQuery(quantityType: type, quantitySamplePredicate: predicate,
+                                                options: .cumulativeSum, anchorDate: anchor,
+                                                intervalComponents: DateComponents(hour: 1))
+            q.initialResultsHandler = { _, results, error in
+                if let error {
+                    cont.resume(throwing: error)
+                    return
+                }
+                var rows: [(ts: Int, steps: Int)] = []
+                results?.enumerateStatistics(from: start, to: end) { stats, _ in
+                    if let sum = stats.sumQuantity() {
+                        let steps = Int(sum.doubleValue(for: .count()).rounded())
+                        rows.append((ts: Int(stats.startDate.timeIntervalSince1970), steps: steps))
+                    }
+                }
+                cont.resume(returning: rows)
+            }
+            store.execute(q)
+        }
+    }
+
+    private func collect(_ id: HKQuantityTypeIdentifier, unit: HKUnit, start: Date, end: Date,
+                         op: HKStatisticsOptions, sink: @escaping (String, Double) -> Void) async -> Bool {
+        guard let type = HKQuantityType.quantityType(forIdentifier: id) else { return false }
+        let cal = Calendar.current
+        let anchor = cal.startOfDay(for: start)
+        let predicate = NSCompoundPredicate(andPredicateWithSubpredicates: [
+            HKQuery.predicateForSamples(withStart: start, end: end, options: .strictStartDate),
+            Self.notNoopAuthored,
+        ])
+        return await withCheckedContinuation { (cont: CheckedContinuation<Bool, Never>) in
             let q = HKStatisticsCollectionQuery(quantityType: type, quantitySamplePredicate: predicate,
                                                 options: op, anchorDate: anchor,
                                                 intervalComponents: DateComponents(day: 1))
-            q.initialResultsHandler = { _, results, _ in
-                results?.enumerateStatistics(from: start, to: end) { stats, _ in
+            q.initialResultsHandler = { _, results, error in
+                // A nil `results` with an error is a FAILED read, not an empty one — see the note on
+                // the return value. Both are reported as false so the caller can tell them apart from
+                // a query that genuinely found nothing.
+                guard error == nil, let results else { cont.resume(returning: false); return }
+                results.enumerateStatistics(from: start, to: end) { stats, _ in
                     let q: HKQuantity?
                     switch op {
                     case .cumulativeSum:     q = stats.sumQuantity()
@@ -835,7 +1230,7 @@ final class HealthKitBridge: ObservableObject {
                     }
                     if let q { sink(HealthKitBridge.dayString(stats.startDate), q.doubleValue(for: unit)) }
                 }
-                cont.resume()
+                cont.resume(returning: true)
             }
             store.execute(q)
         }
@@ -884,6 +1279,55 @@ final class HealthKitBridge: ObservableObject {
     /// the macOS export importer and the Android Health Connect importer, which already ingest workouts,
     /// closing the iOS gap. The upsert is idempotent on (deviceId, startTs), so re-running a sync window
     /// refreshes rather than duplicates.
+    /// Individual caffeine samples in the window, newest first (#949).
+    ///
+    /// A SAMPLE query, not the day-bucketed `collect`: the caffeine card estimates what is still active
+    /// from a half-life decay, so it needs each intake's own timestamp. A day total would collapse a 7am
+    /// coffee and a 9pm one into a single number that answers no question the card asks.
+    ///
+    /// Each sample keeps its HealthKit UUID as `externalId` so a re-import can tell an intake it already
+    /// has from a new one. `notNoopAuthored` keeps NOOP's own samples out — we do not write caffeine
+    /// today, but the predicate costs nothing and closes the loop if that ever changes.
+    ///
+    /// Returns nil when the read FAILED, as distinct from an empty array meaning "no caffeine logged".
+    /// The caller replaces the imported set wholesale, so collapsing those two cases would let a failed
+    /// query silently delete every imported intake.
+    private func collectCaffeine(start: Date, end: Date) async -> [CaffeineIntake]? {
+        guard let type = HKQuantityType.quantityType(forIdentifier: .dietaryCaffeine) else { return nil }
+        let predicate = NSCompoundPredicate(andPredicateWithSubpredicates: [
+            HKQuery.predicateForSamples(withStart: start, end: end, options: .strictStartDate),
+            Self.notNoopAuthored,
+        ])
+        return await withCheckedContinuation { (cont: CheckedContinuation<[CaffeineIntake]?, Never>) in
+            let sort = NSSortDescriptor(key: HKSampleSortIdentifierStartDate, ascending: false)
+            let q = HKSampleQuery(sampleType: type, predicate: predicate,
+                                  limit: HKObjectQueryNoLimit, sortDescriptors: [sort]) { _, samples, error in
+                // The CAST is part of the failure test, not a fallback. `?? []` here would turn an
+                // unexpected sample type into "no caffeine tonight", and the caller replaces the imported
+                // set wholesale — so a cast that ever failed would silently delete every imported intake.
+                // Same reasoning as the error check beside it.
+                guard error == nil, let samples = samples as? [HKQuantitySample] else {
+                    cont.resume(returning: nil); return
+                }
+                let out: [CaffeineIntake] = samples.compactMap { s in
+                    let mg = s.quantity.doubleValue(for: .gramUnit(with: .milli))
+                    // A zero or non-finite sample carries no dose worth showing; skip it rather than log
+                    // a 0 mg intake, which would pad the "intakes still active" count with nothing.
+                    guard mg.isFinite, mg > 0 else { return nil }
+                    // The sample's OWN uuid as the intake id, not a fresh one. `CaffeineIntake` defaults
+                    // `id` to `UUID()`, so minting one here would give the same coffee a different
+                    // identity on every sync: `replaceImported`'s no-op guard would never match (a
+                    // pointless JSON rewrite + republish each time), and `ForEach` would see the whole
+                    // logged list as new rows and rebuild it. HealthKit sample uuids are stable.
+                    return CaffeineIntake(id: s.uuid, at: s.startDate, mg: mg,
+                                          externalId: s.uuid.uuidString)
+                }
+                cont.resume(returning: out)
+            }
+            store.execute(q)
+        }
+    }
+
     private func collectWorkouts(start: Date, end: Date) async -> [WorkoutRow] {
         let predicate = NSCompoundPredicate(andPredicateWithSubpredicates: [
             HKQuery.predicateForSamples(withStart: start, end: end, options: .strictStartDate),
@@ -910,7 +1354,7 @@ final class HealthKitBridge: ObservableObject {
                         strain: nil,
                         distanceM: workout.totalDistance?.doubleValue(for: .meter()),
                         zonesJSON: nil,
-                        notes: nil))
+                        notes: nil, steps: nil))
                 }
                 cont.resume(returning: rows)
             }

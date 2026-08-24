@@ -1,4 +1,5 @@
 import Foundation
+import StrandAnalytics
 
 /// Opt-in switch for the EXPERIMENTAL WHOOP 5.0/MG ("puffin") protocol probes.
 ///
@@ -16,8 +17,13 @@ enum PuffinExperiment {
     /// Separate, more-deliberate opt-in for the WHOOP 5/MG "R22" deep-data unlock — the one probe
     /// that WRITES a persistent feature flag to the strap (the `enable_r22_*` SET_CONFIG sequence the
     /// official app sends; documented by judes.club + Asherlc/dofek). Kept distinct from the read-only
-    /// probes above because it changes strap state, so it must be turned on explicitly and is still
-    /// fully reversible. Driven only from `BLEManager.enableWhoop5DeepData()`. (#174)
+    /// probes above because it changes strap state, so it must be turned on explicitly.
+    ///
+    /// Reversible, and now actually reversed by code rather than only in the comment: this key gates BOTH
+    /// `BLEManager.enableWhoop5DeepData()` and `BLEManager.disableWhoop5DeepData()`, and the send allowlist
+    /// consults `FeatureFlagWriteGate` so only the sixteen R22 keys — carrying either their enable value or
+    /// the off value — can travel through opcode 120. Note the pref itself writes NOTHING in either
+    /// direction; it only decides whether a send is permitted. (#174)
     static let deepDataKey = "noopWhoop5DeepData"
 
     static var deepDataEnabled: Bool { UserDefaults.standard.bool(forKey: deepDataKey) }
@@ -29,6 +35,77 @@ enum PuffinExperiment {
     static let broadcastHrKey = "noopBroadcastHr"
 
     static var broadcastHrEnabled: Bool { UserDefaults.standard.bool(forKey: broadcastHrKey) }
+
+    /// Opt-in "ECG raw-data gate" (#891): writes the device-config key `enable_raw_data_w_ecg` — the key
+    /// the strap's own 115/116 enumeration listed, and which reads `'0'` on a subscription-free WHOOP MG
+    /// whose three TOGGLE_LABRADOR commands all ack SUCCESS and emit nothing.
+    ///
+    /// Its own key rather than a shared "ECG" one: this repo gives every PERSISTENT STRAP WRITE its own
+    /// deliberate opt-in (`deepDataKey` #174, `broadcastHrKey` #181), so reusing one switch for "listen for
+    /// ECG packets" (`ecgKey`) and "change a stored value on the strap" would let the second ride in on
+    /// consent given for the first.
+    ///
+    /// Reversible in one tap, default OFF, and additionally gated on `Whoop5Variant.isMG` at the call site
+    /// — a plain 5.0 has no electrodes. Driven only by `BLEManager.setEcgRawDataGate(_:)`, which always
+    /// follows the write with a `GET_DEVICE_CONFIG_VALUE(121)` read-back. Mirrors the Android
+    /// `PuffinExperiment.KEY_ECG_RAW_DATA`.
+    static let ecgRawDataKey = "noopEcgRawDataGate"
+
+    static var ecgRawDataEnabled: Bool { UserDefaults.standard.bool(forKey: ecgRawDataKey) }
+
+    /// Opt-in "SpO₂ strap estimate" display (#103, extended to Oura by queue 11a): surfaces a nightly
+    /// candidate SpO₂ mean in the Blood Oxygen tile/card, labelled "strap estimate (unverified)". The
+    /// transform is device-conditional (`IntelligenceEngine`):
+    ///  - **WHOOP 5/MG**: the `spo2_candidate_82` V18Aux byte (70–100 range). An 8-night independent
+    ///    validation tracked it at corr +0.99 against the WHOOP app, but two nights on the original #103
+    ///    device moved OPPOSITE — device/firmware variance unresolved.
+    ///  - **Oura**: `min(sample, 100)` applied per-sample to the ring's own decoded `0x6F` SpO2, then
+    ///    averaged (`AnalyticsEngine.nightlySpo2CeilingMean`) — the raw wire mean has a documented
+    ///    positive bias (OURA_PROTOCOL.md §6.5.0), so ceiling@100 is queue 11a's starting transform,
+    ///    round-matching the Oura app's own displayed SpO2 on 3/3 full-tier nights measured so far
+    ///    (2026-08-22).
+    /// Neither candidate is a validated calibration. Per the derived-biosignal rule (CLAUDE.md), both ship
+    /// behind this one default-off toggle, never as the default `spo2Pct` and never feeding a downstream
+    /// gate.
+    ///
+    /// Display-only: writes nothing to the strap. The engine writes the resolved mean to metricSeries as
+    /// "spo2_candidate" under the "-noop" computed device ID; the UI reads it only while this toggle is
+    /// ON. Mirrors the Android `NoopPrefs.KEY_SPO2_CANDIDATE_DISPLAY`.
+    static let spo2CandidateDisplayKey = "noopSpo2CandidateDisplay"
+
+    static var spo2CandidateDisplayEnabled: Bool { UserDefaults.standard.bool(forKey: spo2CandidateDisplayKey) }
+
+    /// Opt-in "Personal daytime-stress baseline" (#463): score TODAY's intraday stress timeline against a
+    /// PERSONAL cross-day rolling baseline (Oura-style `.baselineRelative`) instead of the day's own calm
+    /// hours (`.dayRelative`, the default). Default OFF — the validated r≈0.6 HR-only margin is so far
+    /// SINGLE-SUBJECT (see `DaytimeStress.baselineRelativeHighMarginBPM`), so this stays a chooseable lens,
+    /// not a silent default, until it is validated on more subjects. When OFF, `StressView` /
+    /// `StressScreen` pass no mode and the read is byte-identical to before. Mirrors the Android
+    /// `NoopPrefs.KEY_STRESS_PERSONAL_BASELINE`.
+    static let stressPersonalBaselineKey = "noopStressPersonalBaseline"
+
+    static var stressPersonalBaselineEnabled: Bool { UserDefaults.standard.bool(forKey: stressPersonalBaselineKey) }
+
+    /// Opt-in "Banister Effort" (#1545): score Effort with Banister's EXPONENTIAL TRIMP instead of the
+    /// default Edwards 5-zone summation.
+    ///
+    /// Edwards is time-in-zone and pays **nothing** below 50% HRR. A reporter's weightlifting session
+    /// scored 1.7 while a walk scored higher — working that number backwards gives a TRIMP of about 1,
+    /// i.e. the model saw essentially no time above the floor for the whole session. An hour held at 45%
+    /// HRR scores 0.00 under Edwards and about 43 under Banister; that is the difference between
+    /// under-rating intermittent work and not seeing it at all.
+    ///
+    /// Default OFF, and it must stay a choice rather than become the default: it re-scores every day in
+    /// the window against a different recipe, so flipping it silently would move a headline metric's
+    /// whole history. Each method maps a theoretical maximum day to exactly 100 via its own log
+    /// denominator (`StrainScorer.logMapDenominator`), so the two are on the same axis and switching does
+    /// not rescale the axis under the user. Mirrors the Android `NoopPrefs.KEY_BANISTER_EFFORT`.
+    static let banisterEffortKey = "noopBanisterEffort"
+
+    static var banisterEffortEnabled: Bool { UserDefaults.standard.bool(forKey: banisterEffortKey) }
+
+    /// The TRIMP recipe every Effort computation on this device should use.
+    static var effortMethod: StrainScorer.Method { banisterEffortEnabled ? .banister : .edwards }
 
     /// Opt-in "Continuous HRV capture": hold the dense realtime HR stream armed even with no Live screen
     /// open, so the strap banks beat-to-beat R-R intervals 24/7 for far better overnight HRV/recovery/
@@ -43,18 +120,79 @@ enum PuffinExperiment {
     /// only inside the nightly window (the reused quiet-hours window convention: minutes since local
     /// midnight, wrap-aware, 22:00 to 07:00 by default) instead of 24/7, roughly halving the battery
     /// cost. Composed with the base toggle so existing users need no migration: base on + this off reads
-    /// ALWAYS (the pre-#927 behaviour). Default OFF. Read by BLEManager at EVERY arm site (re-derived at
+    /// ALWAYS (the pre-#927 behaviour). Defaults ON for fresh installs, OFF once Continuous HRV has been
+    /// used (#1008) — see below. Read by BLEManager at EVERY arm site (re-derived at
     /// arm time, never precomputed; see ContinuousHrvSchedule). Mirrors the Android
     /// `NoopPrefs.KEY_CONTINUOUS_HRV_OVERNIGHT`.
     static let continuousHrvOvernightOnlyKey = "noopContinuousHrvOvernightOnly"
 
-    static var continuousHrvOvernightOnlyEnabled: Bool { UserDefaults.standard.bool(forKey: continuousHrvOvernightOnlyKey) }
+    /// Defaults to ON for anyone who has never touched Continuous HRV, and to OFF for anyone who has
+    /// (#1008). WHOOP publishes no daytime HRV figure at all — its reading is an overnight one — so a
+    /// 24/7 stream has no official-app analogue, and overnight-only roughly halves the battery cost.
+    /// Making the cheaper, WHOOP-comparable behaviour the default is the point; the expensive one stays
+    /// a deliberate choice.
+    ///
+    /// `UserDefaults.bool(forKey:)` cannot express this on its own: it returns `false` for a missing key,
+    /// which is indistinguishable from an explicit off. The unset case is therefore resolved from whether
+    /// `keepRealtimeForDataKey` exists, rather than by writing a migration — the only thing that must not
+    /// happen is silently narrowing capture for someone already relying on it. Twin of the Android
+    /// `NoopPrefs.continuousHrvOvernight`.
+    static var continuousHrvOvernightOnlyEnabled: Bool {
+        UserDefaults.standard.object(forKey: continuousHrvOvernightOnlyKey) as? Bool ?? true
+    }
+
+    /// One-time migration for the #1008 default flip. Called once at launch, BEFORE anything reads the
+    /// setting, and before the user can reach the toggle.
+    ///
+    /// The default moved from OFF to ON, so an install that predates the change has to be pinned to OFF
+    /// explicitly or it would be silently narrowed to overnight-only capture — removing daytime data the
+    /// user opted in for. "Predates the change" is read as "has ever toggled Continuous HRV", i.e. the
+    /// base key exists.
+    ///
+    /// Deciding this at READ time instead does not work, and the way it fails is worth recording: the
+    /// discriminator would be the base key, which the user's own opt-in creates — so a fresh install
+    /// would default to ON and then flip to OFF the moment they enabled Continuous HRV, the exact
+    /// opposite of the intent.
+    ///
+    /// A `@AppStorage` `onChange` hook cannot substitute for this either: `@AppStorage` writes the value
+    /// BEFORE the handler runs, so by then a first-ever toggle is indistinguishable from any other.
+    ///
+    /// Idempotent: writes only when the overnight key is absent and the base key is present.
+    /// Twin of the Android `NoopPrefs.migrateContinuousHrvOvernightDefault`.
+    static func migrateContinuousHrvOvernightDefault() {
+        let defaults = UserDefaults.standard
+        guard shouldPinLegacyOvernightDefault(
+            hasOvernightChoice: defaults.object(forKey: continuousHrvOvernightOnlyKey) != nil,
+            hasUsedContinuousHrv: defaults.object(forKey: keepRealtimeForDataKey) != nil) else { return }
+        defaults.set(false, forKey: continuousHrvOvernightOnlyKey)
+    }
+
+    /// The migration's decision, lifted out so it is testable without touching `UserDefaults`. Twin of
+    /// the Android `NoopPrefs.shouldPinLegacyOvernightDefault`.
+    ///
+    /// Pin the OLD default only for an install that has used Continuous HRV and never chose an overnight
+    /// setting. Everything else is left alone.
+    ///
+    /// Note what this is NOT keyed on: the READ. An earlier attempt resolved the default at read time
+    /// from `hasUsedContinuousHrv`, which the user's own opt-in creates — so a fresh install read ON and
+    /// then flipped to OFF the moment Continuous HRV was enabled. Running the decision once at launch is
+    /// what makes the answer stable.
+    static func shouldPinLegacyOvernightDefault(hasOvernightChoice: Bool,
+                                                hasUsedContinuousHrv: Bool) -> Bool {
+        !hasOvernightChoice && hasUsedContinuousHrv
+    }
 
     // MARK: - Power saving (#477), parity with Android NoopPrefs
 
     /// "Power saving" master: battery-adaptive strap-sync cadence. Default off. */
     static let powerSavingKey = "noopPowerSaving"
     static var powerSavingEnabled: Bool { UserDefaults.standard.bool(forKey: powerSavingKey) }
+
+    /// "Low refresh": a sub-option of Power saving (only meaningful while that master is on). Stretches
+    /// the periodic history offload to hourly at ANY strap charge, instead of only while the battery is
+    /// low. Default off. Cadence only — no data is lost (the strap banks to flash and trims on our ack).
+    static let lowRefreshKey = "noopLowRefresh"
+    static var lowRefreshEnabled: Bool { UserDefaults.standard.bool(forKey: lowRefreshKey) }
 
     /// Battery-% threshold for power saving (10–30). Default 20 (0 in the store means "unset" → 20).
     static let powerSavingBatteryPctKey = "noopPowerSavingBatteryPct"
@@ -141,6 +279,19 @@ enum PuffinExperiment {
 
     static var motionAwareWakeEnabled: Bool { UserDefaults.standard.bool(forKey: motionAwareWakeKey) }
 
+    /// Opt-in "WHOOP MG ECG (experimental)": unlock the gated, user-initiated ECG ("Labrador") probe that
+    /// asks an MG strap to start its ECG subsystem. Default OFF, and OFF is not merely the default — with
+    /// this key false the four ECG opcodes are dropped by the BLEManager allowlist, so no ECG byte can
+    /// reach a strap on a normal install. Additionally gated on a POSITIVELY identified MG
+    /// (`Whoop5Variant.mg`): a plain 5.0 has no electrodes and a 4.0 has neither the hardware nor the
+    /// transport. Every send is still user-initiated and confirmation-gated at the call site.
+    ///
+    /// NOT a medical feature. Whatever the strap returns is unvalidated instrumentation, never a
+    /// diagnosis — see the probe's report text and DISCLAIMER.md.
+    static let ecgKey = "noopWhoop5Ecg"
+
+    static var ecgEnabled: Bool { UserDefaults.standard.bool(forKey: ecgKey) }
+
     /// Every 5/MG-only probe key, in ONE place — the twin of Kotlin's `FIVE_MG_GATED_KEYS`.
     ///
     /// The capture flag deliberately appears here even though it is declared on `PuffinFrameRecorder`
@@ -152,6 +303,11 @@ enum PuffinExperiment {
         defaultsKey,                     // protocol probes
         deepDataKey,                     // R22 deep-data strap write
         broadcastHrKey,                  // broadcast-HR write
+        // MG ECG (Labrador) probe — writes ECG control commands. Swift-only for now: the Android client
+        // takes the ECG decoder but has no ECG app layer, so Kotlin's FIVE_MG_GATED_KEYS has no twin
+        // entry to add. Add one there in the same change that adds an Android probe.
+        ecgKey,
+        ecgRawDataKey,                   // enable_raw_data_w_ecg strap write (#891)
         PuffinFrameRecorder.enabledKey,  // raw frame capture — declared on PuffinFrameRecorder
     ]
 

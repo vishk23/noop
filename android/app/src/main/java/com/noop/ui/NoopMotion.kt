@@ -1,6 +1,12 @@
 package com.noop.ui
 
 import com.noop.R
+import android.content.BroadcastReceiver
+import android.content.Context
+import android.content.Intent
+import android.content.IntentFilter
+import android.content.SharedPreferences
+import android.os.PowerManager
 import android.provider.Settings
 import androidx.compose.animation.core.AnimationSpec
 import androidx.compose.animation.core.animateFloatAsState
@@ -25,6 +31,7 @@ import androidx.compose.ui.platform.LocalInspectionMode
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
+import androidx.core.content.ContextCompat
 import kotlinx.coroutines.delay
 
 // MARK: - NoopMotion — the "Design Reset" motion set (WHOOP design language, 2026-06-22)
@@ -67,6 +74,117 @@ fun rememberReduceMotion(): Boolean {
         scale == 0f
     }
 }
+
+/**
+ * Process-wide battery-saver state, registered once and read by every animating surface.
+ *
+ * One receiver, not one per composable: the liquid primitives alone have 26 call sites, and a
+ * `DisposableEffect` inside each would register and unregister a `BroadcastReceiver` as gauges scroll in
+ * and out of composition — churn, in the change that exists to remove per-frame work. The Apple twin is a
+ * singleton (`LiquidPowerMonitor.shared`) for the same reason, and like it this is never unregistered:
+ * the state is process-lifetime and so is the observer.
+ *
+ * Backed by Compose snapshot state, so a write from the receiver recomposes exactly the surfaces that
+ * read it.
+ */
+private object PowerSaveMonitor {
+    val isSaving = mutableStateOf(false)
+    private var registered = false
+
+    /** Idempotent; safe to call from every composition. Called on the main thread by construction. */
+    fun ensureStarted(context: Context) {
+        if (registered) return
+        val app = context.applicationContext
+        val pm = app.getSystemService(Context.POWER_SERVICE) as? PowerManager ?: return
+        isSaving.value = pm.isPowerSaveMode
+        val receiver = object : BroadcastReceiver() {
+            override fun onReceive(unused: Context?, intent: Intent?) { isSaving.value = pm.isPowerSaveMode }
+        }
+        // ACTION_POWER_SAVE_MODE_CHANGED is a protected system broadcast; RECEIVER_NOT_EXPORTED stops
+        // other apps sending it while the system still delivers. Same shape as the Bluetooth state
+        // receiver in WhoopConnectionService.
+        val ok = runCatching {
+            ContextCompat.registerReceiver(
+                app,
+                receiver,
+                IntentFilter(PowerManager.ACTION_POWER_SAVE_MODE_CHANGED),
+                ContextCompat.RECEIVER_NOT_EXPORTED,
+            )
+        }.isSuccess
+        if (ok) registered = true
+    }
+}
+
+/**
+ * True while the system is in battery saver. The Android analogue of iOS `isLowPowerModeEnabled`, which
+ * [rememberPoseStill] pairs with reduce-motion so the continuously-animating surfaces pose still (#909).
+ *
+ * Live, not read-once: toggling battery saver takes effect without leaving the screen, matching the Apple
+ * side's `NSProcessInfoPowerStateDidChange` observer. Previews (inspection mode) always report `false`,
+ * like [rememberReduceMotion], so design tooling shows the animated state.
+ */
+@Composable
+fun rememberPowerSaveMode(): Boolean {
+    if (LocalInspectionMode.current) return false
+    val context = LocalContext.current
+    // `remember` so the idempotent start runs once per composition rather than on every recomposition.
+    remember(context) { PowerSaveMonitor.ensureStarted(context) }
+    return PowerSaveMonitor.isSaving.value
+}
+
+/**
+ * Process-wide live mirror of the in-app "Reduce motion in NOOP" preference. SharedPreferences keeps
+ * listeners weakly, so this object retains both the preferences and listener for the process lifetime.
+ * One observer feeds Compose snapshot state to every looping surface, avoiding a listener per composable.
+ */
+private object QuietMotionMonitor {
+    val enabled = mutableStateOf(false)
+    private var preferences: SharedPreferences? = null
+    private var listener: SharedPreferences.OnSharedPreferenceChangeListener? = null
+
+    /** Idempotent; called on the main thread from composition. */
+    fun ensureStarted(context: Context) {
+        if (preferences != null) return
+        val prefs = NoopPrefs.of(context.applicationContext)
+        enabled.value = prefs.getBoolean(NoopPrefs.KEY_QUIET_MOTION, false)
+        val observer = SharedPreferences.OnSharedPreferenceChangeListener { changed, key ->
+            if (key == NoopPrefs.KEY_QUIET_MOTION) {
+                enabled.value = changed.getBoolean(NoopPrefs.KEY_QUIET_MOTION, false)
+            }
+        }
+        preferences = prefs
+        listener = observer
+        prefs.registerOnSharedPreferenceChangeListener(observer)
+    }
+}
+
+/** The live in-app quiet-motion preference. Previews stay animated. */
+@Composable
+fun rememberQuietMotion(): Boolean {
+    if (LocalInspectionMode.current) return false
+    val context = LocalContext.current
+    remember(context) { QuietMotionMonitor.ensureStarted(context) }
+    return QuietMotionMonitor.enabled.value
+}
+
+/**
+ * True when a continuously-animating surface should render its single posed frame instead of running
+ * a frame loop — the user turned system animations off, the system is in battery saver, or the in-app
+ * quiet-motion preference is enabled.
+ *
+ * **For frame loops only.** The one-shot helpers in this file (`CountUpText`, `staggeredAppear`, the
+ * 160 ms tweens in `LiquidPrimitives`) keep asking [rememberReduceMotion] on its own: those settle and
+ * stop, so they are not the cost battery saver is asking to avoid, and the Apple change this mirrors
+ * (#909) gated only its `TimelineView`s for the same reason.
+ *
+ * The measured cost on the Apple side was ~18% of a CPU core for the idle Today screen, identical in
+ * Debug and Release because the per-frame work is canvas drawing rather than arithmetic. Android runs
+ * the same picture through `withFrameNanos` / `rememberInfiniteTransition`, so the shape holds even
+ * though the number is unmeasured here.
+ */
+@Composable
+fun rememberPoseStill(): Boolean =
+    rememberReduceMotion() || rememberPowerSaveMode() || rememberQuietMotion()
 
 // MARK: - NoopMotion springs / tokens
 

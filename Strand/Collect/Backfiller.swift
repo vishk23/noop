@@ -85,6 +85,20 @@ final class Backfiller {
     /// Per-session persistence tally — the success-side observability the log forensics flagged as the
     /// blind spot (#150): we logged FAILURES (decoded-to-0) but never SUCCESSES, so a strap log couldn't
     /// tell a banking strap from a broken one. Reset at begin(); read by BLEManager at session end to emit
+    /// #1008/#1118 PRE-STORAGE R-R census, accumulated across the session. `offered` is what the decoder
+    /// handed over; `inserted` is what survived the store's ON CONFLICT key, so the gap is how much the
+    /// primary key already absorbs. The per-second histogram sums per chunk, so a second split across two
+    /// chunks is counted in both — a rounding artifact at chunk edges only, and the ratio below (exact
+    /// sums over the exact span) is the number that decides emission-vs-ingest. Instrumentation only.
+    private(set) var sessionRrOffered = 0
+    private(set) var sessionRrInserted = 0
+    private(set) var sessionRrSumMs = 0
+    private(set) var sessionRrMinTs: Int?
+    private(set) var sessionRrMaxTs: Int?
+    private(set) var sessionRrHist = [0, 0, 0, 0]
+    private(set) var sessionRrGapHist = [0, 0, 0, 0, 0, 0, 0, 0]
+    private(set) var sessionRrFill = [0, 0, 0, 0]
+
     /// "persisted N rows (M with motion) across K night(s)". Nights are day-keys (ts / 86400).
     private(set) var sessionRowsPersisted = 0
     /// #42: set by `begin` when this session continues an auto-continue burst (#364) that already banked
@@ -118,6 +132,9 @@ final class Backfiller {
     private(set) var sessionClockDevice: Int?
     private(set) var sessionClockWall: Int?
     private(set) var sessionUsedIdentityRef = false
+    /// #1008: 1-based chunk counter for the per-chunk `hist clock` diag line, so a strap log can be read
+    /// as a trajectory across one offload. Reset per session alongside the clock ref above.
+    private var chunkIndex = 0
     /// Logged once per session when the strap reports trim=0xFFFFFFFF — the "no valid flash cursor"
     /// sentinel: it has no banked history to offload (a clock/charge state, not a decode bug).
     private var loggedNoCursor = false
@@ -131,6 +148,14 @@ final class Backfiller {
     /// at a session boundary so a clock-broken strap is visible in the strap log (observability only — the
     /// ingest gate already kept the garbage rows out of the DB).
     private(set) var sessionDroppedImplausible = 0
+
+    /// #891 diagnostic: packet types this session's offload carried that the decoder has no rows for,
+    /// folded across chunks. Each type is logged the FIRST time it appears — a 30k-record offload must not
+    /// emit 30k lines — and the running total is what a later line can report. See
+    /// `Streams.unhandledPacketTypes` for why this is not derivable from anything already logged: an
+    /// unmapped type is dropped by the decoder AND excluded from the reject archive, so today it is
+    /// invisible and the sync reports clean.
+    private(set) var sessionUnhandledPacketTypes: [String: Int] = [:]
 
     /// #520 diagnostic: `dynamic_acceleration` folded across every chunk of this session, logged once at
     /// the session boundary. Session-scoped rather than per-chunk because a chunk is an arbitrary slice of
@@ -225,15 +250,25 @@ final class Backfiller {
         chunk.removeAll(keepingCapacity: true)
         chunkOpen = true
         sessionRowsPersisted = 0
+        sessionRrOffered = 0
+        sessionRrInserted = 0
+        sessionRrSumMs = 0
+        sessionRrMinTs = nil
+        sessionRrMaxTs = nil
+        sessionRrHist = [0, 0, 0, 0]
+        sessionRrGapHist = [0, 0, 0, 0, 0, 0, 0, 0]
+        sessionRrFill = [0, 0, 0, 0]
         sessionMotionRows = 0
         sessionSkinTempRows = 0
         sessionNightKeys.removeAll(keepingCapacity: true)
         sessionClockDevice = nil          // #67: re-capture the decode clock ref for this session
         sessionClockWall = nil
         sessionUsedIdentityRef = false
+        chunkIndex = 0
         loggedNoCursor = false
         loggedFutureRtc = false
         sessionDroppedImplausible = 0
+        sessionUnhandledPacketTypes = [:]   // #891: a second offload must re-log its first sighting
         sessionDynAccel = Streams.DynAccelDiag()
         loggedLayoutVersions.removeAll(keepingCapacity: true)
         spo2Dumped = 0
@@ -294,6 +329,22 @@ final class Backfiller {
     nonisolated static func sessionSummaryLine(rows: Int, motion: Int, skinTemp: Int, nights: Int) -> String? {
         guard rows > 0 else { return nil }
         return "Backfill: session persisted \(rows) rows (\(motion) with motion, \(skinTemp) skin-temp) across \(nights) night(s)."
+    }
+
+    /// #1008/#1118: the session's PRE-STORAGE R-R census. `ratio` is beat-time per second of wall time
+    /// over the whole session — above 1.0 is physically impossible, and because it is measured on what the
+    /// DECODER produced it separates an emission/decode defect (ratio already high here) from an ingest
+    /// one (ratio ~1 here while the stored night still reads high). nil when the session banked no R-R.
+    func sessionRrEmissionLine() -> String? {
+        guard sessionRrOffered > 0, let lo = sessionRrMinTs, let hi = sessionRrMaxTs else { return nil }
+        let span = max(hi - lo + 1, 1)
+        let ratio = Double(sessionRrSumMs) / 1000.0 / Double(span)
+        let r = RrEmissionStats.Result(secondsWithRr: sessionRrHist.reduce(0, +),
+                                       intervals: sessionRrOffered, sumRrMs: sessionRrSumMs,
+                                       spanSec: span, ratio: ratio, perSecond: sessionRrHist,
+                                       gapHist: sessionRrGapHist, fill: sessionRrFill)
+        return RrEmissionStats.logLine(path: "historical", offered: sessionRrOffered,
+                                       inserted: sessionRrInserted, r)
     }
 
     /// #67 diag: the persisted-nights DATE RANGE plus the offload's effective clock state — the two facts
@@ -434,6 +485,16 @@ final class Backfiller {
                 return DecodedChunk(parsed: parsed, decoded: decoded, rejected: rejected)
             }.value
             let parsed = d.parsed
+            // #1008: per-chunk clock basis + R-R packing. The session summary logs only the FIRST chunk's
+            // correlation, which cannot show the offset moving across a long offload nor separate "the same
+            // beats arrived twice" from "one record stamped 8 intervals on one second". Log-only.
+            chunkIndex += 1
+            if let l = ChunkClockDiag.line(chunk: chunkIndex,
+                                           deviceClockRef: ref.device,
+                                           wallClockRef: ref.wall,
+                                           rrTimestamps: d.decoded.rr.map(\.ts)) {
+                log?(l)
+            }
             // Observability (PR #241): log which layout this strap emits on a HEALTHY sync too — the
             // unmapped-version path below only fires for layouts NOOP can't decode, so a normal log
             // never revealed v18/v24/v25/v26. Once per distinct layout this session.
@@ -524,6 +585,20 @@ final class Backfiller {
             for ev in decoded.droppedRtcEvents {
                 log?("Backfill: strap reported \(ev.kind) with an implausible own-timestamp \(BadClockDiagnostics.isoDay(ev.rawTs)) (\(BadClockDiagnostics.hoursOffset(ev.rawTs, now: nowForRtc)) vs now) — the strap's RTC reset to a wrong base (#324/#928); this is the ground-truth cause of the future-dated banking, not a NOOP decode bug.")
             }
+            // #891: packet types this chunk carried that the decoder has no case for. Logged the first
+            // time each type appears so a long offload stays readable. This is the only place such a
+            // record becomes visible: `default:` drops it and `rejectedHistoricalRecords` archives only
+            // type-47, so without this line an offload full of an unmapped type reports a clean sync.
+            for (typeName, n) in decoded.unhandledPacketTypes.sorted(by: { $0.key < $1.key }) {
+                let firstSighting = sessionUnhandledPacketTypes[typeName] == nil
+                sessionUnhandledPacketTypes[typeName, default: 0] += n
+                if firstSighting {
+                    log?("Backfill: the strap sent \(n) record(s) of packet type \(typeName), which this " +
+                         "decoder has no rows for — they are being dropped. If \(typeName) is not a name " +
+                         "you recognise, this is a firmware record type NOOP has never mapped: please " +
+                         "report it on #891 with the strap model and firmware build.")
+                }
+            }
             // Diagnostic (#77): the AGGREGATE silent-loss case — frames arrived but produced no rows at
             // all (CRC fail / unmapped layout / out-of-range timestamp), so this chunk persists nothing
             // yet still acks below and the strap trims past it. The per-version log above only catches
@@ -552,15 +627,27 @@ final class Backfiller {
                 // prefix — v25/v26 records run ~84 B and the truncated tail is exactly where the
                 // unmapped motion/HR fields sit), and sample a few more so one log carries enough
                 // records to triangulate offsets. These only ever fire for unmapped firmware.
-                for (i, f) in rejected.prefix(8).enumerated() {
+                let sample = Array(rejected.prefix(8))
+                var emptySkipped = 0
+                for (i, f) in sample.enumerated() {
+                    // #1007: an all-zero frame has no record layout to map, so its hex dump is pure log
+                    // bloat (a strap emitting these produced ~4 MB of all-00). Keep the WARNING count above.
+                    if isEmptyRecordFrame(f) { emptySkipped += 1; continue }
                     let hex = f.map { String(format: "%02x", $0) }.joined()
                     log?("Backfill: rejected frame[\(i)] \(f.count)B: \(hex)")
+                }
+                if emptySkipped > 0 {
+                    log?("Backfill: #1007 \(emptySkipped)/\(sample.count) sampled frame(s) all-zero (empty payload) - hex dump skipped")
                 }
             }
             // Commit the decoded rows FIRST (durable). Doing this before the reject archive means a
             // rare insert failure — which returns and re-sends the whole chunk next session — can't
             // leave duplicate lines in the append-only reject archive.
             let counts: (hr: Int, rr: Int, events: Int, battery: Int, spo2: Int, skinTemp: Int, resp: Int, gravity: Int)
+            // #1008/#1118: census the batch BEFORE it is stored — the only place the decoder's own
+            // emission can be measured, since every existing R-R number is taken after the ON CONFLICT key
+            // has already absorbed part of it.
+            let rrCensus = RrEmissionStats.compute(decoded.rr.map { (ts: $0.ts, rrMs: $0.rrMs) })
             do { counts = try await store.insert(decoded, deviceId: deviceId) } catch {
                 // Diag (#601): the decoded rows couldn't be written — this is the "history stalls but live HR
                 // works" class. We return WITHOUT acking so the strap keeps this chunk and re-sends it next
@@ -573,6 +660,19 @@ final class Backfiller {
             // "persisted N rows (M with motion) across K night(s)" — the win-rate signal a log never had.
             let tally = Backfiller.chunkTally(counts: counts, timestamps: decoded.gravity.map(\.ts) + decoded.hr.map(\.ts))
             sessionRowsPersisted += tally.rows
+            // #1008/#1118 census accumulation (pre-storage `offered` vs post-key `inserted`).
+            sessionRrOffered += rrCensus.intervals
+            sessionRrInserted += counts.rr
+            sessionRrSumMs += rrCensus.sumRrMs
+            if rrCensus.intervals > 0 {
+                let lo = decoded.rr.map(\.ts).min() ?? 0
+                let hi = decoded.rr.map(\.ts).max() ?? 0
+                sessionRrMinTs = min(sessionRrMinTs ?? lo, lo)
+                sessionRrMaxTs = max(sessionRrMaxTs ?? hi, hi)
+                for i in 0..<4 { sessionRrHist[i] += rrCensus.perSecond[i] }
+                for i in 0..<8 { sessionRrGapHist[i] += rrCensus.gapHist[i] }
+                for i in 0..<4 { sessionRrFill[i] += rrCensus.fill[i] }
+            }
             sessionMotionRows += tally.motion
             sessionSkinTempRows += counts.skinTemp
             sessionNightKeys.formUnion(tally.nights)

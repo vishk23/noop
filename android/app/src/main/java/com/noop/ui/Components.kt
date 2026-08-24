@@ -267,17 +267,21 @@ fun SectionHeader(
     trailing: String? = null,
     modifier: Modifier = Modifier,
 ) {
-    Row(
+    Column(
         modifier = modifier.fillMaxWidth(),
-        verticalAlignment = Alignment.Top,
     ) {
-        Column(modifier = Modifier.weight(1f)) {
-            if (overline != null) Overline(overline)
-            Text(title, style = NoopType.title2, color = Palette.textPrimary)
+        if (overline != null || trailing != null) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.Top,
+            ) {
+                if (overline != null) Overline(overline, modifier = Modifier.weight(1f))
+                if (trailing != null) {
+                    Text(trailing, style = NoopType.footnote, color = Palette.textSecondary)
+                }
+            }
         }
-        if (trailing != null) {
-            Text(trailing, style = NoopType.footnote, color = Palette.textSecondary)
-        }
+        Text(title, style = NoopType.title2, color = Palette.textPrimary)
     }
 }
 
@@ -309,7 +313,11 @@ fun ConnectionDot(
         // are several on Today (each StatePill, source pill, etc.) — kept a running animation-clock
         // subscription invalidating the frame, for a halo that wasn't even drawn. Hoisting it into a child
         // that's composed only when `pulsing` means a still dot does zero per-frame work. Identical visuals.
-        if (pulsing) {
+        // ...and not at all under Reduce Motion or battery saver: the halo is decoration, and an
+        // infinite transition per live dot is exactly the idle per-frame work battery saver asks an app
+        // to stop. A still dot still reads as live — the colour carries that. (#909)
+        val renderStill = rememberPoseStill()
+        if (pulsing && !renderStill) {
             PulsingDotHalo(tone = tone, size = size)
         }
         Box(
@@ -390,7 +398,12 @@ fun StatePill(
         horizontalArrangement = Arrangement.spacedBy(6.dp),
     ) {
         if (showsDot) ConnectionDot(tone = tone, pulsing = pulsing, size = 7.dp)
-        Text(title, style = NoopType.overline.copy(letterSpacing = 0.4.sp), color = tone.color)
+        // A pill is a single line: ellipsize a long title (e.g. a long custom model id) instead of
+        // wrapping it, so it can't eat a whole Row and squeeze a sibling control to nothing (#1074).
+        Text(
+            title, style = NoopType.overline.copy(letterSpacing = 0.4.sp), color = tone.color,
+            maxLines = 1, overflow = TextOverflow.Ellipsis,
+        )
     }
 }
 
@@ -399,12 +412,12 @@ fun StatePill(
 @Composable
 fun SourceBadge(text: String, tint: Color = Palette.accent, modifier: Modifier = Modifier) {
     val shape = RoundedCornerShape(50)
-    Text(
-        text = text.uppercase(),
-        style = NoopType.overline.copy(fontSize = 10.sp, letterSpacing = 0.5.sp),
-        color = tint,
-        maxLines = 1,                          // #74: e.g. "ON-DEVICE" stays on one line, never wraps the hero
-        overflow = TextOverflow.Ellipsis,
+    Box(
+        // The pill itself. The label used to BE this node, with `heightIn` pinning it to 18.dp — and a
+        // 10.sp line box is ~13.dp, so the ~5.dp of slack all fell below the text and pushed it upward.
+        // SwiftUI's twin uses `.frame(height:)`, which centres by default, so the two platforms drew the
+        // same badge differently. A Box that owns the height and centres its content matches iOS and
+        // keeps the label centred at any font scale.
         modifier = modifier
             // Preserve the canonical compact height at the default font scale, but grow instead of clipping
             // when Android's font scaling makes the single-line label taller.
@@ -413,7 +426,16 @@ fun SourceBadge(text: String, tint: Color = Palette.accent, modifier: Modifier =
             .background(tint.copy(alpha = 0.14f))
             .border(1.dp, tint.copy(alpha = 0.30f), shape)
             .padding(horizontal = Metrics.space8),
-    )
+        contentAlignment = Alignment.Center,
+    ) {
+        Text(
+            text = text.uppercase(),
+            style = NoopType.overline.copy(fontSize = 10.sp, letterSpacing = 0.5.sp),
+            color = tint,
+            maxLines = 1,                      // #74: e.g. "ON-DEVICE" stays on one line, never wraps the hero
+            overflow = TextOverflow.Ellipsis,
+        )
+    }
 }
 
 // MARK: - TrendChip — a small tinted delta pill with a direction arrow.
@@ -466,6 +488,7 @@ internal fun AutoSizeValue(
     color: Color,
     modifier: Modifier = Modifier,
     minScale: Float = 0.6f,
+    textAlign: TextAlign = TextAlign.Start,
 ) {
     var scale by remember(text, style) { mutableStateOf(1f) }
     Text(
@@ -476,6 +499,7 @@ internal fun AutoSizeValue(
         maxLines = 1,
         softWrap = false,
         overflow = TextOverflow.Ellipsis,
+        textAlign = textAlign,
         modifier = modifier,
         onTextLayout = { result ->
             if (result.didOverflowWidth && scale > minScale) {

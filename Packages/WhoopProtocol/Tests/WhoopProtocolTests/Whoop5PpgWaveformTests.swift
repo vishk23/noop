@@ -9,7 +9,7 @@ import XCTest
 /// the concatenated waveform's autocorrelation peaks at the heart rate (lag 14 = 102.9 bpm vs a measured
 /// 101.7 bpm), trough-detection gives a 563 ms inter-beat interval (≈106 bpm), the pulse stays HR-locked
 /// even when the wrist is still, and its amplitude is not motion-driven. See
-/// `tools/linux-capture/analyze_v26_waveform.py` and `BLE_REVERSE_ENGINEERING.md` §5.
+/// `Tools/linux-capture/analyze_v26_waveform.py` and `BLE_REVERSE_ENGINEERING.md` §5.
 ///
 /// Samples are raw AC-coupled ADC counts — PPG has no absolute unit — so they are exposed verbatim with
 /// no invented scale. Real type-47 frames carry no device name / serial / token, so the fixture is real.
@@ -100,10 +100,19 @@ final class Whoop5PpgWaveformTests: XCTestCase {
     func testExtractHistoricalStreamsPersistsRawPpgWaveform() {
         let f = parseFrame(bytes(v26Hex), family: .whoop5)
         let streams = extractHistoricalStreams([f], deviceClockRef: 1_780_917_232, wallClockRef: 1_780_917_232)
-        XCTAssertEqual(streams.ppgWaveform, [PpgWaveformSample(ts: 1_780_917_232, samples: expectedWaveform)])
+        XCTAssertEqual(streams.ppgWaveform,
+                       [PpgWaveformSample(ts: 1_780_917_232, samples: expectedWaveform, burstIndex: 1)])
         XCTAssertTrue(streams.ppgHr.isEmpty, "a lone 1 s record is too short for a confident HR estimate")
         // Not "no rows at all" — the Backfiller's silent-data-loss diagnostic must see this as decoded.
         XCTAssertFalse(streams.isEmpty)
+    }
+
+    func testExtractHistoricalStreamsCarriesEachBurstIndexWithItsWaveform() {
+        let parsed = [v26Hex, v26HexChannel46].map { parseFrame(bytes($0), family: .whoop5) }
+        let streams = extractHistoricalStreams(parsed,
+                                               deviceClockRef: 1_780_917_232,
+                                               wallClockRef: 1_780_917_232)
+        XCTAssertEqual(streams.ppgWaveform.map(\.burstIndex), [1, 2])
     }
 
     /// `Streams.isEmpty` must count a waveform-only decode as non-empty even when `ppgHr` (derived FROM
@@ -128,8 +137,12 @@ final class Whoop5PpgWaveformTests: XCTestCase {
         let json = #"{"ppg_waveform":[{"ts":1780917232,"samples":[-1432,-1332,12]}]}"#
         let s2 = try dec.decode(Streams.self, from: Data(json.utf8))
         XCTAssertEqual(s2.ppgWaveform, [PpgWaveformSample(ts: 1_780_917_232, samples: [-1432, -1332, 12])])
+        XCTAssertNil(s2.ppgWaveform.first?.burstIndex, "legacy JSON has no burst index")
         // Round-trip encode → decode is identity.
-        let round = try dec.decode(Streams.self, from: JSONEncoder().encode(s2))
-        XCTAssertEqual(round.ppgWaveform, s2.ppgWaveform)
+        let withBurst = Streams(ppgWaveform: [PpgWaveformSample(ts: 1_780_917_232,
+                                                                samples: [-1432, -1332, 12],
+                                                                burstIndex: 4)])
+        let round = try dec.decode(Streams.self, from: JSONEncoder().encode(withBurst))
+        XCTAssertEqual(round.ppgWaveform, withBurst.ppgWaveform)
     }
 }

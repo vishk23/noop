@@ -18,6 +18,25 @@ import com.noop.data.StepRow
 import com.noop.data.StreamBatch
 import com.noop.data.StreamPersistence
 
+/**
+ * How stale the strap RTC must be before the `(wall - device)` offset is applied to a historical record's
+ * own unix second. BELOW this the offset is discarded and the raw stamp is kept verbatim, so an everyday
+ * drift of seconds-to-minutes never reaches stored timestamps. Shared with [ChunkClockDiag] so the strap
+ * log's `corr=on|off` cannot disagree with what the decoder actually did. Twin of the Swift
+ * `histStaleClockThresholdSec`.
+ */
+const val HIST_STALE_CLOCK_THRESHOLD_SEC = 86_400   // 1 day
+
+/**
+ * #891: packet types an offload legitimately carries that [extractHistoricalStreams] has no rows for, so
+ * reaching the `else` branch is expected rather than a finding. Both decode to zero rows BY DESIGN —
+ * CONSOLE_LOGS is strap-side debug text, METADATA is envelope bookkeeping — and counting them on every sync
+ * would bury the one signal [com.noop.data.StreamBatch.unhandledPacketTypes] exists to surface. Nothing else
+ * is excluded, including named-but-unhandled types like `HISTORICAL_IMU_DATA_STREAM(52)`: those are exactly
+ * the interesting ones. Keep in lockstep with Swift's `expectedUnhandledHistoricalTypes`.
+ */
+val EXPECTED_UNHANDLED_HISTORICAL_TYPES: Set<String> = setOf("METADATA", "CONSOLE_LOGS")
+
 /*
  * Historical (offload) decode for the WHOOP 4.0 — the type-47 HISTORICAL_DATA path.
  *
@@ -96,6 +115,22 @@ private fun ByteArray.histI16(off: Int): Int? {
     return if (u >= 0x8000) u - 0x10000 else u
 }
 
+/**
+ * Unsigned little-endian u32 -> Long. null when out of range.
+ *
+ * THE RETURN TYPE IS LOAD-BEARING: keep a u32 in the Long (unsigned) domain all the way to the
+ * decoded map. Kotlin's Int is 32-bit where Swift's is 64-bit, so `toInt()` on a value with bit 31
+ * set decodes to a NEGATIVE number here and the full unsigned value in Swift from byte-identical
+ * bytes — a cross-platform divergence the per-platform fixture-hex tests cannot see (the wire bytes
+ * match and each suite asserts its own platform's answer). PR #848 hit this in the v18 storage codec
+ * and PR #869 in `record_index@11`; for `unix` the consequence is worse than a wrong number, because
+ * a negative timestamp fails the #547 `plausible()` floor and [extractHistoricalStreams] drops the
+ * record outright — total, silent history loss on Android only, from 2038-01-19 onward.
+ *
+ * Read a u32 into an Int ONLY where the field is provably bounded below 2^31; otherwise carry the
+ * Long. Reading it out of a parsed map needs `longOrNull`, NOT `intOrNull` — the latter re-narrows
+ * with `toInt()` and silently undoes this.
+ */
 private fun ByteArray.histU32(off: Int): Long? {
     if (off + 4 > size) return null
     return (this[off].toLong() and 0xFFL) or
@@ -214,7 +249,8 @@ fun decodeHistorical(frame: ByteArray, family: DeviceFamily = DeviceFamily.WHOOP
     if (version == 25 && frame.size >= 79) {
         val out = LinkedHashMap<String, Any?>()
         out["hist_version"] = version
-        frame.histU32(11)?.let { out["unix"] = it.toInt() }
+        // Long, not Int — see [histU32]. Pinned by `whoop4_v25_synthetic_unix_high_bit`.
+        frame.histU32(11)?.let { out["unix"] = it }
         fun grav(off: Int): Double? {
             val u = frame.histU16(off) ?: return null
             return (if (u >= 32768) u - 65536 else u).toDouble() / 16384.0   // i16 LE, ±2 g full-scale
@@ -245,7 +281,8 @@ fun decodeHistorical(frame: ByteArray, family: DeviceFamily = DeviceFamily.WHOOP
     out["hist_version"] = version
 
     // unix is the record's REAL unix seconds (no clock offset needed for type-47).
-    frame.histU32(layout.unixOff)?.let { out["unix"] = it.toInt() }
+    // Long, not Int — see [histU32]. Pinned by `whoop4_v24_synthetic_unix_high_bit`.
+    frame.histU32(layout.unixOff)?.let { out["unix"] = it }
     frame.histU8(layout.hrOff)?.let { out["heart_rate"] = it }
     val rrn = frame.histU8(layout.rrCountOff) ?: 0
     out["rr_count"] = rrn
@@ -284,6 +321,40 @@ fun decodeHistorical(frame: ByteArray, family: DeviceFamily = DeviceFamily.WHOOP
 }
 
 /**
+ * The WHOOP 5/MG type-47 `hist_version` values THIS platform has a real field map for. Every other
+ * version reaches no decoder at all: [decodeWhoop5Historical] returns null and nothing but the raw bytes
+ * of the record can preserve it.
+ *
+ * This is the single source of truth for "does NOOP-Android understand this layout": the version gates in
+ * [decodeWhoop5Historical] and the v26 branch of [extractHistoricalStreams] read nothing else, and
+ * [rejectedHistoricalRecords] uses it to decide which records must be archived raw. Keeping one set means
+ * the two can never disagree — the failure mode this replaced was a record from an unmapped layout that
+ * happened to decode a plausible `unix` and `gravity_x`/`heart_rate` slipping past the archive filter, so
+ * its bytes were kept nowhere at all and the strap freed them on the very next trim ack.
+ *
+ * ⚠️ DELIBERATELY NARROWER THAN THE SWIFT `mappedWhoop5HistoricalVersions`, which is `[18, 20, 21, 26]`.
+ * Swift's `decodeWhoop5Historical` dispatches v20 (raw optical block) and v21 (raw 6-axis IMU) through
+ * `decodeWhoop5HistoricalV2021`; the Kotlin historical path has no such branch — `Whoop5RawOptical` and
+ * `Whoop5RawImu` exist here but are wired to the LIVE deep-buffer route in `WhoopBleClient`, not to the
+ * type-47 historical dispatch. Claiming 20/21 here would assert a field map Android does not have, which
+ * is precisely the "it holds by accident" class of bug this constant was introduced to close. The archive
+ * OUTCOME is unchanged either way today: an unmapped 5/MG version already decodes to null on Android and
+ * so was already archived by the decode-outcome route. Add a version here only when a decoder for it
+ * lands on this side. Pinned by `UnmappedHistoricalLayoutTest`.
+ */
+val MAPPED_WHOOP5_HISTORICAL_VERSIONS: Set<Int> = setOf(18, 26)
+
+/**
+ * True when [frame] is a WHOOP 5/MG type-47 record whose layout version has NO field map on this
+ * platform — the records that are never re-derivable from anything NOOP stores. Non-type-47 and
+ * too-short frames are false. Twin of the Swift `isUnmappedWhoop5HistoricalRecord`.
+ */
+fun isUnmappedWhoop5HistoricalRecord(frame: ByteArray): Boolean {
+    if (frame.size <= 9 || (frame[8].toInt() and 0xFF) != PacketType.HISTORICAL_DATA.rawValue) return false
+    return (frame[9].toInt() and 0xFF) !in MAPPED_WHOOP5_HISTORICAL_VERSIONS
+}
+
+/**
  * WHOOP 5.0/MG type-47 "v18" historical decode. The puffin envelope is longer, so the record starts at
  * byte 8 (type@8, version@9) and fields sit at their WHOOP5-ABSOLUTE offsets — NOT the WHOOP4 V24 layout
  * shifted by +4 (that decodes to garbage on v18). Offsets verified against real worn/off-wrist frames
@@ -297,14 +368,28 @@ fun decodeHistorical(frame: ByteArray, family: DeviceFamily = DeviceFamily.WHOOP
 private fun decodeWhoop5Historical(frame: ByteArray): Map<String, Any?>? {
     if (frame.histU8(8) != PacketType.HISTORICAL_DATA.rawValue) return null
     val version = frame.histU8(9) ?: return null
+    // One gate, one list: 18 is the only version this function maps, and v26 (handled by
+    // [decodeWhoop5HistoricalV26] from [extractHistoricalStreams]) is the only other one this platform
+    // maps at all — so [MAPPED_WHOOP5_HISTORICAL_VERSIONS] must contain exactly {18, 26}. That set is
+    // what decides whether a record gets archived raw, so the two cannot be allowed to drift;
+    // `UnmappedHistoricalLayoutTest` pins the lockstep against the decoder's actual behaviour.
     if (version != 18) return null
 
     val out = LinkedHashMap<String, Any?>()
     out["hist_version"] = version
     // @11 a per-record counter: +1 every record, independent of unix (advances across gaps); seen on
     // two straps. @11 is only the low byte — read the full u32 LE.
-    frame.histU32(11)?.let { out["record_index"] = it.toInt() }
-    frame.histU32(15)?.let { out["unix"] = it.toInt() }
+    // Emitted as a Long, NOT narrowed to Int: this is an UNSIGNED 32-bit field and Kotlin's Int is
+    // 32-bit while Swift's is 64-bit, so `toInt()` made a value with bit 31 set decode to
+    // -1_062_772_323 here and 3_232_194_973 in Swift from byte-identical bytes — a cross-platform
+    // decode divergence the per-platform fixture-hex tests cannot see (same bytes, each suite asserting
+    // its own answer). PR #848 hit the same 32-vs-64-bit split in the storage codec. Pinned on both
+    // platforms by the `whoop5_v18_synthetic_record_index_high_bit` fixture in decoder_oracle.json.
+    frame.histU32(11)?.let { out["record_index"] = it }
+    // Same unsigned-domain rule, and here it is not merely a wrong number: a narrowed `unix` goes
+    // NEGATIVE past 2038-01-19, fails the #547 plausibility floor, and the record is dropped — see
+    // [histU32]. Pinned by `whoop5_v18_synthetic_unix_high_bit`.
+    frame.histU32(15)?.let { out["unix"] = it }
     frame.histU8(22)?.let { out["heart_rate"] = it }
     val rrn = frame.histU8(23) ?: 0
     out["rr_count"] = rrn
@@ -445,16 +530,18 @@ private fun decodeWhoop5Historical(frame: ByteArray): Map<String, Any?>? {
  * PPG-derived on-device), so the win here is the waveform itself, which [PpgHr] turns into HR.
  *
  * Returns the record's wall-second [unix] and the 24 raw ADC [samples], or null when the frame is not
- * a v26 HISTORICAL_DATA record or the waveform region is truncated. The bytes before [27] (header +
- * the raw per-burst counter @21 — `burst_index`, NOT a channel id; PR#553) and the footer after [75]
- * are intentionally not mapped here: the Android offload path needs only [unix] + the waveform for HR.
+ * a v26 HISTORICAL_DATA record or the waveform region is truncated. The raw per-burst counter @21
+ * (`burst_index`, NOT a channel id; PR#553) is carried beside the waveform
+ * so durable rows retain their burst boundaries. The footer after [75] remains intentionally unmapped.
  */
-private data class V26Record(val unix: Int, val samples: List<Int>)
+private data class V26Record(val unix: Long, val samples: List<Int>, val burstIndex: Int?)
 
 private fun decodeWhoop5HistoricalV26(frame: ByteArray): V26Record? {
     if (frame.histU8(8) != PacketType.HISTORICAL_DATA.rawValue) return null
     if (frame.histU8(9) != 26) return null
-    val unix = frame.histU32(15)?.toInt() ?: return null
+    // Long, not Int — see [histU32]. This path was never actually wrong (its one consumer re-widened
+    // with `and 0xFFFFFFFFL`), but carrying the reader's own type removes the mask and the trap.
+    val unix = frame.histU32(15) ?: return null
     val samples = ArrayList<Int>(24)
     var off = 27
     while (off < 75) {
@@ -463,21 +550,25 @@ private fun decodeWhoop5HistoricalV26(frame: ByteArray): V26Record? {
         off += 2
     }
     if (samples.isEmpty()) return null
-    return V26Record(unix = unix, samples = samples)
+    val rawBurstIndex = frame.histU8(21)
+    return V26Record(unix = unix, samples = samples,
+        burstIndex = rawBurstIndex?.takeIf { it > 0 })
 }
 
 /**
- * The HISTORICAL_DATA (type-47) record frames in [rawFrames] that genuinely FAIL to decode — a CRC
- * failure, or an unmapped firmware layout whose v24 plausibility gate (see [decodeHistorical]) also
- * rejects it. These are exactly the record frames [extractHistoricalStreams] silently drops: their
- * biometric payload would otherwise be lost forever once the strap trims the acked history.
+ * The HISTORICAL_DATA (type-47) record frames in [rawFrames] that NOOP cannot turn into rows — a CRC
+ * failure, an unmapped firmware layout (5/MG: any `hist_version` outside
+ * [MAPPED_WHOOP5_HISTORICAL_VERSIONS]), or a mapped layout whose envelope parsed but whose v24
+ * plausibility gate (see [decodeHistorical]) rejected it. These are the record frames
+ * [extractHistoricalStreams] silently drops: their biometric payload would otherwise be lost forever once
+ * the strap trims the acked history.
  *
  * EXCLUDED (decode to zero rows BY DESIGN, never "lost" data — must NOT be counted):
  *   - CONSOLE_LOGS (type-50) frames — the strap's own diagnostics text channel. On WHOOP 4.0 the
  *     inner type byte is frame[4]; type-50 (0x32) is not type-47 so the family-aware type guard below
  *     already skips it. On WHOOP 5/MG the inner type byte is at frame[8].
- *   - WHOOP 5/MG v26 (raw PPG) records — deliberately unstored (see [decodeWhoop5Historical]), known
- *     and skipped by design, not lost.
+ *   - WHOOP 5/MG v26 (raw PPG) records — stored in the dedicated waveform stream, so they do not belong
+ *     in the rejected-record archive.
  *   - Non-record frames (METADATA, EVENT, etc.) — not type-47, so never returned.
  *
  * The Backfiller archives these raw bytes BEFORE acking the trim, so a user on an unmapped firmware
@@ -495,14 +586,45 @@ fun rejectedHistoricalRecords(
     return rawFrames.filter { frame ->
         val t = frame.histU8(typeIndex) ?: return@filter false
         if (t != PacketType.HISTORICAL_DATA.rawValue) return@filter false // type-50 console / metadata / etc.
-        // WHOOP 5/MG v26 = raw PPG block, deliberately not stored — known-skipped, not lost data.
+        // WHOOP 5/MG v26 = raw PPG block with its own durable waveform stream, not rejected data.
         if (family == DeviceFamily.WHOOP5 && frame.histU8(9) == 26) return@filter false
+        // UNMAPPED LAYOUT (5/MG) — archive UNCONDITIONALLY, whatever it decoded.
+        //
+        // The decode-outcome test below is the wrong QUESTION for a layout NOOP has no field map for.
+        // Today it happens to give the right ANSWER, because [decodeWhoop5Historical] returns null for
+        // every version outside [MAPPED_WHOOP5_HISTORICAL_VERSIONS] — but that is an accident of the
+        // decoder's current shape, not a property of the format. One static schema field for type 47, or
+        // one partially-mapped new version, and a record that yielded a plausible `unix` plus a
+        // `heart_rate`/`gravity_x` would pass the screen and be kept NOWHERE at all, its bytes freed by
+        // the very next trim ack. That is exactly the shape a novel record type (a new firmware's rollup,
+        // an on-demand capture) can take. Deciding on the VERSION makes it structural.
+        //
+        // This cannot flood the archive with records we already understand: the mapped versions never
+        // reach here. Retention for the records that DO ([RawHistoryArchive.evictLines]) evicts
+        // entirely-zero-payload frames first, so a firmware that banks empty placeholder records at 1 Hz
+        // cannot push out the one informative frame either. Twin of the Swift `rejectedHistoricalRecords`
+        // layout clause. WHOOP 4 is untouched: its unmapped versions go through the v24 fallback below,
+        // which keeps a record only when it validates physiologically.
+        if (family == DeviceFamily.WHOOP5 && isUnmappedWhoop5HistoricalRecord(frame)) return@filter true
         // A type-47 record that [decodeHistorical] cannot turn into usable biometrics — CRC failure or
         // an unmapped layout the v24-fallback plausibility gate rejected. This is precisely what
         // [extractHistoricalStreams] drops (`decodeHistorical(...) ?: continue`), so the rejected set
         // matches the silently-lost set exactly.
         decodeHistorical(frame, family) == null
     }
+}
+
+/**
+ * A rejected history frame whose entire record PAYLOAD is zero — a valid header + trailing CRC wrapping
+ * nothing. Such a frame carries no field layout to reverse-engineer, so the Backfiller skips its (large)
+ * hex dump (#1007: a strap emitting these produced ~4 MB of all-00 in the strap log, ~8 dumps/chunk).
+ * Only the payload between the ~21-byte header and the 4-byte trailing CRC is examined; the size guard
+ * keeps a runt frame from ever reading as "empty". Mirrors the Swift `isEmptyRecordFrame`.
+ */
+fun isEmptyRecordFrame(frame: ByteArray): Boolean {
+    if (frame.size <= 25) return false
+    for (i in 21 until frame.size - 4) if (frame[i].toInt() != 0) return false
+    return true
 }
 
 // MARK: - METADATA classification (port of HistoricalMeta.swift)
@@ -591,6 +713,8 @@ fun extractHistoricalStreams(
     // Count of records dropped by the #547 plausibility gate this batch, surfaced on the returned
     // StreamBatch so the Backfiller can log "bad strap clock" once per session via its existing seam.
     var droppedImplausible = 0
+    // #891: packet types that reach the `else` branch and are dropped. See StreamBatch.unhandledPacketTypes.
+    val unhandledTypes = mutableMapOf<String, Int>()
     // #324: oldest/newest own-timestamp among the dropped records (the poisoned-range epoch span), and the
     // dropped RTC-state events (RTC_LOST / BOOT / SET_RTC) — the ground truth that the clock reset. Declared
     // before correctedWall so the local function can capture them (Kotlin: no forward reference to locals).
@@ -626,7 +750,7 @@ fun extractHistoricalStreams(
     // record re-syncs to the SAME corrected ts (offloaded rows dedupe by (deviceId, ts); an un-snapped,
     // slightly-different offset on re-sync would duplicate every row). A normal/identity clockRef has
     // offset ~0 (< threshold) → rawTs unchanged (current behavior).
-    val staleThreshold = 86_400          // 1 day
+    val staleThreshold = HIST_STALE_CLOCK_THRESHOLD_SEC
     val snapGranularity = 300            // 5 min
     val clockOffset = wallClockRef - deviceClockRef
     // #547: now NULLABLE. After resolving the final candidate ts (BOTH the raw pass-through branch AND the
@@ -700,13 +824,15 @@ fun extractHistoricalStreams(
                     decodeWhoop5HistoricalV26(frame)?.let { rec ->
                         // #547: skip a v26 PPG buffer whose unix is implausible (correctedWall → null) so a
                         // bad-clock strap can't seed the derived-HR estimator with garbage-timestamped samples.
-                        val baseTs = correctedWall(rec.unix.toLong() and 0xFFFFFFFFL)
+                        val baseTs = correctedWall(rec.unix)
                         if (baseTs != null) {
                             for (v in rec.samples) ppgSamples.add(PpgHr.Sample(ts = baseTs, value = v))
                             // Persist the raw waveform itself too (#156 follow-up), keyed on the record's
                             // corrected wall-second. Guard on non-empty so a truncated frame that decoded
                             // zero samples never banks an empty row (mirrors the Swift `!samples.isEmpty`).
-                            if (rec.samples.isNotEmpty()) ppgWaveform.add(PpgWaveformRow(baseTs, rec.samples))
+                            if (rec.samples.isNotEmpty()) {
+                                ppgWaveform.add(PpgWaveformRow(baseTs, rec.samples, rec.burstIndex))
+                            }
                         }
                     }
                 }
@@ -716,7 +842,10 @@ fun extractHistoricalStreams(
                 // #547: correctedWall is now nullable — it returns null for an implausible (far-past /
                 // future-dated) record, so the `?: continue` below skips a bad-clock record entirely
                 // instead of letting its garbage `unix` enter the DB and pollute the day-windowed analytics.
-                val ts = (p.intOrNull("unix")?.toLong())?.let { correctedWall(it) } ?: continue
+                // longOrNull, NOT intOrNull: the latter's `is Long -> v.toInt()` branch would re-narrow
+                // the u32 the decoder just carried in the unsigned domain, sending a post-2038 record
+                // negative and straight into the #547 drop below — silently, on Android only. See [histU32].
+                val ts = p.longOrNull("unix")?.let { correctedWall(it) } ?: continue
 
                 // skip startup hr=0 (matches Swift `bpm != 0`).
                 p.intOrNull("heart_rate")?.let { bpm -> if (bpm != 0) hr.add(HrRow(ts, bpm)) }
@@ -897,7 +1026,28 @@ fun extractHistoricalStreams(
                 appendHistBattery(battery, wallClockRef.toLong(), parsed.parsed)
             }
 
-            else -> Unit
+            // #891: no branch handles this type, so the record is dropped — count it first, or an offload
+            // carrying a type nobody has mapped reports as a clean sync. See StreamBatch.unhandledPacketTypes
+            // for why METADATA/CONSOLE_LOGS are excluded. Mirrors Swift's `default:`.
+            else -> {
+                // Family-aware exactly as Swift's `frameTypeName` is: a WHOOP 4.0 frame renders through the
+                // plain enum (`schema.typeName` on Apple), a 5/MG frame through the puffin aliasing
+                // (`canonicalTypeName`). Always aliasing here would have rendered a 4.0 type-56 as METADATA
+                // and then EXCLUDED it, while Apple counted it as PUFFIN_METADATA — the census silently
+                // disagreeing across platforms about an anomalous frame, which is the one case it exists for.
+                val name = if (family == DeviceFamily.WHOOP5) Framing.typeName(t)
+                           else PacketType.fromRaw(t)?.name ?: "type$t"
+                if (name !in EXPECTED_UNHANDLED_HISTORICAL_TYPES) {
+                    // Swift skips CRC-failed frames BEFORE its switch; this loop dispatches on the raw type
+                    // byte, so the check has to happen here or a corrupt frame would be reported as an
+                    // unknown firmware feature on Android and not on Apple. A CRC failure is a different
+                    // finding with its own archive (rejectedHistoricalRecords).
+                    val parsed = Framing.parseFrame(frame, family)
+                    if (parsed.ok && parsed.crcOk != false) {
+                        unhandledTypes[name] = (unhandledTypes[name] ?: 0) + 1
+                    }
+                }
+            }
         }
     }
 
@@ -913,6 +1063,7 @@ fun extractHistoricalStreams(
         ppgHr = ppgHr,
         ppgWaveform = ppgWaveform,
         v18Aux = v18Aux,
+        unhandledPacketTypes = unhandledTypes,   // #891 diag census (not persisted)
         droppedImplausibleTs = droppedImplausible,
         droppedImplausibleOldestTs = droppedOldest,   // #324 poisoned-range epoch span (diag only)
         droppedImplausibleNewestTs = droppedNewest,

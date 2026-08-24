@@ -23,6 +23,11 @@ import BackgroundTasks
 ///   `submit` fails gracefully and the in-app "Run now" + the macOS path still work.)
 ///
 /// Opt-in, default OFF — like every NOOP automation. Everything is on-device; nothing is sent anywhere.
+///
+/// RETENTION (#650): every write is pruned to `keepCount` generations (default 14), oldest first, and
+/// the Test Centre export card offers a manual "Clear scheduled exports" for an immediate wipe — these
+/// files sit in Documents (Files-visible) with no UI in the loop reminding anyone they exist, so a
+/// default cap and a visible clear action both matter. Mirrors Android's `LogExport` retention.
 @MainActor
 enum ScheduledDebugExport {
 
@@ -32,19 +37,112 @@ enum ScheduledDebugExport {
         static let enabled = "debugExport.enabled"          // master enable; default OFF
         static let time = "debugExport.timeMinutes"         // minutes since local midnight; default 07:00
         static let lastRun = "debugExport.lastRunDayKey"    // yyyy-MM-dd of the last completed drop (catch-up dedup)
+        static let keepCount = "debugExport.keepCount"      // retention: generations to keep (#650)
     }
 
     /// 07:00 — a log waiting when you wake (matches Android's `DEFAULT_TIME`).
     static let defaultTimeMinutes = 7 * 60
     private static let minutesPerDay = 24 * 60
 
-    /// iOS BGTask identifier. Derived from the running bundle id (rather than hardcoded) so it tracks
-    /// BUNDLE_ID_PREFIX (see Config/BundleId.xcconfig) automatically and always matches the iOS target's
-    /// `BGTaskSchedulerPermittedIdentifiers` (Info.plist), which is built from `$(PRODUCT_BUNDLE_IDENTIFIER)`
-    /// the same way. Must also be registered at launch for `submit` to succeed — wired in the app entry point.
-    static let bgTaskIdentifier = (Bundle.main.bundleIdentifier ?? "com.noopapp.noop") + ".debugexport"
+    // MARK: - Retention (#650: these accumulated in Documents with no cleanup and no visible cap)
+
+    /// Retention choices offered by the scheduled-export keep-count picker. Mirrors Android's
+    /// `EXPORT_KEEP_OPTIONS`. A longer range than `FolderBackup.keepOptions` (the `.noopbak` backup
+    /// picker) since a scheduled export is a small text/JSON pair, not a whole-DB snapshot.
+    static let keepOptions = [3, 7, 14, 30, 60]
+
+    private static let defaultKeepCount = 14
+
+    /// How many scheduled-export GENERATIONS (a day's log + raw-capture pair counts once) to keep
+    /// before `performExport` prunes older ones, oldest first. Mirrors `FolderBackup.keepCount`'s
+    /// shape (0-means-unset sentinel, clamp to a sane 1...100).
+    static var keepCount: Int {
+        get {
+            let v = UserDefaults.standard.integer(forKey: K.keepCount)   // 0 when never set
+            return v == 0 ? defaultKeepCount : min(max(v, 1), 100)
+        }
+        set { UserDefaults.standard.set(min(max(newValue, 1), 100), forKey: K.keepCount) }
+    }
+
+    /// Filename prefixes for the two scheduled-export file kinds this type writes into Documents (the
+    /// log `.txt` and the raw-capture `.json`). Nothing else in Documents matches either prefix, so
+    /// retention and the manual clear action only ever touch scheduled drops.
+    private static let logPrefix = "noop-strap-log-"
+    private static let rawPrefix = "noop-raw-capture-"
+
+    /// The `yyMMdd-HHmm` stamp embedded in one scheduled-export filename (log `.txt` or raw `.json`),
+    /// or nil if `name` isn't one of ours. Mirrors Android `LogExport.scheduledExportStamp`. Pure — no
+    /// file IO — so retention math is unit-testable.
+    static func exportStamp(fromFilename name: String) -> String? {
+        if name.hasPrefix(logPrefix), name.hasSuffix(".txt") {
+            return String(name.dropFirst(logPrefix.count).dropLast(4))
+        }
+        if name.hasPrefix(rawPrefix), name.hasSuffix(".json") {
+            return String(name.dropFirst(rawPrefix.count).dropLast(5))
+        }
+        return nil
+    }
+
+    /// Scheduled-export STAMPS (not filenames) to prune to keep only the `keep` newest generations — a
+    /// day's log+raw pair shares a stamp and counts once. Mirrors Android
+    /// `LogExport.scheduledExportStampsToPrune`. `yyMMdd-HHmm` is fixed-width and zero-padded, so a
+    /// plain string sort orders it correctly with no date parsing needed (same trick as the Android
+    /// twin's `yyyyMMdd-HHmmss`). Empty when already within budget.
+    static func exportStampsToPrune(_ names: [String], keep: Int) -> Set<String> {
+        let stamps = Array(Set(names.compactMap { exportStamp(fromFilename: $0) })).sorted(by: >)
+        guard stamps.count > keep else { return [] }
+        return Set(stamps.dropFirst(keep))
+    }
+
+    /// Best-effort retention: delete scheduled-export files under `docs` beyond `keep` generations,
+    /// oldest first. Called after every write in `performExport`. Failures are ignored — a transient
+    /// hiccup here must never fail the export itself.
+    private static func pruneScheduledExports(in docs: URL, keep: Int) {
+        let fm = FileManager.default
+        guard let names = try? fm.contentsOfDirectory(atPath: docs.path) else { return }
+        let toPrune = exportStampsToPrune(names, keep: keep)
+        guard !toPrune.isEmpty else { return }
+        for name in names {
+            guard let stamp = exportStamp(fromFilename: name), toPrune.contains(stamp) else { continue }
+            try? fm.removeItem(at: docs.appendingPathComponent(name))
+        }
+    }
+
+    /// Manual "Clear scheduled exports" action: delete every scheduled-export file under Documents
+    /// right now, regardless of the retention setting. Never touches an interactive save/share (those
+    /// go through `FileExport`'s save panel / share sheet, not Documents) or anything else the user or
+    /// another feature put in Documents. Returns the number of files removed.
+    @discardableResult
+    static func clearScheduledExports() -> Int {
+        guard let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first
+        else { return 0 }
+        let fm = FileManager.default
+        guard let names = try? fm.contentsOfDirectory(atPath: docs.path) else { return 0 }
+        var removed = 0
+        for name in names where exportStamp(fromFilename: name) != nil {
+            if (try? fm.removeItem(at: docs.appendingPathComponent(name))) != nil {
+                removed += 1
+            }
+        }
+        return removed
+    }
+
+    /// iOS BGTask identifier. Must also appear in the iOS target's `BGTaskSchedulerPermittedIdentifiers`
+    /// (Info.plist) and be registered at launch for `submit` to succeed — wired in the app entry point.
+    ///
+    /// Resolved from the bundle rather than hardcoded, because the permitted entries are namespaced
+    /// under the bundle id: a build under a different Apple ID (the documented "change it in one place"
+    /// path — see `APP_GROUP_ID` in project.yml) rewrites the plist side, and a literal here would go
+    /// stale and silently kill this lane. See `BGTaskIdentifier` for the full contract.
+    static let bgTaskIdentifier = BGTaskIdentifier.resolve(
+        suffix: "debugexport", upstream: "com.noopapp.noop.debugexport")
 
     static var isEnabled: Bool { UserDefaults.standard.bool(forKey: K.enabled) }
+
+    /// A delivered BGAppRefresh request is single-shot and should schedule its successor only while the
+    /// user still has scheduled exports enabled. Kept outside the iOS-only `register` block so the
+    /// disable-versus-delivery race is testable on every platform.
+    static func backgroundTaskShouldResubmit(enabled: Bool) -> Bool { enabled }
 
     /// Time-of-day to export, minutes since local midnight. Clamped to a valid minute. Default 07:00.
     static var timeMinutes: Int {
@@ -127,15 +225,22 @@ enum ScheduledDebugExport {
 
     /// If today's drop is due (we're at/after the chosen time and haven't written today), write it once.
     /// Covers macOS launches where the time passed while the app wasn't open, and the iOS foreground path.
-    private static func catchUpIfDue() {
-        guard isEnabled else { return }
+    ///
+    /// Returns whether this call can be considered successful: `true` when there was nothing to do
+    /// (feature off, not yet time, or already ran today — nothing was attempted, so nothing failed) or the
+    /// export was attempted and wrote successfully; `false` only when an export was actually attempted and
+    /// `performExport` failed to write. The iOS BGTask handler uses this to report the real outcome to
+    /// `setTaskCompleted(success:)` instead of a hardcoded success.
+    @discardableResult
+    private static func catchUpIfDue() -> Bool {
+        guard isEnabled else { return true }
         let now = Date()
         let cal = Calendar.current
         let comps = cal.dateComponents([.hour, .minute], from: now)
         let nowMinutes = (comps.hour ?? 0) * 60 + (comps.minute ?? 0)
-        guard nowMinutes >= timeMinutes else { return }      // not yet time today
-        guard UserDefaults.standard.string(forKey: K.lastRun) != dayKey(now) else { return } // already ran today
-        _ = performExport(markDay: true)
+        guard nowMinutes >= timeMinutes else { return true }      // not yet time today
+        guard UserDefaults.standard.string(forKey: K.lastRun) != dayKey(now) else { return true } // already ran today
+        return performExport(markDay: true) != nil
     }
 
     /// Seconds from now until the next wall-clock occurrence of `minuteOfDay` (today if still ahead, else
@@ -181,6 +286,10 @@ enum ScheduledDebugExport {
         if markDay {
             UserDefaults.standard.set(dayKey(Date()), forKey: K.lastRun)
         }
+        // Retention (#650): these accumulate in Documents with no UI in the loop to notice, so prune
+        // after every write (scheduled OR manual "Run now") — mirrors Android pruning on every
+        // `writeScheduledExport` call.
+        pruneScheduledExports(in: docs, keep: keepCount)
         return logURL
     }
 
@@ -200,11 +309,53 @@ enum ScheduledDebugExport {
     /// the task. Both live in the iOS app target — call this from `StrandiOSApp.init()`. Safe to leave
     /// uncalled: `submitBackgroundRequest()` fails gracefully and the macOS path + "Run now" still work.
     static func register() {
-        BGTaskScheduler.shared.register(forTaskWithIdentifier: bgTaskIdentifier, using: nil) { task in
-            // Write the drop, then immediately request the next one (BGAppRefresh is single-shot).
-            if isEnabled { catchUpIfDue() }
+        let registered = BGTaskScheduler.shared.register(forTaskWithIdentifier: bgTaskIdentifier, using: nil) { task in
+            let completion = TaskCompletionGuard(task: task)
+            // iOS can kill the process before our work below returns if the background budget runs out;
+            // report that honestly as a failure (so the run is retried) instead of leaving the task
+            // marked incomplete, and instead of the old hardcoded `success: true`.
+            task.expirationHandler = { completion.finish(success: false) }
+            // BGAppRefresh is single-shot. `setEnabled(false)` cancels the pending request, but iOS can
+            // already be delivering one when it does — `cancel` loses that race. Gate the successor on a
+            // fresh enabled read so a stale delivery can't resurrect a daily background wake the user
+            // turned off. Disabled is a terminal no-op: nothing to export, nothing to resubmit.
+            guard backgroundTaskShouldResubmit(enabled: isEnabled) else {
+                completion.finish(success: true)
+                return
+            }
+            // Write the drop, then immediately request the next one.
+            // `catchUpIfDue()` already no-ops (returning true) when nothing is due.
+            let succeeded = catchUpIfDue()
             submitBackgroundRequest()
-            task.setTaskCompleted(success: true)
+            completion.finish(success: succeeded)
+        }
+        // `register` returns false when the identifier isn't on the permitted list — the one signal that
+        // this lane is dead. Discarding it is what let a bundle-id remap silently disable the drop.
+        BGTaskIdentifier.report(bgTaskIdentifier, registered: registered)
+    }
+
+    /// Guards `BGTask.setTaskCompleted` against being called twice — once from the normal completion
+    /// path and once from `expirationHandler` — which BGTaskScheduler treats as a programmer error.
+    /// Plain lock rather than actor isolation: the expiration handler can be invoked by the system on a
+    /// queue other than the one running the registration closure.
+    private final class TaskCompletionGuard {
+        private let task: BGTask
+        private let lock = NSLock()
+        private var finished = false
+
+        init(task: BGTask) { self.task = task }
+
+        func finish(success: Bool) {
+            lock.lock()
+            defer { lock.unlock() }
+            guard !finished else { return }
+            finished = true
+            task.setTaskCompleted(success: success)
+            // Break the retain cycle set up in `register()` (task → expirationHandler closure → self →
+            // task). The handler is useless once the task is completed, so drop it here; without this the
+            // guard + task + closure leak until the system happens to release the task. Harmless to nil
+            // after completion.
+            task.expirationHandler = nil
         }
     }
 

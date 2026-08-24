@@ -38,7 +38,8 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalView
-import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.noop.analytics.HrZones
@@ -62,6 +63,7 @@ fun LiveWorkoutScreen(vm: AppViewModel, onClose: () -> Unit) {
     val profile = remember { ProfileStore.from(context.applicationContext) }
     // Effort display scale (#268) — routes the live Effort read-out so it matches every other surface.
     val effortScale = UnitPrefs.effortScale(context)
+    val unitSystem = UnitPrefs.system(context)
     val bpm by vm.bpm.collectAsStateWithLifecycle()
     val activeWorkout by vm.activeWorkout.collectAsStateWithLifecycle()
     // Additive: instantaneous speed/cadence/power from a connected standard fitness sensor (RSC/CSC/CPS),
@@ -94,18 +96,20 @@ fun LiveWorkoutScreen(vm: AppViewModel, onClose: () -> Unit) {
     LaunchedEffect(w == null) { if (w == null) onClose() }
     if (w == null) return
 
-    val zoneSet = remember(profile.hrMax) { HrZones.zones(maxHR = profile.hrMax.toDouble()) }
+    val zoneSet = remember(profile.hrMax, profile.hrZoneThresholds) { profile.hrZoneSet }
     val zone = bpm?.let { zoneSet.zoneNumber(it.toDouble()) } ?: 0
 
     // Guards the destructive End action behind a confirm (#517) — a stray tap on the full-width
     // button used to end the workout instantly with no way back.
     var showEndConfirm by remember { mutableStateOf(false) }
+    var showDeleteConfirm by remember { mutableStateOf(false) }
 
     var nowMs by remember { mutableStateOf(System.currentTimeMillis()) }
     LaunchedEffect(w.startMs) {
         while (true) { nowMs = System.currentTimeMillis(); delay(1000) }
     }
-    val elapsedS = ((nowMs - w.startMs) / 1000).coerceAtLeast(0)
+    val currentPauseMs = w.pausedAtMs?.let { nowMs - it } ?: 0L
+    val elapsedS = ((nowMs - w.startMs - w.pausedDurationMs - currentPauseMs) / 1000).coerceAtLeast(0)
 
     // A scenic Effort-tinted backdrop behind the whole in-exercise screen — the live workout reads as
     // an Effort-world hero, not a flat panel.
@@ -126,26 +130,52 @@ fun LiveWorkoutScreen(vm: AppViewModel, onClose: () -> Unit) {
                 .padding(28.dp),
             verticalArrangement = Arrangement.spacedBy(20.dp),
         ) {
-            // Header — sport + elapsed clock.
+            // Header — sport name on the left, a recording-status capsule on the right (glanceable
+            // hierarchy parity with the iOS live-workout redesign; the elapsed clock moved to its own
+            // centered TIME hero below).
             Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
-                Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
-                    Overline("Recording workout", color = Palette.effortColor)
-                    Text(w.sport.name, style = NoopType.title1, color = Palette.textPrimary)
+                Text(
+                    w.sport.name, style = NoopType.title1, color = Palette.textPrimary,
+                    maxLines = 1, overflow = TextOverflow.Ellipsis,
+                    modifier = Modifier.weight(1f),
+                )
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(6.dp),
+                    modifier = Modifier
+                        .background(Palette.metricRose.copy(alpha = 0.12f), RoundedCornerShape(50))
+                        .padding(horizontal = 10.dp, vertical = 5.dp),
+                ) {
+                    Box(Modifier.size(7.dp).clip(CircleShape).background(Palette.metricRose))
+                    Overline(
+                        if (w.pausedAtMs != null) uiString(R.string.workout_action_paused)
+                        else uiString(R.string.workout_action_recording),
+                        color = Palette.metricRose,
+                    )
                 }
+            }
+
+            // Centered TIME hero — the elapsed clock, promoted out of the header into the glanceable stack.
+            Column(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalAlignment = Alignment.CenterHorizontally,
+                verticalArrangement = Arrangement.spacedBy(2.dp),
+            ) {
+                Overline("Time", color = Palette.textSecondary)
                 Text(
                     String.format("%d:%02d", elapsedS / 60, elapsedS % 60),
-                    style = NoopType.number(34f), color = Palette.textPrimary,
+                    style = NoopType.number(56f), color = Palette.textPrimary,
                 )
             }
 
-            // The hero — big live HR, tinted to the current zone.
+            // Centered live-HR hero — tinted to the current zone; the zone label sits on the zone rail below.
             HeroHeartRate(bpm = bpm, zone = zone)
 
-            // The accumulating Effort on the shared layered StrainGauge — liveStrain is on NOOP's 0–100
-            // Effort axis, mapped to the gauge's 0–21 span (mirrors the Today effort hero). Display-only.
+            // The accumulating Effort — same liveStrain source and 0–21 / 0–100 scale, rendered as a centered
+            // free metric to sit alongside TIME and HEART RATE. Keeps the "of N" scale the iOS redesign dropped.
             EffortGauge(liveStrain = w.liveStrain, effortScale = effortScale)
 
-            // Zone rail — five segments, the active one lit.
+            // Zone section — the zone label capsule on the header row, the five-segment rail, and the band.
             ZoneRail(zone = zone, zoneSet = zoneSet)
 
             // Live stats grid — avg / peak / effort, from the captured window.
@@ -158,6 +188,20 @@ fun LiveWorkoutScreen(vm: AppViewModel, onClose: () -> Unit) {
                     accent = Palette.strainColor(w.liveStrain))
             }
 
+            // Live GPS distance + average pace for distance sports (#1195). The values are already computed
+            // and published on every accepted fix (mirrored from GpsSession into ActiveWorkout) — this only
+            // surfaces them live, where before they appeared solely in the post-workout detail. Hidden until
+            // the first accepted fix, so a denied-permission session shows no empty tiles. Reuses the already
+            // localized "Distance"/"Pace" labels. Mirrors the iOS DistancePaceRowIfPresent leaf.
+            if (w.gpsEnabled && w.track.isNotEmpty()) {
+                Row(horizontalArrangement = Arrangement.spacedBy(Metrics.gap), modifier = Modifier.fillMaxWidth()) {
+                    StatTile(modifier = Modifier.weight(1f), label = uiString(R.string.l10n_live_screen_distance_42320809),
+                        value = UnitFormatter.distanceFromMeters(w.distanceM, unitSystem), accent = Palette.effortColor)
+                    StatTile(modifier = Modifier.weight(1f), label = uiString(R.string.l10n_live_screen_pace_7a9a6226),
+                        value = UnitFormatter.paceFromSecPerKm(w.paceSecPerKm, unitSystem), accent = Palette.effortColor)
+                }
+            }
+
             // Additive sensor readout — only renders when a connected standard fitness sensor is feeding.
             SensorRow(sensor)
 
@@ -167,14 +211,21 @@ fun LiveWorkoutScreen(vm: AppViewModel, onClose: () -> Unit) {
             // and the button stays reachable by scrolling when the content overflows.
             Spacer(Modifier.height(12.dp))
 
-            Button(
-                onClick = { showEndConfirm = true },
-                modifier = Modifier.fillMaxWidth(),
-                contentPadding = PaddingValues(vertical = 14.dp),
-                colors = ButtonDefaults.buttonColors(
-                    containerColor = Palette.statusCritical, contentColor = Palette.surfaceBase,
-                ),
-            ) { Text(uiString(R.string.l10n_live_workout_screen_end_workout_3e8d6238), style = NoopType.headline) }
+            Row(horizontalArrangement = Arrangement.spacedBy(10.dp), modifier = Modifier.fillMaxWidth()) {
+                Button(
+                    onClick = { vm.toggleWorkoutPause() }, modifier = Modifier.weight(1f),
+                    contentPadding = PaddingValues(vertical = 14.dp),
+                ) { Text(if (w.pausedAtMs != null) uiString(R.string.workout_action_resume) else uiString(R.string.workout_action_pause), style = NoopType.headline) }
+                Button(
+                    onClick = { showDeleteConfirm = true }, modifier = Modifier.weight(1f),
+                    contentPadding = PaddingValues(vertical = 14.dp),
+                    colors = ButtonDefaults.buttonColors(containerColor = Palette.statusCritical),
+                ) { Text(uiString(R.string.workout_action_delete), style = NoopType.headline) }
+                Button(
+                    onClick = { showEndConfirm = true }, modifier = Modifier.weight(1f),
+                    contentPadding = PaddingValues(vertical = 14.dp),
+                ) { Text(uiString(R.string.workout_action_end), style = NoopType.headline) }
+            }
         }
     }
 
@@ -214,6 +265,25 @@ fun LiveWorkoutScreen(vm: AppViewModel, onClose: () -> Unit) {
             },
         )
     }
+
+    if (showDeleteConfirm) {
+        AlertDialog(
+            onDismissRequest = { showDeleteConfirm = false },
+            containerColor = Palette.surfaceOverlay,
+            title = { Text(uiString(R.string.workout_delete_title), style = NoopType.title2, color = Palette.textPrimary) },
+            text = { Text(uiString(R.string.workout_delete_message), style = NoopType.subhead, color = Palette.textSecondary) },
+            confirmButton = {
+                TextButton(onClick = { showDeleteConfirm = false; vm.discardWorkout(); onClose() }) {
+                    Text(uiString(R.string.workout_action_delete), style = NoopType.body, color = Palette.statusCritical)
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { showDeleteConfirm = false }) {
+                    Text(uiString(R.string.l10n_live_workout_screen_cancel_77dfd213), style = NoopType.body, color = Palette.textSecondary)
+                }
+            },
+        )
+    }
 }
 
 /**
@@ -248,21 +318,32 @@ private fun SensorRow(sensor: StandardHrSource.SensorMetrics) {
 
 @Composable
 private fun EffortGauge(liveStrain: Double, effortScale: EffortScale) {
-    NoopCard(padding = 18.dp, tint = Palette.effortColor) {
-        Column(
-            modifier = Modifier.fillMaxWidth(),
-            horizontalAlignment = Alignment.CenterHorizontally,
-            verticalArrangement = Arrangement.spacedBy(10.dp),
-        ) {
-            Overline("Effort building", color = Palette.effortColor)
-            StrainGauge(
-                strain = UnitFormatter.effortValue(liveStrain, effortScale),
-                outOf = if (effortScale == EffortScale.WHOOP) 21.0 else 100.0,
-                valueText = UnitFormatter.effortDisplay(liveStrain, effortScale),
-                diameter = 150.dp,
-                lineWidth = 14.dp,
-            )
-        }
+    val outOf = if (effortScale == EffortScale.WHOOP) 21.0 else 100.0
+    val value = UnitFormatter.effortValue(liveStrain, effortScale)
+    // A centered free metric to sit alongside TIME and HEART RATE (glanceable parity with the iOS
+    // live-workout redesign). The value counts up; the scale denominator stays visible below — a bare
+    // number on the WHOOP 0–21 scale is ambiguous without "of 21", so unlike the iOS change we keep it.
+    // mergeDescendants: read "Effort building, <value>, of N" as one TalkBack utterance (the CountUpText
+    // otherwise reads on its own), matching the iOS effort VoiceOver label without new strings.
+    Column(
+        modifier = Modifier.fillMaxWidth().semantics(mergeDescendants = true) {},
+        horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.spacedBy(2.dp),
+    ) {
+        Overline("Effort building", color = Palette.effortColor)
+        CountUpText(
+            value = value,
+            format = { v ->
+                if (effortScale == EffortScale.WHOOP) String.format(java.util.Locale.US, "%.1f", v)
+                else v.toInt().toString()
+            },
+            style = NoopType.number(56f),
+            color = Palette.textPrimary,
+        )
+        Text(
+            uiString(R.string.l10n_live_workout_screen_of_c5e92da0, outOf.toInt()),
+            style = NoopType.captionNumber, color = Palette.textSecondary,
+        )
     }
 }
 
@@ -273,38 +354,36 @@ private fun HeroHeartRate(bpm: Int?, zone: Int) {
         zone >= 1 -> Palette.hrZoneColor(zone)
         else -> Palette.effortColor
     }
-    NoopCard(padding = 24.dp, tint = Palette.effortColor) {
-        Column(
-            modifier = Modifier.fillMaxWidth(),
-            horizontalAlignment = Alignment.CenterHorizontally,
-            verticalArrangement = Arrangement.spacedBy(6.dp),
-        ) {
-            Overline("Heart rate")
-            Box(contentAlignment = Alignment.Center) {
-                // Soft zone-tinted halo behind the numeral — the Bevel glow.
-                Box(
-                    modifier = Modifier
-                        .size(132.dp)
-                        .clip(CircleShape)
-                        .background(tint.copy(alpha = if (bpm == null) 0f else 0.14f)),
-                )
-                Text(bpm?.toString() ?: "—", style = NoopType.number(80f), color = tint)
-            }
-            Text("bpm", style = NoopType.subhead, color = Palette.textSecondary)
-            Text(
-                if (zone >= 1) "Zone $zone · ${zoneName(zone)}" else "Below Zone 1",
-                style = NoopType.captionNumber,
-                color = tint,
-                textAlign = TextAlign.Center,
-            )
-        }
+    // Centered free metric — no card chrome, matching the TIME and EFFORT heroes. The zone label moved
+    // to the zone-rail header row below, so the heart rate reads as one clean value.
+    Column(
+        modifier = Modifier.fillMaxWidth(),
+        horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.spacedBy(2.dp),
+    ) {
+        Overline("Heart rate", color = Palette.textSecondary)
+        Text(bpm?.toString() ?: "—", style = NoopType.number(72f), color = tint)
+        Text("bpm", style = NoopType.subhead, color = Palette.textSecondary)
     }
 }
 
 @Composable
 private fun ZoneRail(zone: Int, zoneSet: com.noop.analytics.HrZoneSet) {
     Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-        Overline("HR zone")
+        // Header row: the section label with the current-zone capsule on the right (moved off the HR hero).
+        Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
+            Overline("HR zone")
+            Spacer(Modifier.weight(1f))
+            val capsuleTint = if (zone >= 1) Palette.hrZoneColor(zone) else Palette.effortColor
+            Text(
+                if (zone >= 1) "Zone $zone · ${zoneName(zone)}" else "Below Zone 1",
+                style = NoopType.captionNumber,
+                color = capsuleTint,
+                modifier = Modifier
+                    .background(capsuleTint.copy(alpha = 0.12f), RoundedCornerShape(50))
+                    .padding(horizontal = 10.dp, vertical = 4.dp),
+            )
+        }
         Row(horizontalArrangement = Arrangement.spacedBy(6.dp), modifier = Modifier.fillMaxWidth()) {
             (1..5).forEach { z ->
                 val active = z == zone

@@ -21,7 +21,10 @@ import WhoopProtocol
 //           (1..5 at 50/60/70/80/90 %HRR cut-offs) × duration.
 //        b. Banister exponential: sample contributes duration × x × 0.64 × e^(b·x).
 //   4. Logarithmic compression onto [0, 100]:
-//        strain = 100 × ln(TRIMP + 1) / ln(D),  D = STRAIN_DENOMINATOR.
+//        strain = 100 × ln(TRIMP + 1) / ln(D)
+//      D belongs to the METHOD, not to the scorer: Edwards uses `strainDenominator` (7201, from its
+//      sex-independent 7200 ceiling), Banister its own sex-dependent ceiling + 1. See
+//      `logMapDenominator(method:sex:)` — reusing one for the other silently rescales the axis (#1545).
 //
 // References: Karvonen 1957 (%HRR); Edwards 1993 (5-zone TRIMP); Banister 1991
 // (exponential TRIMP, b = 1.92 men / 1.67 women); Tanaka 2001 (HRmax = 208 − 0.7×age).
@@ -52,6 +55,27 @@ public enum StrainScorer {
     /// D = 7200 + 1 = 7201 makes ln(7201)/ln(7201) = 1.
     public static let strainDenominator: Double = 7201.0
     static var lnStrainDenominator: Double { log(strainDenominator) }
+
+    /// Banister's daily ceiling: 24 h held at ΔHRR = 1.0. Unlike Edwards' 7200 this is SEX-DEPENDENT,
+    /// because the exponent `b` differs — which is the whole reason `strainDenominator` cannot be reused
+    /// for it. Feeding Banister TRIMP through the Edwards denominator would score every day against a
+    /// ceiling ~14% (men) or ~32% (women) higher than Banister can actually reach, so nobody would ever
+    /// see 100 and the two methods would not be on the same axis. (#1545)
+    static func banisterDailyCeiling(b: Double) -> Double {
+        24.0 * 60.0 * 1.0 * banisterScale * exp(b)
+    }
+
+    /// The log-map denominator for a method, so a caller never has to know which constant belongs to
+    /// which recipe. Ceiling + 1 in both cases, mirroring how `strainDenominator` was derived, so a
+    /// theoretical maximum day maps to exactly `maxStrain` under either method.
+    public static func logMapDenominator(method: Method, sex: String) -> Double {
+        switch method {
+        case .edwards:
+            return strainDenominator
+        case .banister:
+            return banisterDailyCeiling(b: sex.lowercased().hasPrefix("f") ? banisterBWomen : banisterBMen) + 1.0
+        }
+    }
 
     /// Fallback per-sample duration (minutes) — 1 s at 1 Hz.
     static let fallbackSampleMin: Double = 1.0 / 60.0
@@ -132,27 +156,88 @@ public enum StrainScorer {
 
     // MARK: - TRIMP accumulation
 
+    /// Longest span (minutes) a single reading may be credited with. A wear or connection dropout leaves a
+    /// gap with no data in it; without a ceiling the last reading before the gap would be credited with the
+    /// whole of it, so one sample in zone 5 could invent hours of effort. 2 min is 4x the sparsest real
+    /// cadence we know of (the 5/MG's ~30 s, see `minSparseReadings`), so no genuine cadence is truncated.
+    public static let maxSampleGapMin: Double = 2.0
+
+    /// The one Effort figure every read-out on Today must show (#1001).
+    ///
+    /// Effort has two sources. `stored` is the daily row, rewritten only when the heavy daily pass runs.
+    /// `live` is today's in-progress recompute over the raw HR stream (local midnight → now), which
+    /// exists precisely because the stored row lags — early in the day it still holds yesterday's Effort
+    /// or a stale 0.0 (#402). Past days have no live value and use the row.
+    ///
+    /// Taking the MAX rather than preferring `live` is not a tie-break: Effort accrues over a day and
+    /// must never visibly DROP. The live recompute can UNDER-read when today's HR is sparse, or when a
+    /// logged workout's load is not in the raw stream — a 5/MG user who trained in the morning had a real
+    /// 38.3 replaced by a live 0 (#489/#506). Flooring at what is already earned is what stops that.
+    ///
+    /// Shared so the hero ring, the Key Metrics tile and the chart's edge badge cannot drift apart: they
+    /// each resolved Effort themselves, and only the ring knew about `live`, so an active morning showed
+    /// 2.3 on the ring and 0.5 in the other two until the daily pass caught up (#1001).
+    public static func effectiveEffort(live: Double?, stored: Double?) -> Double? {
+        guard let live else { return stored }
+        guard let stored else { return live }
+        return Swift.max(live, stored)
+    }
+
     /// Infer per-sample duration (minutes) from the first two timestamps. Falls
     /// back to 1 s when fewer than two samples or coincident timestamps.
+    ///
+    /// No production caller remains — TRIMP uses `sampleDurationsMinutes` (#950). Kept ONLY so the
+    /// uniform-identity regression test can compare the new accumulation against the SHIPPED old formula
+    /// rather than a reimplementation of it. Delete it if that test ever goes.
     static func sampleDurationMinutes(_ hr: [HRSample]) -> Double {
         guard hr.count >= 2 else { return fallbackSampleMin }
         let deltaS = abs(Double(hr[1].ts - hr[0].ts))
         return deltaS > 0 ? deltaS / 60.0 : fallbackSampleMin
     }
 
+    /// Per-sample durations (minutes): each reading covers the gap to the NEXT one, clamped to
+    /// `maxSampleGapMin`; the last reuses the gap before it.
+    ///
+    /// #950: TRIMP used to take ONE duration inferred from the first two timestamps and multiply the whole
+    /// zone-weight sum by it. NOOP's HR stream is not uniformly spaced — live Bluetooth arrives ~1 s apart,
+    /// banked 5/MG history ~30 s, and dropouts leave larger holes — so whichever gap happened to be first
+    /// set the scale for the entire window. Worse, a workout window and the day that contains it start at
+    /// different samples, so they picked different factors and the two Effort numbers stopped being
+    /// comparable, which is what the report was about.
+    ///
+    /// For a UNIFORMLY spaced series every gap is the same, so this returns the old value for every sample
+    /// and the resulting TRIMP is unchanged — which is why no existing test moves. Byte-parity twin of
+    /// Kotlin `sampleDurationsMinutes`.
+    static func sampleDurationsMinutes(_ hr: [HRSample]) -> [Double] {
+        if hr.isEmpty { return [] }
+        if hr.count == 1 { return [fallbackSampleMin] }
+        var out: [Double] = []
+        out.reserveCapacity(hr.count)
+        for i in 0..<(hr.count - 1) {
+            let deltaS = abs(Double(hr[i + 1].ts - hr[i].ts))
+            let minutes = deltaS > 0 ? deltaS / 60.0 : fallbackSampleMin
+            out.append(min(minutes, maxSampleGapMin))
+        }
+        out.append(out[out.count - 1])   // the final reading has no successor; reuse the gap before it
+        return out
+    }
+
     static func edwardsTRIMP(_ hr: [HRSample], restingHR: Double, hrReserve: Double,
-                             sampleDurationMin: Double) -> Double {
-        var weighted = 0
-        for s in hr { weighted += zoneWeight(Double(s.bpm), restingHR: restingHR, hrReserve: hrReserve) }
-        return Double(weighted) * sampleDurationMin
+                             durations: [Double]) -> Double {
+        var acc = 0.0
+        for i in hr.indices {
+            acc += Double(zoneWeight(Double(hr[i].bpm), restingHR: restingHR, hrReserve: hrReserve))
+                * durations[i]
+        }
+        return acc
     }
 
     static func banisterTRIMP(_ hr: [HRSample], restingHR: Double, hrReserve: Double,
-                              sampleDurationMin: Double, b: Double) -> Double {
+                              durations: [Double], b: Double) -> Double {
         var acc = 0.0
-        for s in hr {
-            let x = pctHRR(Double(s.bpm), restingHR: restingHR, hrReserve: hrReserve) / 100.0
-            if x > 0 { acc += sampleDurationMin * x * banisterScale * exp(b * x) }
+        for i in hr.indices {
+            let x = pctHRR(Double(hr[i].bpm), restingHR: restingHR, hrReserve: hrReserve) / 100.0
+            if x > 0 { acc += durations[i] * x * banisterScale * exp(b * x) }
         }
         return acc
     }
@@ -161,6 +246,10 @@ public enum StrainScorer {
 
     /// Map accumulated TRIMP onto [0, 100] via 100 × ln(TRIMP+1) / ln(D), 2 dp.
     /// TRIMP ≤ 0 → 0.
+    ///
+    /// The default D is **Edwards'**. A Banister TRIMP passed here without an explicit denominator is
+    /// scored against the wrong ceiling and reads low — prefer `strain(…)`, which resolves the
+    /// method's own denominator, or pass `logMapDenominator(method:sex:)` yourself. (#1545)
     public static func trimpToStrain(_ trimp: Double, denominator: Double = strainDenominator) -> Double {
         if trimp <= 0 { return 0 }
         let value = maxStrain * log(trimp + 1.0) / log(denominator)
@@ -205,13 +294,17 @@ public enum StrainScorer {
     ///   - restingHR: resting HR (bpm) for the HRR denominator (default 60).
     ///   - method: `.edwards` (default) or `.banister`.
     ///   - sex: "male"/"female" — selects the Banister coefficient (ignored by Edwards).
-    ///   - denominator: log-map D (default STRAIN_DENOMINATOR).
+    ///   - denominator: log-map D. `nil` (the default) resolves to the denominator that BELONGS to
+    ///     `method` — Edwards' 7201, or Banister's sex-dependent ceiling. Pass a value only to override.
     public static func strain(_ hr: [HRSample],
                               maxHR: Double? = nil,
                               restingHR: Double = defaultRestingHR,
                               method: Method = .edwards,
                               sex: String = "male",
-                              denominator: Double = strainDenominator) -> Double? {
+                              denominator: Double? = nil) -> Double? {
+        // Resolve BEFORE the memo key is built, or a Banister request would be cached under Edwards'
+        // denominator and a later Edwards request could collide with it.
+        let resolvedDenominator = denominator ?? logMapDenominator(method: method, sex: sex)
         // v7.0.2 perf (#707): TRIMP integrates over the day's HR stream; called once per day in the post-sync
         // scoring loop AND from the Today view (which re-reads on each live-HR tick). Memoize on the HR
         // fingerprint + every scalar that steers the score, so an identical re-request is a lookup. The
@@ -219,9 +312,10 @@ public enum StrainScorer {
         let key = StrainKey(
             hr: StreamFingerprint.of(hr, ts: { $0.ts }, quant: { Int($0.bpm) }),
             maxHR: maxHR, restingHR: restingHR, method: method,
-            sexF: sex.lowercased().hasPrefix("f"), denom: denominator)
+            sexF: sex.lowercased().hasPrefix("f"), denom: resolvedDenominator)
         return strainCache.value(key) {
-            strainUncached(hr, maxHR: maxHR, restingHR: restingHR, method: method, sex: sex, denominator: denominator)
+            strainUncached(hr, maxHR: maxHR, restingHR: restingHR, method: method, sex: sex,
+                           denominator: resolvedDenominator)
         }
     }
 
@@ -249,7 +343,7 @@ public enum StrainScorer {
         }
         if !enoughData || effMax <= restingHR { return nil }
 
-        let sampleDur = sampleDurationMinutes(hr)
+        let durations = sampleDurationsMinutes(hr)
         let hrReserve = effMax - restingHR
 
         let trimp: Double
@@ -257,10 +351,10 @@ public enum StrainScorer {
         case .banister:
             let b = sex.lowercased().hasPrefix("f") ? banisterBWomen : banisterBMen
             trimp = banisterTRIMP(hr, restingHR: restingHR, hrReserve: hrReserve,
-                                  sampleDurationMin: sampleDur, b: b)
+                                  durations: durations, b: b)
         case .edwards:
             trimp = edwardsTRIMP(hr, restingHR: restingHR, hrReserve: hrReserve,
-                                 sampleDurationMin: sampleDur)
+                                 durations: durations)
         }
         return trimpToStrain(trimp, denominator: denominator)
     }

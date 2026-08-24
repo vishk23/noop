@@ -214,8 +214,18 @@ extension WhoopStore {
     /// from the CURRENT `labMarker` rows. Latest-numeric-per-day wins; if no numeric
     /// reading remains for a cell, its projected day is deleted (so a removed/last
     /// reading never leaves a stale projected value behind).
+    ///
+    /// Resurrection guard: a cloud-journal delete tombstones a metric point's (day, key) — see
+    /// `CloudTombstoneStore`. Every cell this projects lands in `metricSeries` under the constant
+    /// `labBookSourceId` (not the marker's own `deviceId`), so tombstones are loaded for THAT id — a
+    /// tombstoned cell is skipped entirely, so a later marker upsert/delete can't resurrect a point
+    /// the user deleted on the cloud side.
     private func reprojectCells(_ db: Database, cells: Set<DayCell>) throws {
+        let tombstoned = Set(try WhoopStore.metricPointTombstoneRows(db, deviceId: WhoopStore.labBookSourceId)
+            .map { MetricPointTombstoneKey(day: $0.day, key: $0.key) })
         for cell in cells {
+            if tombstoned.contains(MetricPointTombstoneKey(day: cell.day, key: cell.markerKey)) { continue }
+
             // Latest NUMERIC reading for this (markerKey, day): greatest takenAt with a
             // non-null value. Matches LabBookProjection.project(.latest) on numeric rows.
             let latest = try Double.fetchOne(db, sql: """

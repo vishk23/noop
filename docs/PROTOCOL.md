@@ -188,7 +188,46 @@ public func parseFrame(_ frame: [UInt8], family: DeviceFamily) -> ParsedFrame
 `38 PUFFIN_COMMAND_RESPONSE` and `56 PUFFIN_METADATA` are aliased onto `COMMAND_RESPONSE` /
 `METADATA` by `canonicalTypeName(_:schema:)` so they never decode as "unknown".
 
-### 2.4 Checksums
+### 2.4 COMMAND_RESPONSE body
+
+Every reply to a command (`COMMAND_RESPONSE`, type 36 — and its 5/MG alias 38) opens with two bytes
+before whatever the command itself returns:
+
+```
+WHOOP 4.0    [6] resp_cmd   [7] resp_seq   [8] result   [9..] per-command body
+WHOOP 5/MG   [10] resp_cmd  [11] resp_seq  [12] result  [13..] per-command body
+```
+
+the 5/MG offsets being the 4.0 ones + 4, like the rest of the puffin inner record.
+
+- **`resp_cmd`** — the command being answered (`CommandNumber`).
+- **`resp_seq`** — the strap's own per-response counter. Not the envelope `seq` at `[5]`/`[9]`, which is
+  host-assigned and echoed back: a single capture shows envelope `seq` 147 alongside `resp_seq` 2. A
+  repeated `resp_seq` across replies is how a duplicated write was identified in #791.
+- **`result`** — `CommandResult`: `0` FAILURE, `1` SUCCESS, `2` PENDING, `3` UNSUPPORTED. `GET_DATA_RANGE`
+  answers PENDING then SUCCESS; `3` is what a real MG returned when it rejected `RUN_HAPTICS_PATTERN`
+  (#48). Both fields are decoded from the bounded payload slice, so a reply too short to carry them
+  yields neither rather than reading the CRC32 trailer (#894).
+
+**The first body byte is per-command, and is not a status flag.** `GET_BATTERY_LEVEL` puts the charge
+percentage there — `47` in the hardware-confirmed fixture — so the slot carries real data. On other
+commands it has only ever been observed as `1`:
+
+| capture | command | result | first body byte |
+|---|---|---|---:|
+| real 5/MG | `GET_BATTERY_LEVEL` | SUCCESS | **47** (= 47%) |
+| real 5/MG | `GET_DATA_RANGE` | SUCCESS | 1 |
+| real MG | `SELECT_WRIST`, accepted | SUCCESS | 1 |
+| real MG | `SELECT_WRIST`, refused | FAILURE | 1 |
+| real MG | `TOGGLE_LABRADOR_*` | SUCCESS | 1 |
+
+For the wrist and ECG commands what that `1` means is **open**. A capture that sent `SELECT_WRIST` with
+argument `0` got `1` back, which refutes an echo of the request — but every frame anyone has captured had
+a stored value of `1`, so "reads back stored state" and "this handler writes a literal `1`" make identical
+predictions on all of them. It is therefore left undecoded rather than named; settling it needs a reply
+from a strap whose stored value is `0`. See #891.
+
+### 2.5 Checksums
 
 | Algorithm | Function | Parameters |
 |-----------|----------|------------|
@@ -202,7 +241,7 @@ and `classifyHistoricalMeta(_:)` refuses to act on a frame where `p.crcOK == fal
 that gate a garbled or hostile peer could forge a `HISTORY_END`/`HISTORY_COMPLETE` and advance
 the strap's trim cursor, discarding data that was never durably stored.
 
-### 2.5 Reassembly
+### 2.6 Reassembly
 
 BLE notifications arrive as MTU-sized fragments. `Reassembler` (`Framing.swift`) accumulates
 bytes, finds the `0xAA` SOF, reads the `u16` LE length at `buf[1..3]`, and emits a complete
@@ -410,10 +449,30 @@ On MAVERICK the clock commands also answer in the high opcode space — `SET_CLO
 and `GET_CLOCK` at 147 (0x93), alongside `GET_HELLO` at 145 (0x91) — distinct from the 4.0
 numbers (10 / 11) above.
 
-The strap further exposes an ECG/HeartKey command family (`ECG_MAIN_CONTROL`, `ECG_SEND_RAW`,
-`ECG_SAVE_RAW`, `ECG_SAVE_FILTERED`, `ECG_SELECT_WRIST`; five consecutive codes around 0x7B–0x8B),
-an `IMU_SET_DATA_STREAM` (code 106, shared with `TOGGLE_IMU_MODE`), and a `UART_DISABLE` (0x61–0x69).
-Exact codes for these are unconfirmed.
+The strap further exposes an ECG/HeartKey command family. The `CommandNumber` table carries four codes
+for it — 123 `SELECT_WRIST`, 124 `TOGGLE_LABRADOR_DATA_GENERATION`, 125 `TOGGLE_LABRADOR_RAW_SAVE`,
+139 `TOGGLE_LABRADOR_FILTERED` — which are **not** contiguous, and an earlier revision of this section
+described "five consecutive codes around 0x7B–0x8B" against five names (`ECG_MAIN_CONTROL`,
+`ECG_SEND_RAW`, `ECG_SAVE_RAW`, `ECG_SAVE_FILTERED`, `ECG_SELECT_WRIST`). Both cannot be right:
+`ECG_SEND_RAW` has no code, and 139 (0x8B) is separated from 123–125 (0x7B–0x7D). Treat the name↔code
+mapping as unconfirmed — the 5/MG is known to remap opcodes into the high space (the clock family answers
+at 145/146/147 there versus 10/11 on a 4.0), so a code that is accepted is not evidence that it means
+what the name says.
+
+What is confirmed: on a real WHOOP 5 MG (`WS50_r03`), 124, 125 and 139 are all **accepted** — each
+answers `COMMAND_RESPONSE` with result `SUCCESS(1)` — and no ECG-shaped data followed in a 30-second
+window. That is a null result with several live explanations (an open electrode circuit, flash rather
+than a realtime channel, a wrong opcode mapping, no start verb, a flag block, an entitlement gate); see
+#891. The three reply frames are pinned as decode fixtures in `Whoop5CommandResponseTests` /
+`CommandCatalogueTest`.
+
+NOOP sends these only from the gated, hand-run MG ECG probe described in
+[§9.1](#91-ecg-labrador-on-the-mg) — never automatically, never on a plain 5.0 or a 4.0, and only
+behind the Experimental opt-in plus a positively-identified MG. That is four codes for five names, so
+the correspondence remains a working hypothesis rather than a confirmed mapping.
+
+The strap also exposes an `IMU_SET_DATA_STREAM` (code 106, shared with `TOGGLE_IMU_MODE`) and a
+`UART_DISABLE` (0x61–0x69). Exact codes for these are unconfirmed.
 
 ### Destructive commands — *do not send*
 
@@ -429,6 +488,14 @@ data, brick, or power-cycle the strap. NOOP must never send them.
 | 38 | `PROCESS_FIRMWARE_IMAGE` | firmware write |
 | 45 | `ENTER_BLE_DFU` | enters DFU bootloader |
 | 99 | `RESET_FUEL_GAUGE` | resets battery fuel gauge |
+| 142 | `START_FIRMWARE_LOAD_NEW` | firmware write |
+| 143 | `LOAD_FIRMWARE_DATA_NEW` | firmware write |
+| 144 | `PROCESS_FIRMWARE_IMAGE_NEW` | firmware write |
+
+The 142–144 family is the high-opcode-space counterpart of 36/37/38, in the same style as the clock
+family answering at 145–147 on MAVERICK. It is named by the schema and absent from the sender enum on
+both platforms; it was missing from this table, so nothing recorded that it must stay that way. (83
+`VERIFY_FIRMWARE_IMAGE` is part of the same flow but is not itself a write, and is likewise unsent.)
 
 **Two guarded exceptions — both restarts, both non-destructive** (a restart keeps the strap's stored
 data and just re-advertises after boot). Neither is ever sent automatically or on any connect/offload path.
@@ -484,10 +551,21 @@ the same `pay[2]` record start `GET_BATTERY_LEVEL` and `GET_CLOCK` already decod
 | 117 `START_FF_KEY_EXCHANGE` | `revision u8` · `numberOfFeatureFlags u16 LE` · padding |
 | 118 `SEND_NEXT_FF` | `revision u8` · `index u8` · `validKey u8` · `key` (ASCII, NUL-terminated) · padding |
 
-The walk stops on the strap's own end marker (`validKey = 0`, or `index = 0xFF`), on the announced count,
-or on a hard cap of 128 replies — and each 118 is only sent after the previous reply lands. Both CRCs are
-verified before any field is read; a failed CRC, a non-COMMAND_RESPONSE type, or a short record ends the
-walk with a named reason instead of a decode. Driven by `BLEManager.probeFeatureFlags()` /
+**The two terminator conditions are not interchangeable, and are separated deliberately.** The walk stops
+on `index = 0xFF` — the one end marker a strap has served here unambiguously. `validKey = 0` on its own
+does NOT stop it: that could equally mark an EMPTY or RETIRED SLOT with the list continuing past it, and
+the record layout above is derived from a WHOOP 4.0 and **unverified on 5/MG**. Neither reading is
+established, because on the walks this project has, the two have never been separated on the wire: the
+117/118 walk on a WS50_r03 served sixteen replies that were all `validKey = 1` with no `0xFF` at all,
+and its 115/116 walk ended on a single reply carrying `index = 255` **and** `validKey = 0` together. So a
+`validKey = 0` entry is recorded, stepped over, and the next record verb is sent again — what comes back
+separates the two readings, and the report states which it observed. Past that the bounds are all
+CLIENT-side and each names itself in the report's `Stop code:` line: 8 consecutive `validKey = 0` replies,
+a repeated index during such a run (a parked cursor — evidence for the terminator reading), the announced
+count plus 4, or a hard cap of 128 replies. Each next-record request is only sent after the previous reply
+lands. Both CRCs are verified before any field is read; a failed CRC, a non-COMMAND_RESPONSE type, or a
+short record ends the walk with a named reason instead of a decode, and the RAW record bytes of every
+reply are logged beside the fields decoded from them. Driven by `BLEManager.probeFeatureFlags()` /
 `WhoopBleClient.probeFeatureFlags()` (user-triggered, Test Centre → Connection, both families) and
 allowlisted for 5/MG framing **only while a probe is in flight**; parsed + rendered by the pure
 `FeatureFlagProbe` / `FeatureFlagProbeReport` twins (Swift↔Kotlin byte-parity, unit-tested on synthetic
@@ -702,6 +780,118 @@ Contradictory signals resolve to `.unknown` rather than a guess, and `.unknown` 
 feature stays gated off until the hardware attests to it. Only the 5.0 hardware string is attested on
 real hardware so far; the MG's own revision string is not, so its absence proves nothing.
 
+### 9.1 ECG ("Labrador") on the MG
+
+The MG's ECG subsystem is called **Labrador** in the protocol tables. It is its own realtime data type,
+**not** an R-numbered `StrapSensorData` layout: there is a FILTERED stream (live, display-ready) and a
+RAW stream the strap persists for later offload.
+
+> **Not a medical feature.** NOOP is not a medical device. The strap runs its own embedded rhythm
+> classifier and ships the verdict in every packet; NOOP decodes that byte and nothing more. It is
+> unvalidated instrumentation, never a measurement and never a diagnosis. See
+> [`../DISCLAIMER.md`](../DISCLAIMER.md).
+
+**Commands — a working hypothesis, not a confirmed mapping.** All four numbers are already in
+`CommandNumber` (§6's table, from the upstream whoomp/goose work). Payload is `[revision, arg]` with
+`revision = 0x01`, carried in the normal puffin envelope; `puffinCommandFrame`'s pad4 supplies the
+command struct's trailing `padding` field.
+
+Three reasons the numbers are **not** settled, all of which the on-hardware probe is meant to resolve:
+
+1. **Four codes, five names.** §6 lists five ECG/HeartKey names; only four are mapped here.
+   `ECG_SEND_RAW` is unaccounted for, so at least one of the four could be carrying the wrong name.
+2. **139 (0x8B) is not contiguous** with 123–125, unlike the rest of the family.
+3. **The table is 4.0-derived and 5/MG is known to remap opcodes.** §6's "Additional 5-class command
+   numbers" already records MAVERICK answering `SET_CLOCK` at 146 and `GET_CLOCK` at 147 rather than
+   10/11. So a 4.0-sourced number is not automatically the 5/MG number. This matters more than usual
+   here: `CommandNumber`'s immediate neighbours in that range are
+   **142 `START_FIRMWARE_LOAD_NEW` / 143 `LOAD_FIRMWARE_DATA_NEW` / 144 `PROCESS_FIRMWARE_IMAGE_NEW`** —
+   the destructive family §6's "do not send" section excludes. NOOP never forms those bytes (they are
+   absent from `WhoopCommand` entirely, so the command sender cannot express them), but anyone probing
+   this space by hand should know what sits three codes above 139 before widening a sweep.
+
+| Code | Command | Arg | Reversible? |
+|-----:|---------|-----|---|
+| 123 (0x7B) | `SELECT_WRIST` | `0` right / `1` left — **inferred from enum order, unconfirmed** | **Persistent device config** — survives disconnect; re-writable |
+| 124 (0x7C) | `TOGGLE_LABRADOR_DATA_GENERATION` | `0` stop / `1` start / `2` restart | yes — `stop` is the OFF path |
+| 125 (0x7D) | `TOGGLE_LABRADOR_RAW_SAVE` | `0`/`1` | yes |
+| 139 (0x8B) | `TOGGLE_LABRADOR_FILTERED` | `0`/`1` | yes |
+
+Documented turn-on order: `SELECT_WRIST` → filtered on → raw-save on → data generation `start`. NOOP
+splits `SELECT_WRIST` into its own separately-confirmed action, because it is the only one that writes
+strap state outliving the session **and** its value mapping is unattested.
+
+**The `restart` argument (124 arg `2`).** `0` and `1` are the only values any build in this repo has
+ever put on a wire, which leaves `2` as the one untried argument inside the family §6 records as
+non-destructive. NOOP offers it as a separate, equally-gated action that sends the SAME preamble and
+changes only the control byte — filtered on → raw-save on → data generation `restart`. What the strap
+does with `2` is unknown: the name is read off the client enum's order, exactly like the wrist mapping,
+so there is no basis for claiming it re-arms the two channel toggles itself or for claiming it needs
+them already on. Changing one byte rather than also dropping the preamble is what keeps a null result
+attributable. The probe report annotates every command line with the argument it was sent with
+(`TOGGLE_LABRADOR_DATA_GENERATION(124) arg=2`) precisely because the two runs are otherwise
+indistinguishable in a copied report. Reversal is the ordinary `stop` sequence — this leaves behind the
+same strap state a normal start does.
+
+**Packet layouts.** Both open with the same 17-byte status block (multi-byte fields little-endian):
+
+| Off | Size | Field |
+|----:|-----:|-------|
+| 0 | 1 | `signalQuality` (0 unknown / 1 low / 2 medium / 3 high) |
+| 1 | 1 | `statusFlags` |
+| 2–5 | 1 each | `heartKeyStarted`, `heartKeyIsRunning`, `heartKeyIsStoppedAndComplete`, `heartKeyLeadsAreOn` (Bool) |
+| 6 | 1 | `heartKeyArrhythmiaCheckResult` (0 notComplete, 1 normalSinusRhythm, 2 signalUnreadable, 3 bradycardia, 4 afibDetected, 5 tachycardia, 6 inconclusive) |
+| 7 | 1 | `heartKeyArrhythmiaCheckStatus` (0 notRunning / 1 inProgress / 2 checkComplete) |
+| 8 | 1 | `heartKeyProgress` (percentage; the source type also has a timed-out case whose sentinel value is unattested) |
+| 9 | 1 | `heartKeyUnreadableReason` |
+| 10 | 1 | `heartKeyAverageHR` |
+| 11 | 1 | `heartKeyHR` |
+| 12 | 2 | `heartKeyHRV` (u16) |
+| 14 | 1 | `heartKeyStressScore` |
+| 15 | 2 | `numberOfECGSamples` (u16) |
+
+`FilteredLabradorPacket` then carries `numberOfECGSamples` × **i16** `filteredECGDataRaw`, then padding.
+`RawLabradorPacket` carries an opaque `rawECGDataRaw` blob, then `numberOfLeadsOffSamples` (u8), then
+`leadsOffIRaw` and `leadsOffQRaw` (u16 arrays of that length), then padding. The raw blob's
+bytes-per-sample is `count ÷ numberOfECGSamples` — i.e. its **length is not on the wire**, so
+`Whoop5Ecg.decodeRaw` takes the width explicitly and `rawBytesPerSampleCandidates` enumerates what a
+buffer admits rather than guessing.
+
+**What is not established.** The packet TYPE byte these records arrive under — no capture exists and
+§3's table has no Labrador entry — so `Whoop5Ecg` decodes a payload and the app hunts for the type
+empirically with a structural triage, logging candidates. The wrist enum's raw values, the timed-out
+sentinel, and the ECG sample unit/scale are likewise unattested and are carried raw.
+
+**Gating.** The hardware gate is MG-only and non-bypassable; entitlement and feature-flag gates are
+client-side. Whether the strap ALSO refuses the feature is a separate question that only the strap's own
+behaviour can answer. `Whoop5EcgProbe` separates the observable cases from the COMMAND_RESPONSE result
+code at `frame[12]` (0 FAILURE / 1 SUCCESS / 2 PENDING / 3 UNSUPPORTED): `UNSUPPORTED` means the opcode
+is not implemented, `FAILURE` means the firmware knows the opcode and refused to run it, and
+all-`SUCCESS` with zero packets arriving means acknowledged and then not honoured. Silence alone is
+never read as evidence of anything.
+
+**The verdicts name observations, not mechanisms — and this was got wrong once.** Earlier wording
+attributed both the refusal and the silence to a firmware `WhoopDeviceFlag` layer returning
+`blockedByDeviceFlags`. **That is a client-side construct.** No command in `whoop_protocol.json`'s
+`CommandNumber` table reads or writes such a flag, nothing in this repo implements one, and it is never
+transmitted to a strap — so it is not a strap capability gate and a probe that sees only result codes
+and packet counts cannot attribute silence to it. The reply carries *that* the firmware refused, never
+*why*. #891 then tested the leading named firmware-side candidate — `enable_raw_data_w_ecg`, written to
+`'1'` through `SET_DEVICE_CONFIG_VALUE(119)` and read back through `GET_DEVICE_CONFIG_VALUE(121)` — and
+still saw zero packets in 30 s with the electrodes held, which falsified it. Five explanations remain
+live for that silence: data banked to flash rather than streamed (one toggle is literally `RAW_SAVE`), a
+wrong opcode mapping, no actual start verb among three `TOGGLE_*` commands, an entitlement gate, and an
+electrode circuit that never closed.
+
+**Both silence-interpreting verdicts are scoped to what the run actually asked for.** A verdict that
+reads silence as informative is only reachable when the run exercised the ECG data path, which
+`Whoop5Ecg.requestsRealtimeData` decides from the opcode AND the argument sent: `SELECT_WRIST` configures
+and starts nothing on either argument, the OFF sequence asks for the silence it gets, and `RAW_SAVE`
+names flash rather than a live channel. So a run built only from those reports "no data-generation
+command was sent; this run cannot speak to whether ECG is blocked", and a `FAILURE` on one of them
+reports as a refusal of that write. Without the scoping a `SELECT_WRIST`-only run rendered as a
+device-flag block on real hardware — twice, once through each verdict — which is what #891 records.
+
 ## 10. SpO₂ on 5.0 / MG — what the wire does and does not carry
 
 Recorded because "why is there no blood oxygen?" is a recurring question with a protocol answer.
@@ -747,6 +937,8 @@ is deliberately **not** duplicated here — one table, one place to keep correct
 | `Packages/WhoopProtocol/Sources/WhoopProtocol/PostHooks.swift` | per-type irregular-field decoders |
 | `Packages/WhoopProtocol/Sources/WhoopProtocol/HistoricalMeta.swift` | `classifyHistoricalMeta` (START/END/COMPLETE) |
 | `Packages/WhoopProtocol/Sources/WhoopProtocol/Resources/whoop_protocol.json` | canonical enums + packet layouts |
+| `Packages/WhoopProtocol/Sources/WhoopProtocol/Whoop5Ecg.swift` | MG ECG ("Labrador") packet decode + command construction (§9.1) |
+| `Packages/WhoopProtocol/Sources/WhoopProtocol/Whoop5EcgProbe.swift` | ECG turn-on report + the run-scoped result-code verdicts (§9.1) |
 | `Strand/BLE/BLEManager.swift` | CoreBluetooth transport, bond, connect lifecycle, backfill orchestration |
 | `Strand/BLE/Commands.swift` | safe `WhoopCommand` set + outbound frame builder |
 | `Strand/BLE/FrameRouter.swift` | decode → `LiveState` (UI) |

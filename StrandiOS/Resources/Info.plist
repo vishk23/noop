@@ -7,6 +7,9 @@
 	<key>BGTaskSchedulerPermittedIdentifiers</key>
 	<array>
 		<string>$(PRODUCT_BUNDLE_IDENTIFIER).debugexport</string>
+		<string>$(PRODUCT_BUNDLE_IDENTIFIER).cloudsync.refresh</string>
+		<string>$(PRODUCT_BUNDLE_IDENTIFIER).healthwriteback</string>
+		<string>$(PRODUCT_BUNDLE_IDENTIFIER).rescore</string>
 	</array>
 	<key>CFBundleDevelopmentRegion</key>
 	<string>$(DEVELOPMENT_LANGUAGE)</string>
@@ -48,6 +51,10 @@
 	</array>
 	<key>CFBundleVersion</key>
 	<string>$(CURRENT_PROJECT_VERSION)</string>
+	<key>CLOUDSYNC_TOKEN</key>
+	<string>$(CLOUDSYNC_TOKEN)</string>
+	<key>CLOUDSYNC_URL</key>
+	<string>$(CLOUDSYNC_URL)</string>
 	<key>LSApplicationCategoryType</key>
 	<string>public.app-category.healthcare-fitness</string>
 	<key>LSSupportsOpeningDocumentsInPlace</key>
@@ -80,6 +87,8 @@
 		<string>bluetooth-central</string>
 		<string>location</string>
 		<string>fetch</string>
+		<string>processing</string>
+		<string>remote-notification</string>
 	</array>
 	<key>UIFileSharingEnabled</key>
 	<true/>

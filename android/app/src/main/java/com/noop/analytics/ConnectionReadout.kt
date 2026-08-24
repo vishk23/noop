@@ -12,6 +12,26 @@ import java.util.TimeZone
 // Swift line shapes so a shared report reads identically on either platform.
 
 object ConnectionTrace {
+    /**
+     * The ` after <n>s` suffix on a `connect down` trace line, or empty when the session start is
+     * unknown (#1020).
+     *
+     * A session's length separates the causes of a drop at a glance: a bond watchdog fires seconds in, a
+     * keep-alive stall bounce minutes in, a radio drop anywhere. The bare `connect down (uptime ends)`
+     * could not distinguish them, which is why a report of thousands of reconnects needed a round trip
+     * before anyone could start on it.
+     *
+     * An unknown start yields NO suffix rather than `after 0.0s` — "instant drop" and "we do not know"
+     * are different diagnoses. Integer half-up quantization makes exact 50 ms ties deterministic, and
+     * rendering the whole and fractional digits directly keeps locale out of pasted logs. Twin of the
+     * Swift `ConnectionTrace.sessionHeldSuffix`.
+     */
+    fun sessionHeldSuffix(millis: Long): String {
+        if (millis < 0L) return ""
+        val tenths = millis / 100L + if (millis % 100L >= 50L) 1L else 0L
+        return " after ${tenths / 10L}.${tenths % 10L}s"
+    }
+
 
     /**
      * The CLOCK-DRIFT summary line (#767 / #754 cluster): the strap-reported banked-record window

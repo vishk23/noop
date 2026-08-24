@@ -13,6 +13,24 @@ import Foundation
 // counts, durations and ISO dates only. No em-dashes. The Kotlin twin is ConnectionReadout.kt.
 
 public enum ConnectionTrace {
+    /// The ` after <n>s` suffix on a `connect down` trace line, or empty when the session start is
+    /// unknown (#1020).
+    ///
+    /// A session's length separates the causes of a drop at a glance: a bond watchdog fires seconds in,
+    /// a keep-alive stall bounce minutes in, a radio drop anywhere. The bare `connect down (uptime ends)`
+    /// could not distinguish them, which is why a report of thousands of reconnects needed a round trip
+    /// before anyone could start on it.
+    ///
+    /// An unknown start yields NO suffix rather than `after 0.0s` — "instant drop" and "we do not know"
+    /// are different diagnoses. Integer half-up quantization makes exact 50 ms ties deterministic, and
+    /// rendering the whole and fractional digits directly keeps locale out of pasted logs. Twin of the
+    /// Kotlin `ConnectionTrace.sessionHeldSuffix`.
+    public static func sessionHeldSuffix(millis: Int) -> String {
+        guard millis >= 0 else { return "" }
+        let tenths = millis / 100 + (millis % 100 >= 50 ? 1 : 0)
+        return " after \(tenths / 10).\(tenths % 10)s"
+    }
+
 
     /// The CLOCK-DRIFT summary line (#767 / #754 cluster): the strap-reported banked-record window
     /// [oldest, newest] against the wall clock, with a FUTURE-DATE flag when the strap's newest record is
@@ -142,7 +160,9 @@ public enum ConnectionReadout {
 
     /// Last offload result for the readout's `lastOffloadResult` id: the most recent "offload result=<...>"
     /// fragment the offload-progress emitter writes (e.g. "complete rows=42 nights=2", "empty (console
-    /// only)", "stalled (idle timeout)"). nil when no offload has finished this session.
+    /// only)", "idle-timeout after rows=17205", "stalled (idle timeout, rows=0)"). #1466: the last two are
+    /// distinct on purpose — an idle timeout that banked rows is a productive end, and only rows=0 is a
+    /// stall. nil when no offload has finished this session.
     public static func lastOffloadResult(taggedTail: [String]) -> String? {
         for line in taggedTail.reversed() {
             if let r = line.range(of: "offload result=") {

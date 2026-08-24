@@ -12,6 +12,7 @@ import com.noop.data.DeviceRegistry
 import com.noop.data.WhoopDatabase
 import com.noop.data.WhoopRepository
 import com.noop.ui.NoopPrefs
+import com.noop.ui.AppLanguagePrefs
 import kotlinx.coroutines.runBlocking
 
 /**
@@ -30,7 +31,7 @@ import kotlinx.coroutines.runBlocking
 class NoopApplication : Application() {
 
     override fun attachBaseContext(base: Context) {
-        super.attachBaseContext(base)
+        super.attachBaseContext(AppLanguagePrefs.wrap(base))
         // UI resource lookup is intentionally available before onCreate: data-driven presentation
         // helpers (release notes, metric catalogs) can resolve a resource without becoming
         // @Composable or retaining an Activity. The Application is process-scoped, so this does not
@@ -40,6 +41,9 @@ class NoopApplication : Application() {
 
     override fun onCreate() {
         super.onCreate()
+        // #1008: pin the pre-change Overnight-only default for existing installs before anything
+        // reads it. Idempotent; a no-op on fresh installs and on every launch after the first.
+        com.noop.ui.NoopPrefs.migrateContinuousHrvOvernightDefault(this)
         // Record any uncaught crash to a file so it rides along in the shareable strap log — a
         // device-specific crash (e.g. Insights #224/#267) is otherwise lost to an unreachable logcat.
         CrashCapture.install(this)
@@ -47,7 +51,7 @@ class NoopApplication : Application() {
 
     /** Process-wide Room-backed store. One instance shared by the UI and the background service. */
     val repository: WhoopRepository by lazy {
-        WhoopRepository(WhoopDatabase.get(this).whoopDao())
+        WhoopRepository(WhoopDatabase.get(this))
     }
 
     /** Process-wide device registry over the same Room DB — the single source of the active device id. */
@@ -114,6 +118,7 @@ class NoopApplication : Application() {
             straplog = { ble.externalLog(it) },
             // A generic strap's standard battery (0x180F) → the same live battery field the WHOOP uses.
             batterySink = { pct -> ble.publishExternalBattery(pct) },
+            initialActiveDeviceId = activeDeviceId,
         )
     }
 

@@ -740,6 +740,119 @@ public enum SleepStager {
         return Double(asleep) / Double(inBlock.count) >= morningReonsetBandAsleepFrac
     }
 
+    // MARK: - Band sleep_state WAKE-veto (recover strap-disputed false wakes)
+
+    // NOOP's cardiorespiratory stager is known to OVER-CALL wake: an EEG-free stager reads a still, low-HR
+    // but not-quite-asleep epoch as wake far more often than the wearer was actually awake. WHOOP's OWN
+    // per-second sleep-state band (the persisted v18 @81 high-nibble `(sb>>4)&3`: 0 wake/1 still/2 asleep/
+    // 3 up — banked as `sleepStateJSON`, gridded by `sessionEpochSleepState`) is an INDEPENDENT scored
+    // signal, not a re-derivation of ours. On real banded nights the strap scores "asleep"
+    // (`bandStateAsleep`) across ~two-thirds of the epochs NOOP calls wake, while the reverse disagreement
+    // (NOOP asleep, strap wake) is an order of magnitude smaller. So letting the strap's OWN "asleep"
+    // verdict VETO an INTERIOR wake call recovers most of the spurious wake with near-zero downside.
+    // Unlike the H8 consume confirm (which only ever KEEPS a whole borderline re-onset session), this
+    // operates per EPOCH on the final hypnogram and only ever turns wake INTO sleep.
+
+    /// Default-OFF gate for the band sleep_state WAKE-veto — off until PSG supports it, and the PSG
+    /// harness currently says the OPPOSITE: against the 31-subject sleep-accel truth set the shipped
+    /// recipe UNDER-calls wake (wake% 4.15 vs ~9.1 true, bias −4.92 pp, wake sensitivity 30.8%), so a
+    /// veto that converts wake→light moves the population result AWAY from truth even though it fixes
+    /// real strap-disputed false wakes on HR-inflated nights (the n=12 that motivated it). Flip to true
+    /// only with PSG evidence in hand — `sleeppsg --section variants` prints the wake%/bias row this
+    /// decision keys on. The mechanism stays fully tested behind the flag (tests pass `enabled: true`
+    /// explicitly). An absent band stream (WHOOP 4.0 / unbanded window) is a no-op regardless.
+    public static let bandStateWakeVetoEnabled: Bool = false
+
+    /// #1210 item 2 (retroactive-rescore story): the new-nights-only cutoff. When the veto is flipped on
+    /// (`bandStateWakeVetoEnabled = true`), a NON-ZERO cutoff (a unix second) restricts the correction to
+    /// sessions whose `start >= cutoffTs` — nights already in history keep their raw efficiency, so flipping
+    /// the default cannot silently re-score months of banked nights upward. `0` (the default) applies the
+    /// veto to every banded night (the "just ship the one-time shift" path). Inert while the flag is off.
+    /// Set this to the flip date at the same time as the flag. Mirrors Kotlin `bandStateWakeVetoCutoffTs`.
+    public static let bandStateWakeVetoCutoffTs: Int = 0
+
+    /// The sleep stage a band-vetoed false-wake epoch is reclassified to. `bandStateAsleep` (band sleep_state == 2) means
+    /// only "asleep" — the band carries NO light/deep/REM resolution — so the veto maps it to the generic,
+    /// most-common sleep stage rather than inventing deep/REM detail the strap never asserted (deep/REM
+    /// minutes feed the recovery gate; the veto must not inflate them). "light" is the honest projection of a
+    /// bare "asleep".
+    static let bandVetoRecoverStage: String = "light"
+
+    /// #1210: a TRACE-ONLY line reporting what the (dormant) band wake-veto WOULD recover on a banded night,
+    /// so a validator gathers the recovered-minutes distribution across real nights without any output change
+    /// (the persisted hypnogram stays the flag-gated, unchanged one). Namespaced `bandVeto(shadow):` and free
+    /// of a `day=` / `t=…s` token so `CaptureAccumulator` never counts it as a captured day. Mirrors Kotlin
+    /// `bandVetoShadowLine`. (band sleep_state veto)
+    static func bandVetoShadowLine(startTs: Int, recoveredMin: Double, rawEff: Double, shadowEff: Double) -> String {
+        "bandVeto(shadow): startTs=\(startTs) recoveredMin=\(Int(recoveredMin.rounded())) "
+            + "eff \(Int((rawEff * 100).rounded()))%->\(Int((shadowEff * 100).rounded()))%"
+    }
+
+    /// Band sleep_state WAKE-veto. Given a staged hypnogram `stages` (StageSegments tiling `[start, end]`)
+    /// and the strap's OWN per-timestamp band sleep_state, reclassify INTERIOR wake epochs the strap itself
+    /// scored "asleep" (`bandStateAsleep`) to `bandVetoRecoverStage`. Conservative by construction:
+    ///   - ONLY `bandStateAsleep` (2) vetoes — a "still" (1) / "up" (3) / "wake" (0) band reading is LEFT as
+    ///     wake, so the veto never blind-trusts the band, only its explicit "asleep";
+    ///   - the LEADING wake block (sleep-onset latency, before the first sleep epoch) and the TRAILING wake
+    ///     block (final-morning wake, after the last sleep epoch) are NEVER touched — the veto cannot move
+    ///     sleep onset earlier or final wake later, it only recovers wake FLANKED by sleep;
+    ///   - it only ever turns wake INTO sleep (raising efficiency), never sleep into wake.
+    /// The band is gridded to the SAME 30 s epochs as `stagesJSON` / `sessionEpochMotion` via
+    /// `sessionEpochSleepState`, so epoch i here is epoch i of the persisted `sleepStateJSON`. Empty band
+    /// state, the flag off, or a hypnogram with no interior sleep → returns `stages` UNCHANGED (byte-
+    /// identical). Applies to whichever stager (V1 or V2) produced `stages`. Pure + deterministic.
+    /// (band sleep_state veto)
+    static func applyBandStateWakeVeto(_ stages: [StageSegment], start: Int, end: Int,
+                                       bandSleepState: [(ts: Int, state: Int)],
+                                       enabled: Bool = bandStateWakeVetoEnabled,
+                                       cutoffTs: Int = bandStateWakeVetoCutoffTs) -> [StageSegment] {
+        guard enabled, !bandSleepState.isEmpty, !stages.isEmpty, end > start else {
+            return stages
+        }
+        // #1210 item 2: new-nights-only gate. A non-zero cutoff spares nights that started before it (history
+        // keeps its raw efficiency); `0` applies to every banded night. Inert while the flag is off.
+        if cutoffTs > 0, start < cutoffTs { return stages }
+        // Per-epoch band on the 30 s stagesJSON grid — byte-identical to the persisted sleepStateJSON.
+        let states = sessionEpochSleepState(start: start, end: end, sleepState: bandSleepState)
+        if states.isEmpty { return stages }
+        let n = states.count
+        // Epoch i spans [start + i·epochS, …); boundaries sit on 30 s edges, so expanding the segment tiling
+        // to a per-epoch stage array and re-collapsing it is an exact round-trip (no-op when nothing changes).
+        func epochStart(_ i: Int) -> Int { start + Int(Double(i) * epochS) }
+        var labels = [String](repeating: "wake", count: n)
+        for i in 0..<n {
+            let t = epochStart(i)
+            if let seg = stages.first(where: { $0.start <= t && t < $0.end })
+                ?? stages.first(where: { $0.start <= t && t <= $0.end }) {
+                labels[i] = seg.stage
+            }
+        }
+        // Interior = [firstSleep, lastSleep]; leading/trailing wake blocks are excluded from the veto.
+        guard let onset = labels.firstIndex(where: { $0 != "wake" }),
+              let finalWake = labels.lastIndex(where: { $0 != "wake" }), onset <= finalWake else {
+            return stages   // no sleep at all → nothing to recover
+        }
+        var changed = false
+        for i in onset...finalWake where labels[i] == "wake" && states[i] == bandStateAsleep {
+            labels[i] = bandVetoRecoverStage
+            changed = true
+        }
+        if !changed { return stages }   // the band disputed nothing → byte-identical hypnogram
+        // Re-collapse consecutive same-stage epochs back into segments tiling [start, end].
+        var out: [StageSegment] = []
+        for i in 0..<n {
+            let segStart = epochStart(i)
+            let segEnd = (i == n - 1) ? end : epochStart(i + 1)
+            if let last = out.last, last.stage == labels[i] {
+                out[out.count - 1].end = segEnd
+            } else {
+                out.append(StageSegment(start: segStart, end: segEnd, stage: labels[i]))
+            }
+        }
+        if !out.isEmpty { out[out.count - 1].end = end }
+        return out
+    }
+
     /// Off-wrist HR-gap spans (#500). The contiguous HR-coverage gaps of at least `offWristHRGapMin`
     /// minutes WITHIN [p.start, p.end], as concrete `[start, end)` sub-intervals — a strong wrist-OFF
     /// proxy. Worn, the strap streams ~1 Hz HR (or PPG-derived HR on a 5/MG), so a real night yields no
@@ -827,12 +940,16 @@ public enum SleepStager {
     /// re-onset (#531): a daytime block the strap itself scored predominantly "asleep" is KEPT even on a
     /// borderline HR dip. Default empty keeps pure-function callers/tests free of it; IntelligenceEngine
     /// passes the night window's persisted band state. It can only RESCUE a real-sleep block, never fabricate.
-    /// `useSleepStagerV2` (V7 / #690): when true, each accepted night is staged by the experimental
-    /// cardiorespiratory recipe `SleepStagerV2.stageSession` instead of V1's `stageSession`. DETECTION is
-    /// unchanged (same accepted windows); only the per-epoch hypnogram differs. Default false keeps V1 the
-    /// byte-identical default (the frozen-golden tests stay green). The live call site threads
-    /// `PuffinExperiment.experimentalSleepV2Enabled` so the Settings toggle now affects normal detected
-    /// nights, not just the self-heal restage path.
+    /// `useSleepStagerV2` (7.0.0; default ON since #277/#351): which recipe stages an accepted night — the cardiorespiratory
+    /// `SleepStagerV2.stageSession` when true, V1's `stageSession` when false. DETECTION is unchanged
+    /// (same accepted windows); only the per-epoch hypnogram differs.
+    ///
+    /// THE TWO DEFAULTS ARE NOT THE SAME, and reading only the signature gets this backwards. This
+    /// PARAMETER defaults false so pure-function callers and the frozen-golden tests stay byte-identical.
+    /// The SHIPPED app never takes that default: the live call site threads
+    /// `PuffinExperiment.experimentalSleepV2Enabled`, which is **default ON** (V2 was promoted over V1 in
+    /// #277 and extended to every strap family in #351), so a normal user's nights are staged by **V2**.
+    /// `= false` here describes the library's contract with its callers, not the product's behaviour.
     /// `sleepHRBaseline` (motion-corroborated wake, directive b): the wearer's PERSONALISED overnight HR band
     /// (`adaptiveOvernightHRBaseline`), used by `confirmSleepWithHR` in place of the day-median so a supplement /
     /// fitness era self-calibrates the sleep band. Default nil keeps the day-median (byte-identical to before);
@@ -866,8 +983,11 @@ public enum SleepStager {
         // that steers detection or staging — the four streams, the tz offset (daytime-guard + onset band),
         // the off-wrist intervals (#500 backstop), the persisted band state (#531 H8), and the V2 toggle (an
         // edit to any re-keys to a fresh compute). Result-only + bounded; the raw arrays are never retained.
+        // Match Android's raw-axis semantics: mix x/y/z IEEE-754 bits in order, never their lossy sum.
         let key = DetectKey(
-            grav: StreamFingerprint.of(gravity, ts: { $0.ts }, quant: { Int(($0.x + $0.y + $0.z) * 1024) }),
+            grav: StreamFingerprint.of(gravity, ts: { $0.ts }, quant: {
+                StreamFingerprint.gravityQuant(x: $0.x, y: $0.y, z: $0.z)
+            }),
             hr: StreamFingerprint.of(hr, ts: { $0.ts }, quant: { Int($0.bpm) }),
             rr: StreamFingerprint.of(rr, ts: { $0.ts }, quant: { Int($0.rrMs) }),
             resp: StreamFingerprint.of(resp, ts: { $0.ts }, quant: { $0.raw }),
@@ -973,11 +1093,23 @@ public enum SleepStager {
         // `traceSink?(...)` calls are the only addition and never alter `sessions`. `runIndex` counts
         // only sleep-stage runs so the trace numbers match the candidate ordinal.
         var runIndex = -1
+        // #737 follow-up: counters for the one-line detection summary emitted before `return` (below).
+        // Trace-only — never read back into `sessions`, so the untraced path stays byte-identical. They
+        // make the "slept 8h, app shows 1h" shape legible at a glance: a big detectedSpan with most runs
+        // dropped by the 60-min gate is the fragmentation signature.
+        var sleepRunsSeen = 0
+        var minSleepDrops = 0
+        var firstSleepStart = Int.max
+        var lastSleepEnd = 0
         for p in runs {
             if p.stage != "sleep" { continue }
             runIndex += 1
+            sleepRunsSeen += 1
+            firstSleepStart = min(firstSleepStart, p.start)
+            lastSleepEnd = max(lastSleepEnd, p.end)
             let spanMin = (p.end - p.start) / 60
             if (p.end - p.start) <= minSleepS {
+                minSleepDrops += 1
                 traceSink?(GateTrace.runLine(index: runIndex, startTs: p.start, endTs: p.end,
                     verdict: .dropped, gate: "minSleepMin",
                     detail: "spanMin=\(spanMin) minSleepMin=\(minSleepMin)"))
@@ -1044,11 +1176,17 @@ public enum SleepStager {
                     detail: "daytime=true restingHR=\(resting ?? -1) baseline=\(baseline.map { Int($0) } ?? -1) nightTail=false"))
                 continue
             }
-            let stages = useSleepStagerV2
+            let rawStages = useSleepStagerV2
                 ? SleepStagerV2.stageSession(start: p.start, end: p.end, grav: grav,
                                              hr: hrS, rr: rrS, resp: respS)
                 : stageSession(start: p.start, end: p.end, grav: grav,
                                hr: hrS, rr: rrS, resp: respS)
+            // Band sleep_state WAKE-veto: recover INTERIOR false-wake epochs the strap's OWN band
+            // (`bandSleepState`) scored "asleep". No-op when the band is absent (WHOOP 4.0) or the flag is
+            // off; stager-agnostic (corrects whichever hypnogram V1/V2 produced). Efficiency below is then
+            // computed on the corrected stages, so a night NOOP over-called wake on reports true efficiency.
+            let stages = applyBandStateWakeVeto(rawStages, start: p.start, end: p.end,
+                                                bandSleepState: bandSleepState)
             let eff = efficiency(start: p.start, end: p.end, stages: stages)
             let avgHrv = sessionAvgHRV(start: p.start, end: p.end, rr: rrS)
             sessions.append(SleepSession(start: p.start, end: p.end, efficiency: eff,
@@ -1056,11 +1194,41 @@ public enum SleepStager {
             traceSink?(GateTrace.runLine(index: runIndex, startTs: p.start, endTs: p.end,
                 verdict: .kept, gate: "accepted",
                 detail: "spanMin=\(spanMin) eff=\(round2(eff)) restingHR=\(resting ?? -1) daytime=\(isDaytime)"))
+            // #1210 shadow: the band wake-veto is dormant (default-off), but its recovered-vs-reverse ratio
+            // can only come from banded nights. When a band stream is present, compute what the veto WOULD
+            // recover and trace it — OUTPUT-NEUTRAL: `stages`/`eff` persisted above are the flag-gated
+            // (unchanged) values and nothing reads `shadowStages`. Guarded on `traceSink`, so it fires ONLY
+            // while a diagnostic is collecting (zero production cost). Retire once the flip (#1210) lands.
+            if let traceSink, !bandStateWakeVetoEnabled, !bandSleepState.isEmpty {
+                // `cutoffTs: 0` on purpose: the shadow measures the FULL veto potential across EVERY banded
+                // night (history included) to build the validation distribution, independent of whatever
+                // new-nights cutoff the eventual flip uses.
+                let shadowStages = applyBandStateWakeVeto(rawStages, start: p.start, end: p.end,
+                                                          bandSleepState: bandSleepState,
+                                                          enabled: true, cutoffTs: 0)
+                let shadowEff = efficiency(start: p.start, end: p.end, stages: shadowStages)
+                let recoveredMin = (shadowEff - eff) * Double(p.end - p.start) / 60.0
+                if recoveredMin >= 1.0 {
+                    traceSink(bandVetoShadowLine(startTs: p.start, recoveredMin: recoveredMin,
+                                                 rawEff: eff, shadowEff: shadowEff))
+                }
+            }
             // A run that does NOT continue the chain re-anchors it on this run's onset.
             if !continuesChain { chainFromOvernight = isOvernightOnset(p.start, tzOffsetSeconds: tzOffsetSeconds) }
             chainPrevEnd = p.end
         }
         sessions.sort { $0.start < $1.start }
+        // #737 follow-up: one glanceable line summarising the whole detection pass. A large
+        // `detectedSpanMin` with most runs `droppedMinSleep` and a small `survivingSpanMin` is exactly
+        // the "slept ~8h, only ~1h confirmed" fragmentation the field reports describe — this makes it
+        // readable without hand-summing the per-run lines above. Trace-only.
+        if let traceSink {
+            let detectedSpanMin = lastSleepEnd > firstSleepStart ? (lastSleepEnd - firstSleepStart) / 60 : 0
+            let survivingSpanMin = sessions.reduce(0) { $0 + ($1.end - $1.start) } / 60
+            traceSink("sleep-detect summary: sleepRuns=\(sleepRunsSeen) droppedMinSleep=\(minSleepDrops) "
+                + "kept=\(sessions.count) detectedSpanMin=\(detectedSpanMin) survivingSpanMin=\(survivingSpanMin) "
+                + "sparse=\(sparse) grav=\(grav.count) hr=\(hrS.count)")
+        }
         return sessions
     }
 
@@ -1068,7 +1236,7 @@ public enum SleepStager {
     static func efficiency(start: Int, end: Int, stages: [StageSegment]) -> Double {
         let inBed = Double(end - start)
         if inBed <= 0 { return 0 }
-        let wake = stages.filter { $0.stage == "wake" }.reduce(0.0) { $0 + Double($1.end - $1.start) }
+        let wake = stages.filter { SleepStageVocabulary.isWake($0.stage) }.reduce(0.0) { $0 + Double($1.end - $1.start) }
         let asleep = max(0.0, inBed - wake)
         return min(1.0, asleep / inBed)
     }
@@ -1108,7 +1276,9 @@ public enum SleepStager {
         // resp IS consumed here via the epoch grid, unlike V2). Result-only, bounded, no raw arrays retained.
         let key = V1StageKey(
             start: start, end: end,
-            grav: StreamFingerprint.of(grav, ts: { $0.ts }, quant: { Int(($0.x + $0.y + $0.z) * 1024) }),
+            grav: StreamFingerprint.of(grav, ts: { $0.ts }, quant: {
+                StreamFingerprint.gravityQuant(x: $0.x, y: $0.y, z: $0.z)
+            }),
             hr: StreamFingerprint.of(hr, ts: { $0.ts }, quant: { Int($0.bpm) }),
             rr: StreamFingerprint.of(rr, ts: { $0.ts }, quant: { Int($0.rrMs) }),
             resp: StreamFingerprint.of(resp, ts: { $0.ts }, quant: { $0.raw }))
@@ -1473,6 +1643,12 @@ public enum SleepStager {
     /// Per-window length for the per-window rate estimate (seconds).
     static let rsaWindowS = 300.0
 
+    /// #977: wall-clock seconds a beat-to-beat step may exceed its own RR before the series is treated
+    /// as SPLICED there. `ts` is whole seconds, so a 1 s discrepancy is quantisation, not a gap; the
+    /// blocks that prompted this were 30-45 s. PROVISIONAL, like `coveragePlausibleCeiling` - wide
+    /// enough that only an unambiguous dropout trips it, and deliberately not tuned to a corpus.
+    static let rsaGapToleranceS = 3.0
+
     /// Physiologic breath-interval band (seconds): 0.1–0.4 Hz = 6–24 breaths/min.
     static let rsaMinBreathIntervalS = 2.5   // 24 bpm
     static let rsaMaxBreathIntervalS = 10.0  // 6 bpm
@@ -1492,15 +1668,24 @@ public enum SleepStager {
     /// does not equal a chest-band / capnography rate.
     ///
     /// Pipeline (per matched in-bed session [start, end], unix SECONDS):
-    ///   1. Restrict RR rows to ts in [start, end]; range-filter the RR values
-    ///      (HRVAnalyzer.rangeFilter) to drop dropouts/ectopics.
+    ///   1. Restrict RR ROWS to ts in [start, end] and apply the same range test
+    ///      HRVAnalyzer.rangeFilter applies, keeping the rows so `ts` survives (#977).
     ///   2. Reconstruct beat times by cumulatively summing the kept RR intervals
-    ///      from the first in-bed beat, yielding an (irregular) tachogram.
+    ///      from the first in-bed beat, yielding an (irregular) tachogram, and note
+    ///      where the wall clock outran the beats (#977) — the cumulative sum cannot
+    ///      represent a dropout, so those points are splices, not elapsed time.
     ///   3. Resample the tachogram onto a uniform ~4 Hz grid by linear interpolation.
     ///   4. Detrend: subtract a centered moving mean (rsaDetrendWindowS).
-    ///   5. Per ~5-min window: findPeaks (min distance rsaMinPeakDistanceS) on the
-    ///      detrended grid, keep peak-to-peak intervals in the 6–24 bpm band, rate =
-    ///      60 / median(intervals). Take the median across windows.
+    ///   5. Per ~5-min window, SKIPPING any window containing a splice: findPeaks
+    ///      (min distance rsaMinPeakDistanceS) on the detrended grid, keep peak-to-peak
+    ///      intervals in the 6–24 bpm band, rate = 60 / median(intervals). Take the
+    ///      median across windows.
+    ///
+    /// Known bound on the splice skip (#977): step 4's centered mean spans ±rsaDetrendWindowS/2, so a
+    /// splice just inside one window's edge leaves ~4 s of contaminated samples at the neighbouring
+    /// window's edge. That window is KEPT deliberately — discarding five minutes to avoid four seconds
+    /// costs far more data than it saves, and both medians (over intervals, then over windows) dilute a
+    /// single spurious peak among a five-minute window's worth.
     /// Returns NaN when too few intervals survive (honest no-data).
     static func respRateFromRR(_ rr: [RRInterval], start: Int, end: Int) -> Double {
         let nan = Double.nan
@@ -1509,16 +1694,75 @@ public enum SleepStager {
         // 1. In-bed RR rows in chronological order, range-filtered. STABLE sort: step 2 reconstructs
         // beat times by cumulative sum, so the order of a second's beats moves every subsequent beat
         // time and with it the RSA estimate. Kotlin's twin uses sortedBy, stable by contract. (#823)
-        let inBed = rr.filter { $0.ts >= start && $0.ts <= end }
+        //
+        // #977: the ROWS are kept, not just their values, because `ts` is the only signal that a beat is
+        // missing. Beats lost before storage never enter the array, so contiguity derived from rejection
+        // (cleanRRGapAware) cannot see them - it takes only [Double] and has no clock. Filtering the rows
+        // by the same predicate `HRVAnalyzer.rangeFilter` applies keeps the surviving VALUES identical
+        // (it is an order-preserving range test), which RespRateGapAwareTests pins.
+        let inBedRows = rr.filter { $0.ts >= start && $0.ts <= end }
             .sortedByTsStable()
-            .map { Double($0.rrMs) }
-        let filtered = HRVAnalyzer.rangeFilter(inBed)
+            .filter { Double($0.rrMs) >= HRVAnalyzer.rrMinMs && Double($0.rrMs) <= HRVAnalyzer.rrMaxMs }
+
+        // Beat-accuracy gate (#882/#883): RSA needs per-beat-accurate TIMING - each row's wall-clock gap
+        // must be ≈ its own R-R value. A BANKED stream (an Oura overnight IBI stamps a whole record of
+        // intervals on one coarse ring-time) fails this, and the estimate it produces is not physiology;
+        // return NaN instead. Beat-accurate callers (WHOOP R-R, the synthetic RSA fixtures) measure ~100%
+        // and pass unchanged. Needs a few beats to judge; below that the count gate below handles it.
+        //
+        // Shares HRVAnalyzer's ONE definition of the judgement (#1108) rather than keeping a second copy:
+        // "is each stored interval a real beat-to-beat measurement?" is the same question SDNN asks, and
+        // one boundary deserves one set of constants. `rangeFilter` has already run, so an out-of-range
+        // R-R cannot fail the accuracy test spuriously.
+        //
+        // WHAT THIS ACTUALLY CATCHES, measured (2026-08-07, two Oura nights, 31,460 and 30,754 in-bed
+        // beats, fraction 0.0246 / 0.0235): NOT a corrupted time AXIS - the ring's records tile the night,
+        // sum(R-R) over wall span is 1.030 / 1.008, so beat-time reconstructs the night to 1-3%. What is
+        // unusable is the interval VALUES: the ring decomposes each ~6.6 s record into ~6 intervals whose
+        // SUM is right to ~1% while the individual values are not beat-to-beat measurements (the same
+        // decomposition documented on `HRVAnalyzer.beatValuesAreTrustworthy`). RSA reads the beat-to-beat
+        // variation, so it has nothing to read, and the peak-picker returns its own floor: on both nights
+        // the ungated estimate is 13.33 bpm, and SHUFFLING or REVERSING the night's R-R values returns the
+        // SAME 13.3333 to four decimals. It is a plausible-looking number carrying zero information -
+        // squarely inside `respPlausibleRangeBpm`, so the range clamp below never sees it. That is why the
+        // gate is on BANKED-ness rather than on the output value.
+        //
+        // DISTINCT FROM #977's splice skip below, and BOTH are needed - they catch opposite banking
+        // GEOMETRIES. #977 catches banking that TILES time (the real ring: a ~7 s record boundary against a
+        // ~1.1 s interval reads as a splice, and on those two nights it independently discards 113/113 and
+        // 114/114 windows). This catches banking that COMPRESSES time - `testRespRateFromRRBatchedTimestamps`
+        // stamps 6 beats per single second, so no gap ever exceeds `rsaGapToleranceS` and the splice skip
+        // never fires. Neither subsumes the other; a firmware that changes its record period moves a stream
+        // from one geometry to the other without warning.
+        if inBedRows.count >= 30 {
+            let fraction = HRVAnalyzer.beatAccurateFraction(tsSec: inBedRows.map { $0.ts },
+                                                            rrMs: inBedRows.map { Double($0.rrMs) })
+            if !HRVAnalyzer.beatValuesAreTrustworthy(beatAccurateFraction: fraction) { return nan }
+        }
+
+        let filtered = inBedRows.map { Double($0.rrMs) }
         if filtered.count < 30 { return nan }  // need enough beats for any RSA estimate
 
         // 2. Reconstruct beat times (seconds from session start) by cumulative sum.
+        // #977: a dropout is where the WALL CLOCK outran the beat - ts jumps 30-45 s while the RR only
+        // accounts for ~1 s. The cumulative sum cannot represent that, so it stitches the two sides
+        // together and the tachogram gets a discontinuity the peak-picker reads as breathing. Record the
+        // beat-time of each splice here; step 5 drops the windows containing one. Beat times are NOT
+        // shifted by the gap: within a run the relative timing is right, and that is all a kept window uses.
+        //
+        // This fires on a beat REJECTED just above too, not only one lost before storage: the range
+        // test drops out-of-range intervals, so `ts` steps across them exactly as it does across a
+        // dropout. That is the intent - both genuinely splice the tachogram, which is the same reason
+        // #204/#195 made RMSSD skip differences across a removed beat - but it does mean a night with
+        // heavy ectopic rejection now loses windows it used to keep.
         var beatTimes = [Double](repeating: 0, count: filtered.count)
+        var spliceAtS: [Double] = []
         var acc = 0.0
         for i in filtered.indices {
+            if i > 0 {
+                let wallStepS = Double(inBedRows[i].ts - inBedRows[i - 1].ts)
+                if wallStepS - filtered[i] / 1000.0 > rsaGapToleranceS { spliceAtS.append(acc) }
+            }
             acc += filtered[i] / 1000.0
             beatTimes[i] = acc
         }
@@ -1555,13 +1799,18 @@ public enum SleepStager {
         if standardDeviation(detrended) <= 1e-9 { return nan }  // flat → no RSA
 
         // 5. Per ~5-min window peak-pick → 60/median(breath interval); median across.
+        let spliceGrid = spliceAtS.map { Int($0 / dt) }
         let minDistSamples = max(2, Int((rsaMinPeakDistanceS * rsaResampleHz).rounded()))
         let windowSamples = max(minDistSamples * 3, Int((rsaWindowS * rsaResampleHz).rounded()))
         var perWindowRates: [Double] = []
         var w = 0
         while w < nGrid {
             let wEnd = min(nGrid, w + windowSamples)
-            if wEnd - w >= minDistSamples * 3 {
+            // #977: a window straddling a splice is measuring a discontinuity, not a breath. Dropping it
+            // costs one window; keeping it puts a fabricated interval into the median. All windows spliced
+            // leaves perWindowRates empty and the function returns NaN, which is the honest answer.
+            let spliced = spliceGrid.contains { $0 >= w && $0 < wEnd }
+            if !spliced && wEnd - w >= minDistSamples * 3 {
                 let winSeg = Array(detrended[w..<wEnd])
                 // findPeaks with height = 0.0 selects the positive RSA peaks (one per
                 // breath) on the zero-mean detrended tachogram.
@@ -1692,6 +1941,127 @@ public enum SleepStager {
         return Double(sparse) >= cardiacSparseEpochFrac * Double(sleepFeats.count)
     }
 
+    /// What this epoch's respiration says about depth — FIVE states, because "we did not measure it" is
+    /// not an observation and must not be spendable as one.
+    ///
+    /// This used to be two booleans over a NaN RRV, and the `regular` one read
+    /// `(!f.rrv.isFinite) || (f.rrv <= rrvLo)`: a MISSING respiration reading was converted into a
+    /// positive assertion that breathing was regular, which is pro-deep. On a WHOOP 5/MG that is not an
+    /// edge case, it is the only code path — the v18 layout emits no `resp_rate_raw` at all (pinned by
+    /// `Whoop5HistoricalTests`), so `respSample` has zero rows, every epoch's RRV is NaN, and the
+    /// fabricated "regular" fires on 100% of epochs. Where a night with real respiration data has ~50% of
+    /// its epochs clear the `regular` bar (it is the MEDIAN — `stageRRVLowPct` = 50), a 5/MG night has
+    /// 100% clear it, on no measurement whatsoever.
+    ///
+    /// The five cases are the exact CROSS-PRODUCT of the two predicates this replaced, so the mapping is
+    /// total and no case is decided by which bar `of` happens to test first:
+    ///
+    /// | pre-fix `rrvIrregular` | pre-fix `rrvRegular` | case |
+    /// |---|---|---|
+    /// | false | true (via `!isFinite`) | `unmeasured` |
+    /// | false | true (via the low bar) | `regular` |
+    /// | true | false | `irregular` |
+    /// | false | false | `measuredMidBand` |
+    /// | true | true | `barsDegenerate` |
+    ///
+    /// `unmeasured` and `measuredMidBand` are deliberately DISTINCT. Both fail the regular and irregular
+    /// bars, but they mean opposite things — one is "no reading", the other is a real reading that simply
+    /// sits between the bars — and the classifier already treats them differently (the REM fallback fires
+    /// only on a missing reading). Collapsing them would silently change the hypnogram.
+    enum RespEvidence {
+        /// A finite RRV at or below the session's low bar — breathing measured as regular.
+        case regular
+        /// A finite RRV at or above the session's high bar — breathing measured as irregular.
+        case irregular
+        /// A finite RRV between the bars: measured, but neither notably regular nor notably irregular.
+        case measuredMidBand
+        /// No usable RRV for this epoch. Either the strap has no respiration channel at all (every 5/MG),
+        /// or this epoch's window had too few / too flat samples to derive one (`respRateAndRRV` returns
+        /// NaN below 8 samples, on a flat signal, under 3 peaks, or under 2 in-band breath intervals).
+        case unmeasured
+        /// A finite RRV that clears BOTH bars at once — at or above the high bar AND at or below the low
+        /// bar. The session's two percentile bars have collapsed onto this reading, so it satisfies each
+        /// of them and the pair carries no information at this value.
+        ///
+        /// Reachable, not hypothetical, and for a structural reason: RRV is the population std of breath
+        /// intervals measured in WHOLE SECONDS (`respRateAndRRV`, `dtS` = 1), so it is quantised onto a
+        /// small discrete lattice and exact ties between epochs are ordinary. `percentile` interpolates
+        /// between order statistics, so p50 and p65 coincide whenever the tie run spans them — and when
+        /// only ONE sleep epoch has a finite RRV (the rest NaN, which that same function returns freely on
+        /// short, flat or low-peak windows) `percentile` returns that single value for both, so the epoch
+        /// that SET the bars necessarily sits on both of them.
+        ///
+        /// Kept as its own case because a four-state enum cannot represent it: both pre-fix booleans were
+        /// true here, so whichever bar the factory tested first would silently decide the label. Behaviour
+        /// is pinned to the pre-fix outcome — waived for depth (`rrvRegular` was true, see
+        /// `contradictsDepth`) and clearing the REM irregular bar (`rrvIrregular` was true, see
+        /// `meetsIrregularBar`) — which keeps this change a representation fix.
+        ///
+        /// That pre-fix outcome resolves to DEEP only because the deep rule is written before the REM rule
+        /// in `classifyOne`; statement order is not a reason, and re-deciding it is a live question. It is
+        /// deliberately NOT re-decided here: doing so is a scoring change on the degenerate-distribution
+        /// nights, and this repo has no staged nights of that shape to validate it against (CLAUDE.md,
+        /// "validate against the artifact, not one match"). The point of naming the case is that the
+        /// decision is now a one-line edit in `contradictsDepth` / `meetsIrregularBar` with a test that
+        /// fails loudly, instead of an invisible consequence of statement order.
+        case barsDegenerate
+
+        /// Total mapping of the two pre-fix predicates. Written as an exhaustive switch on the pair
+        /// rather than an ordered `if` chain, because an ordered chain is exactly how the `barsDegenerate`
+        /// case used to be decided by accident.
+        static func of(_ rrv: Double, lowBar: Double?, highBar: Double?) -> RespEvidence {
+            guard rrv.isFinite else { return .unmeasured }
+            let atOrAboveHigh = highBar.map { rrv >= $0 } ?? false
+            let atOrBelowLow = lowBar.map { rrv <= $0 } ?? false
+            switch (atOrAboveHigh, atOrBelowLow) {
+            case (true, true): return .barsDegenerate
+            case (true, false): return .irregular
+            case (false, true): return .regular
+            case (false, false): return .measuredMidBand
+            }
+        }
+
+        /// Whether respiration CONTRADICTS depth. The deep rule reads this rather than a "regular" flag,
+        /// because `unmeasured` is not evidence of regular breathing — it is the absence of evidence, and
+        /// the rule it feeds is "respiration must not rule depth out".
+        ///
+        /// `unmeasured` is WAIVED here, not because missing respiration is reassuring, but because
+        /// blocking on it would decode 0 m of deep on every 5/MG night — the exact regression #127/#129
+        /// fixed for the parallel missing-RMSSD case, whose rule statement already carries the same
+        /// qualifier ("with high parasympathetic tone WHEN MEASURABLE"). This makes the respiration
+        /// waiver explicit and equally qualified instead of leaving it implied by a NaN short-circuit.
+        ///
+        /// `barsDegenerate` is waived too, matching the pre-fix `rrvRegular`; see its doc for why that is
+        /// preserved rather than re-decided.
+        ///
+        /// KNOWN LIMITATION, deliberately not changed here: on a 5/MG BOTH waivers can fire at once
+        /// (sparse R-R leaves RMSSD NaN too), and the deep rule then reduces to stillness + a low HR with
+        /// no physiological corroboration at all. That is a real weakness, but it is bounded — `hrLow` is
+        /// a PERCENTILE bar (`stageHRLowPct` = 25), so at most ~25% of sleep epochs can clear it however
+        /// the respiration term resolves. Narrowing the waiver (e.g. to epoch-level gaps within a night
+        /// that HAS a respiration channel, versus a device with no channel at all) is a scoring change
+        /// that needs validation data this repo does not have — see the "validate against the artifact,
+        /// not one match" rule in CLAUDE.md. `SleepStagerRespEvidenceTests` pins the current behaviour and
+        /// quantifies the bias so that decision can be made on numbers.
+        var contradictsDepth: Bool {
+            switch self {
+            case .regular, .unmeasured, .barsDegenerate: return false
+            case .irregular, .measuredMidBand: return true
+            }
+        }
+
+        /// Whether this epoch clears the session's IRREGULAR bar — the pre-fix `rrvIrregular` predicate,
+        /// which the main REM rule reads. `barsDegenerate` clears it (it IS at or above the high bar) even
+        /// though `contradictsDepth` also waives it; that pair of answers is precisely the pre-fix state
+        /// where both booleans were true, and it is preserved deliberately.
+        var meetsIrregularBar: Bool {
+            switch self {
+            case .irregular, .barsDegenerate: return true
+            case .regular, .measuredMidBand, .unmeasured: return false
+            }
+        }
+    }
+
     static func classifyOne(_ f: EpochFeatures, hrLo: Double?, hrHi: Double?,
                             rmssdHi: Double?, hrvarHi: Double?, rrvHi: Double?, rrvLo: Double?,
                             cardiacSparse: Bool = false) -> String {
@@ -1717,9 +2087,7 @@ public enum SleepStager {
         // Dense 4.0 nights keep the full `hrHigh || hrvarHigh` signal, so their behaviour is unchanged. (#705)
         let cardiacActivatedForWake = cardiacSparse ? hrHigh : cardiacActivated
 
-        let rrvIrregular = f.rrv.isFinite && rrvHi != nil && f.rrv >= rrvHi!
-        // Missing respiration (NaN RRV) treated as "regular" (pro-deep bias).
-        let rrvRegular = (!f.rrv.isFinite) || (rrvLo != nil && f.rrv <= rrvLo!)
+        let resp = RespEvidence.of(f.rrv, lowBar: rrvLo, highBar: rrvHi)
 
         let still = f.moveFrac <= stageStillMoveFrac
         let moving = f.moveFrac >= stageWakeMoveFrac
@@ -1728,12 +2096,15 @@ public enum SleepStager {
         // cardiac half is vetted by HR only (see `cardiacActivatedForWake`), so noisy hrVar no longer
         // over-promotes still sleep to wake. (#705)
         if moving && (cardiacActivatedForWake || !hasHR) { return "wake" }
-        // DEEP: still + low HR + regular respiration, with high parasympathetic tone when measurable.
-        if still && parasympOK && hrLow && rrvRegular { return "deep" }
-        // REM: still body + activated cardiac + irregular respiration.
-        if still && cardiacActivated && rrvIrregular { return "rem" }
-        // REM fallback when respiration unavailable: require BOTH cardiac signals.
-        if still && hrHigh && hrvarHigh && !f.rrv.isFinite { return "rem" }
+        // DEEP: still + low HR + respiration that does not RULE OUT depth, with high parasympathetic tone
+        // when measurable. `contradictsDepth` is where an unmeasured respiration is waived — see its doc
+        // for why the waiver stays and what it costs.
+        if still && parasympOK && hrLow && !resp.contradictsDepth { return "deep" }
+        // REM: still body + activated cardiac + respiration clearing the irregular bar.
+        if still && cardiacActivated && resp.meetsIrregularBar { return "rem" }
+        // REM fallback when respiration was never MEASURED (not merely mid-band): require BOTH cardiac
+        // signals. A mid-band reading is real evidence and does not earn the fallback.
+        if still && hrHigh && hrvarHigh && resp == .unmeasured { return "rem" }
         return "light"
     }
 
@@ -1865,23 +2236,24 @@ public enum SleepStager {
         let hrvarHigh = f.hrVar.isFinite && hrvarHi != nil && f.hrVar >= hrvarHi!
         let cardiacActivated = hrHigh || hrvarHigh
         let cardiacActivatedForWake = cardiacSparse ? hrHigh : cardiacActivated
-        let rrvIrregular = f.rrv.isFinite && rrvHi != nil && f.rrv >= rrvHi!
-        let rrvRegular = (!f.rrv.isFinite) || (rrvLo != nil && f.rrv <= rrvLo!)
+        // Same respiration evidence the classifier uses, from the same factory — so the diagnostic cannot
+        // drift from the rule it explains (these predicates were duplicated by hand).
+        let resp = RespEvidence.of(f.rrv, lowBar: rrvLo, highBar: rrvHi)
         let still = f.moveFrac <= stageStillMoveFrac
         let moving = f.moveFrac >= stageWakeMoveFrac
 
         // classifyOne precedence: WAKE, then DEEP, then REM (then REM fallback), else LIGHT.
         // An epoch that wins WAKE or DEEP was never a REM candidate.
         if moving && (cardiacActivatedForWake || !hasHR) { return .wonOtherStage }     // → wake
-        if still && parasympOK && hrLow && rrvRegular { return .wonOtherStage } // → deep
+        if still && parasympOK && hrLow && !resp.contradictsDepth { return .wonOtherStage } // → deep
         // From here the epoch did NOT win wake/deep; it is either REM or falls through to LIGHT.
-        if still && cardiacActivated && rrvIrregular { return .remEligible }
-        if still && hrHigh && hrvarHigh && !f.rrv.isFinite { return .remEligible }
+        if still && cardiacActivated && resp.meetsIrregularBar { return .remEligible }
+        if still && hrHigh && hrvarHigh && resp == .unmeasured { return .remEligible }
         // Not REM → attribute to the FIRST unmet REM precondition (in REM-rule order).
         if !still { return .notStill }
         if !cardiacActivated { return .noCardiacActivation }
-        if f.rrv.isFinite { return .respRegular }       // resp present but not irregular
-        return .noRespFallbackBar                         // resp absent and the no-resp bar unmet
+        if resp != .unmeasured { return .respRegular }   // resp measured but not irregular
+        return .noRespFallbackBar                          // resp never measured and the no-resp bar unmet
     }
 
     /// Read-only REM-funnel triage for ONE in-bed window [start, end] (#688). Re-runs the SAME Stage-0→3
@@ -2186,7 +2558,7 @@ public enum SleepStager {
 
         var waso = 0.0
         var disturbances = 0
-        for s in segs where s.stage == "wake" {
+        for s in segs where SleepStageVocabulary.isWake(s.stage) {
             let w0 = max(Double(s.start), onset)
             let w1 = min(Double(s.end), sptEnd)
             if w1 > w0 { waso += (w1 - w0); disturbances += 1 }

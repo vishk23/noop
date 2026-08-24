@@ -1,7 +1,8 @@
 package com.noop.testcentre
 
 /**
- * The report-completeness guard (Kotlin twin of the Swift ReportCompleteness). A report is only useful
+ * The report-completeness guard. Swift's architectural counterpart is `CaptureCompleteness` (there is no
+ * Swift type named ReportCompleteness). A report is only useful
  * if the active mode's KILLER TRACE actually landed in report.txt. The Test Centre's whole point is that
  * each domain emits one upfront, hard-to-miss line that settles the bug; if a tester toggles a mode but
  * the emitter never fires (strap never connected, no scored day, the import never ran), the .zip looks
@@ -9,15 +10,23 @@ package com.noop.testcentre
  * whether its killer-trace token is present, so a maintainer (and the tester, via the review sheet) sees
  * "Sleep: MISSING" before the report ships rather than after a round-trip.
  *
- * The {domain -> token} map below is the SINGLE source of truth and is byte-identical to the Swift twin
- * (same domains, same token substrings). Each token is the distinctive, stable leading fragment of that
+ * The {domain -> token} map below is the SINGLE source of truth FOR THIS PLATFORM, and is deliberately
+ * NOT byte-identical to Swift's. It cannot be: each side keys on the tokens ITS OWN emitters actually
+ * write, and the two platforms word several of those lines differently. Of the ten killer tokens, four
+ * match Swift exactly, three differ only by a trailing fragment, and three have no counterpart in the
+ * Swift map at all -- import (`import parser=` vs `import stage=`), steps (`stepsEst ` vs `stepsRaw`)
+ * and battery (`battery series=` vs `bank soc=`). Aligning them would break this guard, because the
+ * token has to match the line Android emits. Each token is the distinctive, stable leading fragment of that
  * domain's killer trace (verified against the trace emitters and their unit tests): a SUBSTRING match is
  * deliberate so the per-day / per-record suffix (counts, ids, ISO dates) can vary without breaking the
  * check. The UNIVERSAL token (`dayOwner day=`) rides every export, so it is checked on every report.
  *
  * Pure + side-effect-free (no clock, no IO): the assembler passes the assembled report.txt text and the
  * active-domain set, and gets back the lines to append. No PII (tokens are fixed format fragments). No
- * em-dashes. Tested directly on the JVM, and a parity test pins the map against the Swift twin.
+ * em-dashes. Tested directly on the JVM by ReportCompletenessContractTest, which pins THIS map -- it
+ * does not read the Swift side and cannot detect drift there. Cross-platform parity of the SECTION the
+ * user reads (labels, ordering, present/MISSING wording) is the contract that matters here; identical
+ * tokens are not, and were never achievable.
  */
 object ReportCompleteness {
 
@@ -67,6 +76,29 @@ object ReportCompleteness {
      */
     val evidenceTokens: Map<TestDomain, String> = linkedMapOf(
         TestDomain.SLEEP to "sleep day=",
+        // #1040: CONNECTION's killer token `clockDrift ` is emitted from the strap-clock/history read, so a
+        // connection that never stays up long enough to reach that read cannot produce it — i.e. the worse
+        // the connection bug, the more certainly the Connection capture reads MISSING. #1040 arrived with
+        // 816 reconnects, a log full of `[connection] connect up/down` lines, and `INCOMPLETE: missing
+        // connection` stamped on it, which reads as an unusable capture when it is in fact the report we
+        // want. `reconnect n=` is the token that survives every way a connection can fail: it is emitted
+        // under TestDomain.CONNECTION on BOTH sides of the wasConnected branch — `reconnect n=<n>
+        // reason=<…>` after a link that came up and dropped, and `reconnect n=<n> failedConnect reason=<…>`
+        // when it never reached CONNECTED at all. So it is present precisely when the connection is broken,
+        // in either failure mode.
+        //
+        // Deliberately NOT `bondState`, the Swift twin's second token
+        // (`CaptureCompleteness.tokens[.connection] == ["clockDrift", "bondState"]`): that fires from only
+        // two sites, both on a COMPLETED encrypted bond, so a loop whose bond never completes — a prime
+        // suspect for a ~3 s bounce — would not emit it and the capture would still read MISSING. Nor
+        // `connect up gen=`, which covers a link that comes up and drops but NOT one that never connects,
+        // leaving a whole failure mode still self-invalidating. Swift wants the same widening; tracked with
+        // #1040 rather than diverging its map from here.
+        //
+        // Residual, accepted: a HEALTHY session that never dropped and never synced history has neither
+        // token. That capture reads MISSING as it always has — but it records no connection problem, so it
+        // is not a bug report being obstructed, which is what this rescue exists to prevent.
+        TestDomain.CONNECTION to "reconnect n=",
         // #141: the NIGHTLY HRV trace proves the HRV mode captured, even when the user never took a manual
         // (spot) reading — `hrv rmssd=` only fires on the Live-screen snapshot, but the overnight per-window
         // trace emits `hrv nightSummary …`. So a wear-overnight-and-export HRV capture reads complete.
@@ -112,10 +144,17 @@ object ReportCompleteness {
         sb.append("=== Capture check ===")
         for ((d, status) in statuses) {
             val matched = matchedToken(reportText, d)
+            // #1040: QUOTE the token. These are raw grep literals — they end in `=` or a significant
+            // trailing space (`clockDrift `), so unquoted they render as a dangling fragment: a real
+            // report read `connection: MISSING (expected clockDrift )`, and an evidence match would read
+            // `present (via reconnect n=)`. Quoting makes it unambiguous that the text IS the substring to
+            // search for, which is the whole point of naming it (#386). Does not affect the #950
+            // self-poisoning guard: the bare token still occurs inside the quotes, so the assembler must
+            // keep passing the PRE-append body either way.
             val label = when {
-                status == Status.MISSING -> "expected ${killerTokens[d]}"
-                matched == killerTokens[d] -> matched
-                else -> "via $matched"
+                status == Status.MISSING -> "expected \"${killerTokens[d]}\""
+                matched == killerTokens[d] -> "\"$matched\""
+                else -> "via \"$matched\""
             }
             sb.append('\n')
                 .append(d.id).append(": ").append(status.token)

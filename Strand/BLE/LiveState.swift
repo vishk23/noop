@@ -36,6 +36,20 @@ public final class LiveState: ObservableObject {
     /// per-connection guards (`connectHandshakeDone`, the cmd-notify-confirmed flag) reset on disconnect,
     /// so the next connection can bump this again.
     @Published public var connectSettled: Int = 0
+    /// Has the CURRENT link proven itself — i.e. has the strap actually spoken (any notification), or has
+    /// the connect handshake completed? `connected` alone cannot answer that: BLEManager publishes it the
+    /// instant CoreBluetooth's `didConnect` fires, BEFORE service discovery, so it is true while no
+    /// characteristic exists and no byte has moved. Combined with iOS state restoration handing back a
+    /// peripheral that is `.connected` but dead, that made the Devices card advertise "Active · Live" for a
+    /// strap that was a corpse — the user read "Live" all evening on a band that had flat-lined.
+    ///
+    /// DEFAULTS TRUE, and only BLEManager ever clears it. That is deliberate: `connected` is also driven by
+    /// four non-WHOOP sources (Oura, Huami, FTMS, generic standard-HR), and each of those sets it true only
+    /// once it is genuinely subscribed and receiving. They never touch this flag, so they keep their exact
+    /// current behaviour — an inert `true` — instead of being regressed into looking offline. BLEManager
+    /// clears it at connect/restore, sets it on first data or a completed handshake, and restores the inert
+    /// `true` on disconnect so a stale `false` can't outlive the link and poison the next source.
+    @Published public var linkProven: Bool = true
     /// True ONLY when a non-WHOOP live source (currently the Oura ring) is actively streaming live HR.
     /// This is the green "STREAMING" signal for sources that have no WHOOP-style encrypted bond: it is
     /// DELIBERATELY separate from `bonded`, which carries WHOOP encrypted-bond + buzz semantics (it gates
@@ -54,6 +68,10 @@ public final class LiveState: ObservableObject {
     /// surface for stress/breathing logic that reacts to the most recent arrival (and the standard
     /// 0x2A37 profile, which is the reliable R-R source). Drive it ONLY via `setRRIntervals(_:)`.
     @Published public var rr: [Int] = []
+    /// Monotonic count of R-R packet arrivals, bumped by every `setRRIntervals(_:)` call. Consume
+    /// packets via `onRRPackets` (keyed on this), never by watching `rr` — see RRPacketObserver.swift.
+    /// Twin of Android LiveState.rrSeq.
+    @Published public private(set) var rrSeq: Int = 0
     /// Rolling UI buffer of recent R-R intervals (capped, oldest dropped first). Standard BLE HR
     /// notifications usually carry only one or two intervals per packet, so the Live console needs a
     /// separate short history to render an actually-moving R-R strip / rolling RMSSD. Appended (never
@@ -64,11 +82,23 @@ public final class LiveState: ObservableObject {
     /// GET_EXTENDED_BATTERY_INFO response (#592). Shown on the Devices card as a "x.xx V" readout beside the
     /// percent; nil until the first battery event lands. Twin of the Android LiveState.batteryMv.
     @Published public var batteryMv: Int? = nil
-    /// Charging flag from the strap's BATTERY_LEVEL events — wire observation: u8 bit0 in the
+    /// RAW charging flag from the strap's BATTERY_LEVEL events — wire observation: u8 bit0 in the
     /// event payload (4.0 @26 / 5.0 @30), pushed ~every 8 min on captured links. nil until the
     /// first event of a session; cleared on disconnect so a stale flag can't outlive the link.
     /// Flag ONLY — the battery % keeps its family-specific source (#77).
+    ///
+    /// This is the WIRE value and stays that way (it's what gets persisted). Do not render it directly:
+    /// the 5.0 offset is unverified and has been observed reporting 0 on a strap that was demonstrably
+    /// charging. `chargingEffective` is the value to display — see `StrapChargeInference`.
     @Published public var charging: Bool? = nil
+    /// The charging state worth showing: the raw flag, rescued by a measurably rising SoC when the flag
+    /// stays silent or wrong. Computed (never stored) over the already-`@Published` `charging` +
+    /// `batterySamples`, exactly like `batteryEstimate` — so any view reading it re-renders when either
+    /// witness changes, and there's no third piece of state to keep in sync.
+    public var chargingEffective: Bool? {
+        StrapChargeInference.resolve(flag: charging, samples: batterySamples,
+                                     nowUnix: Int(Date().timeIntervalSince1970))
+    }
 
     /// The Oura ring's current wear/charge state (nil for non-Oura straps or before any evidence this
     /// session). Driven by OuraLiveSource from the live-HR push + the ring's STATE charger strings: a live
@@ -204,6 +234,30 @@ public final class LiveState: ObservableObject {
     /// window can't outlive the link.
     public func clearStrapRange() { strapRange = nil }
 
+    /// The newest record WE'VE actually persisted (max HR ts) — our data frontier. Together with
+    /// `strapRange.newestUnix` (the newest the STRAP holds) this is the backlog: the gap between what the
+    /// strap banked and what we've recovered. BLEManager publishes it from the one place that already reads
+    /// it, the per-session auto-continue decision, so the readout costs no extra store queries.
+    ///
+    /// nil until the first offload session ends, and cleared on disconnect — a stale frontier would make the
+    /// progress readout quote a gap that no longer exists.
+    @Published public private(set) var dataFrontierUnix: Int?
+
+    /// Publish the frontier read during an offload session's continuation decision. nil is a legitimate
+    /// answer (nothing persisted yet) and is stored as such.
+    public func setDataFrontier(_ ts: Int?) { dataFrontierUnix = ts }
+
+    /// What to tell the user about history recovery right now. Computed over the already-`@Published`
+    /// `connected` / `backfilling` / `dataFrontierUnix` / `strapRange`, so a view reading it re-renders when
+    /// any input moves — same pattern as `batteryEstimate`. Internal (not public) because `BackfillProgress`
+    /// is: it's an app-module display type, and its threshold defaults come from `BackfillContinuation`,
+    /// which is internal too. Every consumer (the Today card, the tests via @testable) is in-module.
+    var backfillProgress: BackfillProgress {
+        BackfillProgress.resolve(connected: connected, backfilling: backfilling,
+                                 frontierUnix: dataFrontierUnix,
+                                 strapNewestUnix: strapRange.map { $0.newestUnix > 0 ? $0.newestUnix : nil } ?? nil)
+    }
+
     @Published public var lastFrameType: String? = nil
     @Published public var lastEvent: String? = nil
     /// #987: unix of the most recent strap frame FrameRouter routed. Deliberately NOT @Published - the
@@ -251,11 +305,45 @@ public final class LiveState: ObservableObject {
     /// WhoopBleClient.featureFlagProbe flow.
     @Published public var featureFlagProbe: String? = nil
 
+    /// The WHOOP MG ECG ("Labrador") probe result (or the waiting sentinel), shown + copied in the Devices
+    /// dialog. Cleared on disconnect and on dialog dismiss. Instrumentation only — the text it carries is
+    /// explicitly not a medical measurement.
+    @Published public var ecgProbe: String? = nil
+
+    /// A rendered snapshot of the raw-history reject archive (`RawHistoryArchive.summaryText`), shown +
+    /// copied from the Devices dialog. Purely local: it reads an on-disk file and sends the strap
+    /// nothing. The affordance for checking, straight after an experiment, whether the record you were
+    /// hunting is actually in the archive rather than already evicted. Cleared on dialog dismiss.
+    @Published public var rawHistoryArchiveReport: String? = nil
+
+    /// The 5-generation hardware variant resolved from the strap's Device Information Service
+    /// (`Whoop5Variant.label`: "MG" / "5.0" / "—"), nil before any DIS string has landed. Published so an
+    /// MG-only capability can gate on POSITIVELY identified hardware instead of guessing from a model
+    /// string; `.unknown` is not MG, so a feature stays off until the strap attests. Diagnostic + gating
+    /// only — it never changes how a frame is parsed (see the note on `Whoop5Variant`).
+    @Published public var whoop5Variant: String? = nil
+
     /// #103: the READ-ONLY device-config read report — what `GET_DEVICE_CONFIG_VALUE`(121) and
     /// `GET_FF_VALUE`(128) answer when asked for a key's VALUE (the #761 follow-up), or the waiting
     /// sentinel while the walk runs. Nothing is written to the strap to produce it. Cleared on disconnect
     /// and on dialog dismiss. Twin of the Android WhoopBleClient.deviceConfigProbe flow.
     @Published public var deviceConfigProbe: String? = nil
+
+    /// #174: the R22 DISABLE report — the per-key result of writing `'0'` to the sixteen feature flags and
+    /// reading every one of them back with `GET_FF_VALUE`(128), or the waiting sentinel while the run walks.
+    /// Unlike the two probes above this one DOES write, which is exactly why it reports the value the strap
+    /// stores rather than the write's own ack. Cleared on disconnect and on dialog dismiss. Twin of the
+    /// Android WhoopBleClient.r22DisableReport flow.
+    @Published public var r22DisableReport: String? = nil
+
+    /// #891: the result of the last `enable_raw_data_w_ecg` write, AFTER its mandatory
+    /// `GET_DEVICE_CONFIG_VALUE(121)` read-back — the write's own ack is never reported as the outcome.
+    /// nil until a write is attempted. Like the R22 disable report (and unlike the read-only probes), a
+    /// write interrupted mid-verification by a disconnect is RENDERED here rather than dropped — it has
+    /// already written to the strap — and a completed result persists until the next write or
+    /// `clearEcgRawDataGate()`. Twin of the Android WhoopBleClient.ecgRawDataGate flow.
+    @Published public var ecgRawDataGate: EcgRawDataGateReport? = nil
+
     /// Wrist-wear state from WRIST_ON/WRIST_OFF events. Defaults true so wear-gated features work
     /// before the first event arrives; flipped by FrameRouter on a real event.
     @Published public var worn: Bool = true
@@ -264,6 +352,12 @@ public final class LiveState: ObservableObject {
     /// offload (consecutive empty backfills). Lets the home state read "connected, history sync is
     /// experimental on 5.0" instead of a WHOOP-4-style "not recording"/sync-error. Reset on connect/disconnect.
     @Published public var historySyncExperimental: Bool = false
+
+    /// #612 — true when the WHOOP-4/generic empty-offload streak (`EmptySyncTracker`, `BLEManager`) is
+    /// currently SUSTAINED (3+ consecutive completed-but-empty offloads). Not 5/MG-specific and not
+    /// coupled to HR: a connected strap that keeps handing over nothing has this true regardless of
+    /// whether live HR is streaming. Reset on disconnect; re-derived from the next offload.
+    @Published public var sustainedEmptyOffload: Bool = false
 
     // MARK: - Standard fitness-sensor live metrics (RSC / CSC / CPS — additive, never HR)
     //
@@ -485,6 +579,7 @@ public final class LiveState: ObservableObject {
     /// rolling buffer. `recentLimit` caps the buffer; the oldest intervals fall off first.
     public func setRRIntervals(_ intervals: [Int], recentLimit: Int = 60) {
         rr = intervals
+        rrSeq += 1
         let valid = intervals.filter { $0 > 0 }
         guard !valid.isEmpty else { return }
         rrRecent.append(contentsOf: valid)
@@ -504,6 +599,7 @@ public final class LiveState: ObservableObject {
         recentHrSamples.removeAll()       // Sleep readout buffers must not outlive the link (Group E)
         recentGravitySamples.removeAll()
         clearStrapRange()                 // a stale clock-drift window must not outlive the link either
+        dataFrontierUnix = nil            // …nor a stale frontier, which would quote a gap that's moved on
         lastFrameAtUnix = nil             // #987: a stale "last frame" freshness must not outlive it either
         ouraWearState = nil               // a stale worn/charging badge must not outlive the link either
         // Perf: flush the durable log tail on disconnect (mirroring is batched in `append`), so a completed
@@ -534,6 +630,10 @@ public final class LiveState: ObservableObject {
     private static let trimSlack = 256
 
     public func append(log line: String, domain: TestDomain? = nil) {
+        // FIRST append of this process: rescue the previous process's durable tail into the generation ring
+        // before this process's own `persistTail` overwrites it (see `rollLogGenerationsIfNeeded`). Latched,
+        // so this is one Bool test per line after the first.
+        Self.rollLogGenerationsIfNeeded()
         // Tag inert when nil (today's behaviour, byte-identical). When tagged, prefix a compact,
         // parseable marker the export filters on. Redaction is STILL the only scrub point
         // (redactPii below); tagging happens BEFORE redaction so the scrub covers the whole line.
@@ -594,6 +694,88 @@ public final class LiveState: ObservableObject {
         (UserDefaults.standard.array(forKey: tailKey) as? [String]) ?? []
     }
 
+    // MARK: - Previous-process log generations (the "why did the app stop" record)
+
+    /// WHY THIS EXISTS. The in-memory `log` lives for the life of the PROCESS, and `exportableLogText()`
+    /// renders exactly that — so an export taken after a restart begins at the restart and the lines that
+    /// would explain the restart are gone. Worse, the single durable slot did not survive either: a fresh
+    /// process starts logging and, 32 lines in, `persistTail` OVERWRITES `strapLog.tail` with the new
+    /// (short) array, destroying the previous session's tail before anyone can read it.
+    ///
+    /// That is not hypothetical — it has now cost THREE consecutive overnight Oura captures, each time the
+    /// same way: the app restarted after wake, and the whole night (connection drops, drain timings, the
+    /// `0x6A` lines) was gone by the time the bundle was exported. An unexplained restart is exactly when
+    /// the previous lines matter most.
+    ///
+    /// So: at the first append of each process, the surviving tail is ROLLED into a small ring of previous
+    /// generations (and the live slot cleared, so a generation is never double-counted). Exports render the
+    /// generations oldest-first ahead of the current process, which keeps `report.txt` in chronological
+    /// order — the log-parsing tools read it unchanged, they simply get more of the night.
+    private static let generationsKey = "strapLog.generations"
+    /// How many previous processes to keep. Three covers the observed failure shape (a wake-time restart,
+    /// occasionally two) without turning a debug tail into a database.
+    static let maxLogGenerations = 3
+    /// Per-generation line cap — smaller than the live `tailLimit` because what explains a stop is the END
+    /// of the previous session. 3 × 1,000 short redacted lines ≈ 300 KB of UserDefaults, bounded.
+    static let generationTailLimit = 1_000
+    /// Once-per-process latch: the roll must happen BEFORE the first `persistTail` of this process, and
+    /// exactly once, or a second roll would push this process's own partial tail in as a "previous" one.
+    nonisolated(unsafe) private static var didRollGenerations = false
+
+    /// Roll the surviving durable tail into the generation ring. Idempotent per process, and a NO-OP when
+    /// the tail is empty — so a launch that logs nothing (or a run right after a roll) never pushes an
+    /// empty generation and never evicts a real one.
+    nonisolated static func rollLogGenerationsIfNeeded(now: Date = Date()) {
+        if didRollGenerations { return }
+        didRollGenerations = true
+        let tail = persistedLogTail()
+        guard !tail.isEmpty else { return }
+        let iso = ISO8601DateFormatter()
+        iso.timeZone = TimeZone(identifier: "UTC")
+        // The stamp is when the roll happened (i.e. this launch), NOT when those lines were written — the
+        // lines carry their own clock. Said plainly in the text so nobody reads it as the session's end.
+        let clipped = tail.count > generationTailLimit ? Array(tail.suffix(generationTailLimit)) : tail
+        // Say the KEPT count, and say so when the head was dropped. The header used to report only
+        // `tail.count` (the pre-clip total), so a generation that had lost its first 1,000 lines still
+        // announced "2,000 line(s)" and read as a complete session — a reader (or a log tool) then
+        // measures the missing head as silence. Both numbers are printed: the pre-clip total is what
+        // tells anyone how much is gone.
+        let count = clipped.count == tail.count
+            ? "\(tail.count) line(s)"
+            : "\(clipped.count) of \(tail.count) line(s), head clipped"
+        let header = "===== previous app session, \(count), rolled at "
+            + iso.string(from: now) + " (this launch) ====="
+        var gens = persistedLogGenerations()
+        gens.append([header] + clipped)
+        if gens.count > maxLogGenerations { gens.removeFirst(gens.count - maxLogGenerations) }
+        UserDefaults.standard.set(gens, forKey: generationsKey)
+        // Clear the live slot: this tail now belongs to a generation, and leaving it would duplicate it in
+        // every export until 32 fresh lines happen to overwrite it.
+        UserDefaults.standard.set([String](), forKey: tailKey)
+    }
+
+    /// The stored generations, oldest-first. Each element's first line is its own separator header.
+    nonisolated static func persistedLogGenerations() -> [[String]] {
+        (UserDefaults.standard.array(forKey: generationsKey) as? [[String]]) ?? []
+    }
+
+    /// The previous processes' lines, oldest-first, ready to sit AHEAD of the current session in an export.
+    /// Empty string when there are none, so a caller can concatenate unconditionally.
+    nonisolated static func previousSessionsText() -> String {
+        let gens = persistedLogGenerations()
+        guard !gens.isEmpty else { return "" }
+        return gens.map { $0.joined(separator: "\n") }.joined(separator: "\n") + "\n"
+            + "===== current app session =====\n"
+    }
+
+    /// Drop every stored generation (Settings → the same place the log is cleared from).
+    nonisolated static func clearLogGenerations() {
+        UserDefaults.standard.removeObject(forKey: generationsKey)
+    }
+
+    /// Tests only: clear the once-per-process latch so a test can stand in for a fresh app launch.
+    nonisolated static func resetGenerationRollLatchForTesting() { didRollGenerations = false }
+
     /// A shareable strap-log body sourced from the DURABLE tail, for a background / scheduled export that
     /// runs with no live `LiveState` instance. Mirrors `exportableLogText()`'s header so a scheduled drop
     /// reads the same as a manual share; falls back to the live `log` is not available here by design
@@ -609,7 +791,9 @@ public final class LiveState: ObservableObject {
             + ProcessInfo.processInfo.operatingSystemVersionString + "\n"
         if !extraHeaderLines.isEmpty { header += extraHeaderLines.joined(separator: "\n") + "\n" }
         header += String(repeating: "-", count: 40) + "\n"
-        return header + persistedLogTail().joined(separator: "\n")
+        // Same generations-then-current shape as `exportableLogText()`: a scheduled drop that fires after a
+        // restart must not report only the (possibly empty) current tail.
+        return header + previousSessionsText() + persistedLogTail().joined(separator: "\n")
     }
 
     /// Scrub personal identifiers from a strap-log line so it's safe to share publicly (#445): BLE MAC
@@ -642,6 +826,12 @@ public final class LiveState: ObservableObject {
     /// session log. Shared so BOTH the Live screen's log card AND a macOS Settings shortcut (#507 — a 4.0
     /// owner couldn't find the log on Mac) build the SAME text. Call on the main thread (button taps).
     func exportableLogText(extraHeaderLines: [String] = []) -> String {
+        // #1263: roll here too, not only in `append`. A restart's export is the whole point of the
+        // generation ring, and a user can open the app and tap Report BEFORE this process logs its first
+        // line — at which point the previous session is still in `tailKey` (unrolled) and the in-memory
+        // `log` is empty, so `previousSessionsText()` below would miss it. The roll is latched + a no-op on
+        // an empty tail, so this is harmless when `append` already ran.
+        Self.rollLogGenerationsIfNeeded()
         let v = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "?"
         #if os(iOS)
         let osName = "iOS"
@@ -653,9 +843,15 @@ public final class LiveState: ObservableObject {
         #if os(iOS)
         let diagLines = IOSDiagnostics.capture().summaryLines()
         if !diagLines.isEmpty { header += diagLines.joined(separator: "\n") + "\n" }
+        // #1578: what the Apple Health observer path cost this session. Silent unless it ran, so a log from
+        // someone with Health off or unauthorized is unchanged.
+        let healthLines = HealthSyncStats.summaryLines()
+        if !healthLines.isEmpty { header += healthLines.joined(separator: "\n") + "\n" }
         #endif
         if !extraHeaderLines.isEmpty { header += extraHeaderLines.joined(separator: "\n") + "\n" }
         header += String(repeating: "-", count: 40) + "\n"
-        return header + log.joined(separator: "\n")
+        // Previous processes first, so the body stays in chronological order and the log-parsing tools read
+        // it unchanged — they just get the night that a wake-time restart used to erase.
+        return header + Self.previousSessionsText() + log.joined(separator: "\n")
     }
 }

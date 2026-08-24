@@ -3,7 +3,7 @@ import Foundation
 /// A generic OpenAI-compatible provider pointed at a user-set base URL — e.g. a local LLM server such
 /// as Ollama, LM Studio or llama.cpp (`http://localhost:11434/v1`), or any self-hosted gateway. Speaks
 /// the OpenAI chat-completions wire format against `AIProvider.custom` endpoints. The API key is
-/// optional — local servers usually need none — so the `Authorization` header is sent only when set.
+/// optional — local servers usually need none — so the configured auth header is sent only when set.
 struct CustomClient: AIProviderClient {
 
     func send(
@@ -36,10 +36,11 @@ struct CustomClient: AIProviderClient {
     /// IGNORES `num_ctx` on the `/v1` endpoint) truncate silently — no error, the text just stops
     /// mid-sentence. We can't raise the window over the OpenAI wire format, so we make the cutoff
     /// visible and tell the user exactly how to fix it.
-    static let truncationNote = "\n\n---\n*Reply cut off: the model hit its context-window limit. "
-        + "On a local server like Ollama (default 2048 tokens), raise it - create a Modelfile with "
-        + "`PARAMETER num_ctx 8192` and select that model, or set `OLLAMA_CONTEXT_LENGTH=8192` and "
-        + "relaunch Ollama - then ask again.*"
+    // #1074: kept provider-agnostic. The old note gave Ollama-specific `num_ctx` instructions that were
+    // wrong for cloud providers (a DeepSeek user just hit the response-length cap, not a local window).
+    static let truncationNote = "\n\n---\n*Reply cut off at the response-length limit. Ask a more "
+        + "specific question for a shorter, complete answer — or, on a local server (e.g. Ollama), "
+        + "raise its context window.*"
 
     /// Pure: unwrap an OpenAI-compatible chat-completions body into the assistant text. Appends
     /// `truncationNote` when the server stopped early (`finish_reason == "length"`) so a context-
@@ -48,8 +49,9 @@ struct CustomClient: AIProviderClient {
         guard let choices = json["choices"] as? [[String: Any]],
               let first = choices.first,
               let message = first["message"] as? [String: Any],
-              let content = message["content"] as? String else {
-            throw AICoachError.decode
+              let content = (message["content"] as? String)?
+                  .trimmingCharacters(in: .whitespacesAndNewlines), !content.isEmpty else {
+            throw emptyReplyError(json)   // #1074: surface the provider's real error if the 200 body has one
         }
         if (first["finish_reason"] as? String)?.lowercased() == "length" {
             return content + Self.truncationNote
@@ -61,25 +63,37 @@ struct CustomClient: AIProviderClient {
         try AIProvider.guardCustomBaseURL()   // #321: reject a public cleartext Custom URL before egress
         var req = URLRequest(url: AIProvider.custom.modelsEndpoint)
         req.httpMethod = "GET"
-        if !key.isEmpty { req.setValue("Bearer \(key)", forHTTPHeaderField: "Authorization") }
+        AIProvider.applyCustomAuthHeader(key, to: &req)
 
         return parseModels(try await performRequest(req, session: session))
     }
 
-    /// Pure: unwrap an OpenAI-compatible `/models` body into ids. Unlike OpenAI we keep *all* ids —
-    /// a local server names models freely (`llama3.1`, `qwen2.5`, …). No network — unit-tested.
+    /// Pure: unwrap an OpenAI-compatible `/models` body into ids. Unlike OpenAI we keep *all* ids.
+    /// Some enterprise gateways return a catalog (`catalog[].models`) rather than `data[].id`; keep
+    /// those ids too so users do not have to type every supported model by hand.
     func parseModels(_ json: [String: Any]) -> [String] {
-        guard let list = json["data"] as? [[String: Any]] else { return [] }
-        return list.compactMap { row in
-            guard let id = row["id"] as? String, !id.isEmpty else { return nil }
-            return id
+        if let list = json["data"] as? [[String: Any]] {
+            return list.compactMap { row in
+                guard let id = row["id"] as? String, !id.isEmpty else { return nil }
+                return id
+            }
+        }
+        guard let catalog = json["catalog"] as? [[String: Any]] else { return [] }
+        var seen = Set<String>()
+        return catalog.flatMap { row -> [String] in
+            guard let models = row["models"] as? [String] else { return [] }
+            return models.filter { !$0.isEmpty }
+        }.filter { id in
+            if seen.contains(id) { return false }
+            seen.insert(id)
+            return true
         }
     }
 
     // MARK: Private
 
     /// `modernParams`: use `max_completion_tokens`, drop `temperature` — for gateways fronting
-    /// reasoning models. The `Authorization` header is omitted when `key` is empty (local servers).
+    /// reasoning models. The auth header is omitted when `key` is empty (local servers).
     private func chat(
         key: String,
         model: String,
@@ -88,16 +102,18 @@ struct CustomClient: AIProviderClient {
         session: URLSession
     ) async throws -> String {
         var body: [String: Any] = ["model": model, "messages": wire]
+        // #1074: 900 truncated detailed coaching replies mid-sentence on cloud providers; 4096 lets a
+        // full multi-section reply complete (a cap, not a target). Matches the Gemini leg + Android.
         if modernParams {
-            body["max_completion_tokens"] = 900
+            body["max_completion_tokens"] = 4096
         } else {
             body["temperature"] = 0.6
-            body["max_tokens"] = 900
+            body["max_tokens"] = 4096
         }
 
         var req = URLRequest(url: AIProvider.custom.endpoint)
         req.httpMethod = "POST"
-        if !key.isEmpty { req.setValue("Bearer \(key)", forHTTPHeaderField: "Authorization") }
+        AIProvider.applyCustomAuthHeader(key, to: &req)
         req.setValue("application/json", forHTTPHeaderField: "Content-Type")
         req.httpBody = try JSONSerialization.data(withJSONObject: body)
 

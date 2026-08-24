@@ -26,7 +26,7 @@ object AppChangelog {
      * Bump this when you add a release below. The "What's New" sheet shows automatically when the
      * stored last-seen version is behind this. (Decoupled from the bundle version on purpose.)
      */
-    const val CURRENT_VERSION = "9.2.0"
+    const val CURRENT_VERSION = "10.5.0"
 
     data class Release(
         val version: String,
@@ -37,6 +37,78 @@ object AppChangelog {
 
     /** Newest first. */
     val releases: List<Release> = listOf(
+        Release(
+            version = "10.5.0",
+            title = uiString(R.string.l10n_app_changelog_training_load_a_vo_max_without_f9205a67),
+            date = "August 2026",
+            items = listOf(
+                "**Training load — CTL, ATL and form (#1423, #1425).** A Trends card tracks fitness, fatigue and the balance between them, so a hard block and the recovery it needs are both visible.",
+                "**A VO₂max without measuring your waist (#1391).** If NOOP knows your resting heart rate it can estimate VO₂max from age and sex alone, and it says which method it used rather than presenting one number as if there were only one way to get it.",
+                "**Much less battery spent re-scoring (#1005, thanks @bartmuskala).** A per-day cache stops NOOP recomputing days whose data hasn't changed — the single biggest background drain on Android — and \"Low refresh\" now offers hourly syncing at any charge.",
+                "**Apple Health write-back and hourly steps (#1432, thanks @MikaSchultes; #1429).** Workouts can flow back into Apple Health automatically, and iPhone steps import hour by hour with a 90-day backfill.",
+                "**More of the Oura ring read honestly (thanks @pipiche38).** The ring's own breath rate is shown as instrumentation (#1384, #1450), its skin-temp gate now fits a ring's independently-clocked sensors (#1467), and Rhythm says \"no data\" outright on hardware that cannot produce the reading (#1360).",
+            ),
+        ),
+        Release(
+            version = "10.1.0",
+            title = uiString(R.string.l10n_app_changelog_personalized_heart_rate_zones_compare_and_8d89ee2a),
+            date = "August 2026",
+            items = listOf(
+                "**Personalized heart-rate zones (#531).** Set your own BPM thresholds in a Settings editor; every zone read-out, and your .noopbak backup, uses them.",
+                "**Compare and switch between straps (#1300).** A two-strap comparison card correlates two straps you own, and a switcher flips which one is active — without ever mixing their data.",
+                "**More honest HRV and sleep.** An over-counted night's HRV reading is now captioned \"unverified\" (#1118); sleep debt is measured against your personalized need (#1348); and duplicate/​phantom Oura sleep nights are collapsed (#1284).",
+                "**More of your Oura ring decoded (#1384, #1359, thanks @pipiche38).** The ring's own breath rate and step features are decoded and shown as instrumentation — read off the ring, never scored.",
+                "**Polish language, and a truthful empty state.** NOOP now speaks Polish (#1250), and the experimental Rhythm view says \"no data\" honestly when a device can't support the reading (#1360).",
+            ),
+        ),
+        Release(
+            version = "10.0.0",
+            title = uiString(R.string.l10n_app_changelog_make_noop_yours_theme_colours_and_6bdef2a7),
+            date = "August 2026",
+            items = listOf(
+                "**Make NOOP yours (#1171, #1172, #1177, #1234).** Pick a chrome accent — Mint, WHOOP Blue, or a custom colour from a full HSV picker — save a named theme preset that coordinates the accent, charts, backdrop and cards together, and set your own photo as the background behind every tab.",
+                "**Forty-plus more sports, with distance and GPS routes (#1273, #1274, #1202, #1238).** The workout picker gains dozens of sports; a manual workout takes a distance; a GPS workout records live distance and pace; and a finished route exports to GPX or FIT.",
+                "**A 13-week active-calorie heatmap (#1240).** A calendar of your recent effort on the Workouts screen, on both platforms.",
+                "**Choose how the sleep chart looks (#1129, #1283, #1291).** Classic, Fill, Garmin Fill, or Ribbon, each with a colour-coded stage legend, on iPhone, Android and Mac.",
+                "**Pick the app's language (#1181).** A language setting independent of the phone, so NOOP can speak a different language than the rest of your device.",
+            ),
+        ),
+        Release(
+            version = "9.3.1",
+            title = uiString(R.string.l10n_app_changelog_widgets_stop_inventing_numbers_naps_count_4f7491bb),
+            date = "August 2026",
+            items = listOf(
+                "**iPhone widgets showed made-up numbers (#887).** A Home Screen widget that could not read your data fell back to the gallery sample — 72% Charge, 58 bpm, 84% battery — for everyone. It now shows dashes when there is nothing to show, and sample values appear only in the widget gallery.",
+                "**Naps count toward sleep debt (#1041).** A separately-recorded nap now repays debt with its actual asleep minutes. Your debt figure will drop on days you napped, including days already in your history. Rest and the sleep headline still describe the main night only.",
+                "**Manual workouts on a second or re-added strap get their Avg HR back (#836).** A workout logged by hand read its heart rate from a placeholder id, so on a WHOOP 5.0 or a re-paired strap it found an empty window and left Avg HR and Effort blank.",
+                "**A connected strap no longer says it is disconnected (#612).** When the link is up but nothing is arriving, the chip said \"Not recording. Strap not connected\", which was simply false. It now says \"Connected\" and explains what is missing — and on Android that chip, and the score-state card beside it, are finally translated instead of always English.",
+                "**Effort agrees with itself on Today (#1001).** The hero ring knew about the morning's climb while the Key Metrics tile and the chart badge still read the overnight row, so the same day showed 2.3 in one place and 0.5 in two others.",
+            ),
+        ),
+        Release(
+            version = "9.3.0",
+            title = uiString(R.string.l10n_app_changelog_water_and_caffeine_from_apple_health_5123b6b0),
+            date = "July 2026",
+            items = listOf(
+                "**Water and caffeine import themselves (#949).** Log a drink in Apple Health or Health Connect and it shows up in NOOP, kept in its own row so it can never overwrite what you typed by hand. iPhone will ask permission once for the two new data types.",
+                "**Effort is measured more honestly (#963, #983).** Every heart-rate sample is now weighted by its own gap rather than the window's first one, and a saved workout is scored against your measured resting heart rate instead of a hardcoded 60. Your Effort numbers will move — in either direction — including for past days.",
+                "**Oura days no longer spike to 90+ resting heart rate (#375).** A nap or a short fragment could outrank the real night and claim the whole day's numbers. Re-import your Oura history to correct days already stored.",
+                "**Sleep staging can't jump from awake to deep (#348).** A transition no scorer should ever emit is now forbidden outright, which is the part of a larger staging change that survived a clean benchmark.",
+                "**The Updates page scrolls, and its release row opens (#984).** Older entries were unreachable and tapping \"what's new\" did nothing but mark it read, so it looked like the entry had been deleted.",
+            ),
+        ),
+        Release(
+            version = "9.2.1",
+            title = uiString(R.string.l10n_app_changelog_battery_saver_quiets_the_gauges_translated_bdbe8650),
+            date = "July 2026",
+            items = listOf(
+                "**Battery saver stops the animation (#909).** Turn on Low Power Mode or battery saver and the live gauges, sky and pulsing dots settle into a single still frame. On iPhone that was measured at ~18% of a CPU core with the screen just sitting idle, and 0% posed still. It switches the moment you flip the setting — no restart.",
+                "**Android notifications are translated (#867).** Every notification the app sends shipped in English no matter your language — the always-on connection notice, all five battery alerts, the illness, move and smart-alarm alerts, and both notification categories in system settings. All of them now speak German, Spanish, French, Portuguese and Chinese.",
+                "**Today and the day chart open instantly on a long history (#908).** Finding your most recent reading walked every heart-rate row for the strap. On a large store that took four to six seconds every time the screen opened; it now takes hundredths of a second.",
+                "**The pulsing connection dot honours \"Remove animations\" (#909).** It kept pulsing regardless. It doesn't now.",
+                "**Strap logs name every command (#891).** An Android strap log showed a bare `0x8B(139)` where iPhone showed the command's name, and neither platform said whether a command had actually succeeded. Both now do — which is what makes a pasted log useful to anyone reading it.",
+            ),
+        ),
         Release(
             version = "9.2.0",
             title = uiString(R.string.l10n_app_changelog_hrv_accuracy_fix_oura_sleep_and_4ed31e39),
@@ -2540,22 +2612,22 @@ object AppChangelog {
         Expectation(
             icon = Icons.Outlined.Science,
             title = uiString(R.string.l10n_app_changelog_independent_and_experimental_f9b65317),
-            body = "NOOP is a personal, open project - not the WHOOP app, and not affiliated with WHOOP. It reads a strap you own, on your own device. Treat it as a capable work-in-progress rather than a finished product.",
+            body = uiString(R.string.onboarding_expectation_independent_body),
         ),
         Expectation(
             icon = Icons.Outlined.VerifiedUser,
             title = uiString(R.string.l10n_app_changelog_whoop_4_0_is_the_supported_16893d9d),
-            body = "WHOOP 4.0 is tested and works end to end. WHOOP 5.0/MG is newer: live heart rate works today, but deeper metrics (recovery, strain, sleep) for 5/MG are still being figured out. NOOP always tells you what's live versus still building.",
+            body = uiString(R.string.onboarding_expectation_whoop_support_body),
         ),
         Expectation(
             icon = Icons.Outlined.HourglassEmpty,
             title = uiString(R.string.l10n_app_changelog_your_scores_build_over_a_few_41388c54),
-            body = "Live heart rate is instant. Recovery, strain and sleep sharpen as NOOP learns your baseline over your first nights of wear. Want your history now? Import your WHOOP export in Data Sources and it backfills in about a minute.",
+            body = uiString(R.string.onboarding_expectation_scores_body),
         ),
         Expectation(
             icon = Icons.Outlined.Shield,
             title = uiString(R.string.l10n_app_changelog_everything_stays_on_your_device_575125e9),
-            body = "No account, no cloud, no sync. NOOP talks only to your strap and keeps everything local. Your data is yours alone.",
+            body = uiString(R.string.onboarding_expectation_local_body),
         ),
     )
 }

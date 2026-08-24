@@ -82,7 +82,6 @@ private val hydrationAccent: Color
 // The frosted translucent near-black the hydration vessel floats on (mock rgba(13,14,20,.80)), so the vessel
 // + the white count-up litre figure read crisp over the day-of-sky. Radius 26 + a white@0.11 hairline give
 // the frosted-glass edge. Same numbers as the liquid Today heroCard (TodayScreen.kt LIQUID_HERO_*).
-private val LIQUID_HERO_FILL: Color = Color(red = 13f / 255f, green = 14f / 255f, blue = 20f / 255f, alpha = 0.80f)
 private val LIQUID_HERO_RADIUS = 26.dp
 
 /** Upper bound (ml) for a single custom hydration log (#798) - a sane cap so a stray digit can't bank an
@@ -124,9 +123,13 @@ fun HydrationScreen(viewModel: AppViewModel) {
     var history by remember { mutableStateOf<List<Pair<String, Double>>>(emptyList()) }
     // A simple reload key the log taps bump so the LaunchedEffect re-reads the store.
     var reloadTick by remember { mutableStateOf(0) }
+    // #949: water imported from Health Connect. Already part of [totalMl]; read separately so the screen
+    // can name where it came from rather than leaving an unexplained jump in the day figure.
+    var importedMl by remember { mutableStateOf(0.0) }
     LaunchedEffect(reloadTick) {
         totalMl = runCatching { HydrationStore.total(viewModel.repo) }.getOrDefault(0.0)
         history = runCatching { HydrationStore.history(viewModel.repo, days = 7) }.getOrDefault(emptyList())
+        importedMl = runCatching { HydrationStore.importedTotal(viewModel.repo) }.getOrDefault(0.0)
     }
 
     // #798 - the LAST amount logged this session, so the detail can offer a one-tap "Undo" that removes
@@ -181,10 +184,10 @@ fun HydrationScreen(viewModel: AppViewModel) {
     LazyScreenScaffold(
         title = uiString(R.string.l10n_hydration_screen_hydration_bdfb040f),
         subtitle = "Your fluid intake today, on this phone only.",
-        topBackground = if (showDayCycleBackground) { { LiquidScreenSky(fillHeight = skyBehindCards) } } else null,
+        topBackground = screenBackdropSlot(showDayCycleBackground, skyBehindCards),
         // Sky-behind-cards fills the viewport so the transparent cards reveal the sky the whole way
         // down (Today / Trends / Sleep / metric-detail parity - same two prefs, same two behaviours).
-        fullBleedBackground = showDayCycleBackground && skyBehindCards,
+        fullBleedBackground = screenBackdropFullBleed(showDayCycleBackground, skyBehindCards),
     ) {
         // HERO — the day's intake as a LiquidVessel (water in a vessel: the literal fit), with the litre
         // figure counting up over it, floating on the frosted translucent-black liquid hero card so it reads
@@ -195,8 +198,8 @@ fun HydrationScreen(viewModel: AppViewModel) {
                 modifier = Modifier
                     .fillMaxWidth()
                     .clip(RoundedCornerShape(LIQUID_HERO_RADIUS))
-                    .background(LIQUID_HERO_FILL.copy(alpha = LIQUID_HERO_FILL.alpha * CardAppearance.opacity))
-                    .border(1.dp, Color.White.copy(alpha = 0.11f * CardAppearance.opacity), RoundedCornerShape(LIQUID_HERO_RADIUS))
+                    .background(Palette.heroFill.copy(alpha = Palette.heroFill.alpha * CardAppearance.opacity))
+                    .border(1.dp, Palette.heroBorder.copy(alpha = Palette.heroBorder.alpha * CardAppearance.opacity), RoundedCornerShape(LIQUID_HERO_RADIUS))
                     .padding(20.dp),
             ) {
                 Column(
@@ -354,6 +357,28 @@ fun HydrationScreen(viewModel: AppViewModel) {
                                 color = Palette.textPrimary,
                             )
                         }
+                        // #949: name the imported share rather than folding it silently into the figure
+                        // above — otherwise the day total moves on its own after a Health Connect import
+                        // and nothing on screen accounts for it.
+                        if (importedMl > 0.0) {
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                verticalAlignment = Alignment.CenterVertically,
+                            ) {
+                                Spacer(Modifier.width(28.dp))
+                                Text(
+                                    uiString(R.string.l10n_hydration_screen_from_health_connect_4ad037a3),
+                                    style = NoopType.footnote,
+                                    color = Palette.textSecondary,
+                                    modifier = Modifier.weight(1f),
+                                )
+                                Text(
+                                    uiString(R.string.l10n_hydration_screen_totalml_toint_ml_522b262a, importedMl.toInt()),
+                                    style = NoopType.footnote,
+                                    color = Palette.textSecondary,
+                                )
+                            }
+                        }
                         // #798 - undo / correct affordances. "Undo last" appears once something has been logged
                         // this session and removes exactly that container from the day total. "Clear today" zeroes
                         // the day's total outright (the delete-everything correction). Both route through the
@@ -367,12 +392,19 @@ fun HydrationScreen(viewModel: AppViewModel) {
                                     modifier = Modifier.weight(1f),
                                 ) { remove(last) }
                             }
-                            NoopButton(
-                                text = uiString(R.string.l10n_hydration_screen_clear_today_1be870ea),
-                                leadingIcon = Icons.Filled.Delete,
-                                kind = NoopButtonKind.Secondary,
-                                modifier = Modifier.weight(1f),
-                            ) { remove(totalMl.toInt()) }
+                            // #949: clears only what NOOP owns. Passing the COMBINED total here would ask
+                            // the store to subtract imported water from the hand-logged row — the row it
+                            // isn't in — and the button is offered only when there is something of ours
+                            // to clear, so it never sits there doing visibly nothing on an import-only day.
+                            val manualMl = (totalMl - importedMl).toInt()
+                            if (manualMl > 0) {
+                                NoopButton(
+                                    text = uiString(R.string.l10n_hydration_screen_clear_today_1be870ea),
+                                    leadingIcon = Icons.Filled.Delete,
+                                    kind = NoopButtonKind.Secondary,
+                                    modifier = Modifier.weight(1f),
+                                ) { remove(manualMl) }
+                            }
                         }
                     }
                 }

@@ -14,10 +14,10 @@ final class TodayLayoutPrefsTests: XCTestCase {
     func testEncodeDecodeRoundTripsAReorderedList() {
         let reordered: [TodaySection] = [
             .heartRate, .hero, .yourCards, .liveSession, .synthesis, .keyMetrics, .workouts, .recoveryVitals,
-            .journal,
+            .journal, .menstrualCycle, .addedCards,
         ]
         let encoded = TodayLayoutPrefs.encode(reordered)
-        XCTAssertEqual(encoded, "heartRate,hero,yourCards,liveSession,synthesis,keyMetrics,workouts,recoveryVitals,journal")
+        XCTAssertEqual(encoded, "heartRate,hero,yourCards,liveSession,synthesis,keyMetrics,workouts,recoveryVitals,journal,menstrualCycle,addedCards")
         XCTAssertEqual(TodayLayoutPrefs.decodeOrder(encoded), reordered)
     }
 
@@ -28,8 +28,8 @@ final class TodayLayoutPrefsTests: XCTestCase {
         let firstCut = "synthesis,keyMetrics,workouts,heartRate,recoveryVitals,yourCards"
         XCTAssertEqual(
             TodayLayoutPrefs.decodeOrder(firstCut),
-            // journal(8) follows everything saved → appended.
-            [.hero, .liveSession, .synthesis, .keyMetrics, .workouts, .heartRate, .recoveryVitals, .yourCards, .journal]
+            // journal(8) follows everything saved → appended; addedCards(10) is last, appended after it.
+            [.hero, .liveSession, .synthesis, .keyMetrics, .workouts, .heartRate, .recoveryVitals, .yourCards, .menstrualCycle, .journal, .addedCards]
         )
     }
 
@@ -37,7 +37,7 @@ final class TodayLayoutPrefsTests: XCTestCase {
         let partial = "heartRate,synthesis,keyMetrics,recoveryVitals"
         XCTAssertEqual(
             TodayLayoutPrefs.decodeOrder(partial),
-            [.hero, .liveSession, .workouts, .heartRate, .synthesis, .keyMetrics, .recoveryVitals, .yourCards, .journal]
+            [.hero, .liveSession, .workouts, .heartRate, .synthesis, .keyMetrics, .recoveryVitals, .yourCards, .menstrualCycle, .journal, .addedCards]
         )
     }
 
@@ -45,12 +45,39 @@ final class TodayLayoutPrefsTests: XCTestCase {
         let messy = "yourCards,BOGUS,yourCards,heartRate, ,heartRate"
         XCTAssertEqual(
             TodayLayoutPrefs.decodeOrder(messy),
-            [.hero, .liveSession, .synthesis, .keyMetrics, .workouts, .recoveryVitals, .yourCards, .heartRate, .journal]
+            [.hero, .liveSession, .synthesis, .keyMetrics, .workouts, .recoveryVitals, .yourCards, .heartRate, .menstrualCycle, .journal, .addedCards]
         )
     }
 
     func testAllJunkYieldsDefaultOrder() {
         XCTAssertEqual(TodayLayoutPrefs.decodeOrder("nope,,zzz"), TodaySection.defaultOrder)
+    }
+
+    func testHiddenSectionsAreExplicitReversibleAndDeduplicated() {
+        let hidden = TodayLayoutPrefs.decodeHidden("workouts,BOGUS,workouts,journal")
+        XCTAssertEqual(hidden, [.workouts, .journal])
+        XCTAssertEqual(TodayLayoutPrefs.encodeHidden(hidden), "workouts,journal")
+    }
+
+    func testVisibleOrderFiltersHiddenWithoutChangingSavedOrder() {
+        let order = "heartRate,hero,yourCards,liveSession,synthesis,keyMetrics,workouts,recoveryVitals,journal"
+        XCTAssertEqual(
+            TodayLayoutPrefs.visibleOrder(orderRaw: order, hiddenRaw: "hero,workouts"),
+            [.heartRate, .yourCards, .liveSession, .synthesis, .keyMetrics, .recoveryVitals, .menstrualCycle, .journal, .addedCards]
+        )
+        XCTAssertEqual(TodayLayoutPrefs.decodeOrder(order), [
+            .heartRate, .hero, .yourCards, .liveSession, .synthesis, .keyMetrics, .workouts,
+            .recoveryVitals, .menstrualCycle, .journal, .addedCards,
+        ])
+    }
+
+    func testNewOrPreviouslyMissingSectionsDefaultToVisible() {
+        XCTAssertTrue(
+            TodayLayoutPrefs.visibleOrder(
+                orderRaw: "synthesis,keyMetrics,workouts,heartRate,recoveryVitals,yourCards",
+                hiddenRaw: "workouts"
+            ).contains(.journal)
+        )
     }
 
     /// defaultOrder must cover EVERY case: the never-hide merge iterates it, so a case missing from the
@@ -66,7 +93,29 @@ final class TodayLayoutPrefsTests: XCTestCase {
         // Pin the exact wire strings — they must match the Android TodaySection byte-for-byte.
         XCTAssertEqual(
             raws,
-            ["hero", "liveSession", "synthesis", "keyMetrics", "workouts", "heartRate", "recoveryVitals", "yourCards", "journal"]
+            ["hero", "liveSession", "synthesis", "keyMetrics", "workouts", "heartRate", "recoveryVitals", "yourCards", "menstrualCycle", "journal", "addedCards"]
         )
+    }
+
+    func testEditableLayoutHidesAndRestoresWithoutDeleting() {
+        var draft = EditableLayoutDraft(
+            visible: TodaySection.defaultOrder,
+            allItems: TodaySection.defaultOrder
+        )
+
+        draft.hide(.workouts)
+        XCTAssertFalse(draft.visible.contains(.workouts))
+        XCTAssertEqual(draft.hidden, [.workouts])
+
+        draft.show(.workouts)
+        XCTAssertEqual(draft.visible.last, .workouts)
+        XCTAssertTrue(draft.hidden.isEmpty)
+        XCTAssertEqual(Set(draft.visible), Set(TodaySection.defaultOrder))
+    }
+
+    func testEditableLayoutKeepsAtLeastOneItemVisible() {
+        var draft = EditableLayoutDraft(visible: [KeyMetric.hrv], hidden: KeyMetric.defaultOrder.filter { $0 != .hrv })
+        draft.hide(.hrv)
+        XCTAssertEqual(draft.visible, [.hrv])
     }
 }

@@ -16,6 +16,7 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.layout.wrapContentWidth
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -53,6 +54,7 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.noop.ai.AiProvider
 import com.noop.ai.ChatMsg
+import com.noop.ai.CustomAiAuthHeader
 
 /**
  * AI Coach, the single opt-in, bring-your-own-key feature.
@@ -85,10 +87,10 @@ fun CoachScreen(vm: CoachViewModel = viewModel()) {
         // LIQUID SKY BACKDROP (the pilot pattern — LiquidScreenSky.kt): the liquid sky sits behind the
         // header and the cards float over the flat canvas below. Reuses the shared LiquidScreenSky() slot
         // verbatim; when the day-cycle background is off, the scaffold paints the plain surface instead.
-        topBackground = if (showDayCycleBackground) { { LiquidScreenSky(fillHeight = skyBehindCards) } } else null,
+        topBackground = screenBackdropSlot(showDayCycleBackground, skyBehindCards),
         // Sky-behind-cards fills the viewport so the transparent cards reveal the sky the whole way
         // down (Today / Trends / Sleep / metric-detail parity - same two prefs, same two behaviours).
-        fullBleedBackground = showDayCycleBackground && skyBehindCards,
+        fullBleedBackground = screenBackdropFullBleed(showDayCycleBackground, skyBehindCards),
     ) {
         if (!configured) {
             CoachSetup(vm = vm)
@@ -108,6 +110,7 @@ private fun CoachSetup(vm: CoachViewModel) {
     val availableModels by vm.availableModels.collectAsStateWithLifecycle()
     val refreshingModels by vm.refreshingModels.collectAsStateWithLifecycle()
     val customBaseUrl by vm.customBaseUrl.collectAsStateWithLifecycle()
+    val customAuthHeader by vm.customAuthHeader.collectAsStateWithLifecycle()
     var keyInput by remember { mutableStateOf("") }
     val isCustom = provider == AiProvider.CUSTOM
 
@@ -154,6 +157,21 @@ private fun CoachSetup(vm: CoachViewModel) {
                         keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Uri),
                         colors = coachFieldColors(),
                         shape = RoundedCornerShape(14.dp),
+                    )
+                }
+
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Overline(uiString(R.string.l10n_coach_screen_key_header_3f2a9b10))
+                    SegmentedPillControl(
+                        items = CustomAiAuthHeader.entries,
+                        selection = customAuthHeader,
+                        label = { it.displayName },
+                        onSelect = { vm.setCustomAuthHeader(context, it) },
+                    )
+                    Text(
+                        uiString(R.string.l10n_coach_screen_use_bearer_for_most_local_servers_4429ab64),
+                        style = NoopType.footnote,
+                        color = Palette.textSecondary,
                     )
                 }
             }
@@ -229,13 +247,21 @@ private fun CoachChat(vm: CoachViewModel) {
         // Active-provider strip + reset-key affordance.
         NoopCard(padding = 14.dp, tint = Palette.chargeColor) {
             Row(verticalAlignment = Alignment.CenterVertically) {
-                StatePill(title = uiString(R.string.l10n_coach_screen_provider_displayname_model_8b39f761, provider.displayName, model), tone = StrandTone.Accent, showsDot = true)
-                Spacer(Modifier.weight(1f))
+                // The pill takes the flexible space (ellipsizing a long model id); the Disconnect keeps
+                // its intrinsic single-line width so it can never be squeezed into a vertical stack (#1074).
+                StatePill(
+                    title = uiString(R.string.l10n_coach_screen_provider_displayname_model_8b39f761, provider.displayName, model),
+                    tone = StrandTone.Accent, showsDot = true,
+                    modifier = Modifier.weight(1f),
+                )
+                Spacer(Modifier.width(8.dp))
                 val disconnectInteraction = remember { MutableInteractionSource() }
                 Text(
                     uiString(R.string.l10n_coach_screen_disconnect_ed28e068),
                     style = NoopType.caption,
                     color = Palette.textSecondary,
+                    maxLines = 1,
+                    softWrap = false,
                     modifier = Modifier
                         .clip(RoundedCornerShape(50))
                         .liquidPress(disconnectInteraction)
@@ -287,13 +313,18 @@ private fun CoachChat(vm: CoachViewModel) {
             }
         }
 
-        // Error line (red).
-        if (error != null) {
+        // Error line (red). Capture into a stable local first: `error` is a state-backed nullable, and
+        // the `semantics {}` contentDescription is a DEFERRED closure run later during the accessibility
+        // pass — by then a recomposition can have cleared `error`, so `error!!` inside the lambda would
+        // NPE (#1074). The local `errorMsg` is a fixed non-null snapshot the lambda can't null out from
+        // under it.
+        val errorMsg = error
+        if (errorMsg != null) {
             Text(
-                error!!,
+                errorMsg,
                 style = NoopType.subhead,
                 color = Palette.statusCritical,
-                modifier = Modifier.semantics { contentDescription = uiString(R.string.l10n_coach_screen_coach_error_error_ad9c8c46, error!!) },
+                modifier = Modifier.semantics { contentDescription = uiString(R.string.l10n_coach_screen_coach_error_error_ad9c8c46, errorMsg) },
             )
         }
 

@@ -145,8 +145,8 @@ fun Modifier.timeOfDayBackground(
  *  Reduce Motion, so the whole layer is static. One slow loop (~80s) so the system has near-zero work. */
 @Composable
 private fun atmospherePhase(animated: Boolean): Float {
-    val reduced = rememberReduceMotion()
-    if (!animated || reduced) return 0f
+    val renderStill = rememberPoseStill()
+    if (!animated || renderStill) return 0f
     val transition = rememberInfiniteTransition(label = "atmosphere")
     val phase by transition.animateFloat(
         initialValue = 0f,
@@ -233,6 +233,7 @@ private fun DrawScope.drawDawn(w: Float, h: Float, isLight: Boolean) {
 }
 
 // MARK: Day — cleanest of the four: a barely-there cool top-light only.
+@Suppress("UNUSED_PARAMETER") // `w` kept for signature symmetry with drawNight(w, h, isLight)
 private fun DrawScope.drawDay(w: Float, h: Float, isLight: Boolean) {
     drawRect(
         brush = Brush.verticalGradient(

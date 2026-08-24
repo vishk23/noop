@@ -19,6 +19,7 @@ non-negotiable (especially on the Bluetooth path).
 ## Table of contents
 
 - [Ground rules](#ground-rules)
+- [Contributor roles & the issue/PR workflow](#contributor-roles--the-issuepr-workflow)
 - [Repository layout](#repository-layout)
 - [Build & test](#build--test)
 - [The design system is the law](#the-design-system-is-the-law)
@@ -57,6 +58,38 @@ A few principles run through the whole codebase. Internalize them before opening
 
 ---
 
+## Contributor roles & the issue/PR workflow
+
+### Community help vs. maintainer decisions
+
+Community members may help triage issues, answer setup questions, test fixes, or point to existing
+documentation — that participation is welcome and valuable. Unless explicitly stated by the
+repository maintainer, those replies are **community help, not official maintainer decisions**.
+Official project decisions, release calls, security ownership, and merge decisions remain with the
+maintainer.
+
+### How issues and PRs are handled here
+
+NOOP runs a **lightweight, maintainer-judgment workflow**, not a strict issue-first gate. Concretely,
+that means:
+
+- There are no dedicated triage/approval labels (e.g. `needs-triage`, `confirmed-bug`,
+  `approved-feature`, `approved-enhancement`, `needs-review`) and no requirement that a PR link a
+  pre-approved issue via `Closes`/`Fixes`/`Resolves #N` before work can start.
+- Issues and PRs are reviewed and merged at the maintainer's discretion, weighed against the ground
+  rules and safety contracts in this document, rather than moved through a formal multi-stage gate.
+- A PR opened without a matching issue, or an issue without a triage label, is **not** by itself a
+  process violation in this repo. Contributors and any external review or automated check (including
+  strict-gate-style audits) should not treat the absence of gate labels as a contribution failure —
+  it reflects how this project currently runs, not an oversight.
+
+This is a deliberate choice for a small, anonymous, offline project; it may change as the project
+grows, in which case this section and the issue/PR templates will be updated together. Until then,
+opening an issue first to coordinate on anything non-trivial (as this guide recommends throughout) is
+still the best way to avoid wasted work — it's just not an enforced gate.
+
+---
+
 ## Repository layout
 
 The codebase is split into reusable, cross-platform Swift packages plus a thin platform-specific app
@@ -87,8 +120,7 @@ Strand/
 │   ├── StrandImport/           # WHOOP CSV + Apple Health importers
 │   └── StrandDesign/           # SwiftUI design system (palette, components, charts)
 ├── Tools/
-│   └── Backfill/               # `swift run backfill` — re-runs importers into the on-device DB
-├── tools/
+│   ├── Backfill/               # `swift run backfill` — re-runs importers into the on-device DB
 │   └── linux-capture/          # Headless Linux capture workbench (Python/bleak + whoop-decode)
 ├── Fixtures/                   # Sample WHOOP export used by tests
 └── android/                    # Android client — full shipped app (Kotlin/Gradle, separate module)
@@ -105,7 +137,7 @@ Strand/
 | Colors, fonts, motion, cards, charts | `Packages/StrandDesign` | No external UI deps; bridges AppKit/UIKit. |
 | CoreBluetooth, bonding, offload, live state | `Strand/BLE`, `Strand/Collect` | macOS-app layer — wraps the pure packages. |
 | A screen, sidebar item, menu-bar UI, automation | `Strand/Screens`, `Strand/App`, `Strand/System` | App layer. |
-| Capturing strap frames on Linux for protocol RE | `tools/linux-capture` | Python/bleak capture → `whoop-decode`; no Mac/CoreBluetooth. See its [README](../tools/linux-capture/README.md). |
+| Capturing strap frames on Linux for protocol RE | `Tools/linux-capture` | Python/bleak capture → `whoop-decode`; no Mac/CoreBluetooth. See its [README](../Tools/linux-capture/README.md). |
 
 **Rule of thumb:** the more "wire-level" or "math-level" a change is, the deeper into `Packages/` it
 should live, and the more it should be covered by a `swift test` suite that runs without an app, a
@@ -172,12 +204,12 @@ cd Packages/WhoopProtocol
 swift build && swift test                 # decoder + its tests, on Linux
 swift build --product whoop-decode        # the decode CLI → .build/debug/whoop-decode
 
-cd ../../tools/linux-capture
+cd ../../Tools/linux-capture
 python3 -m unittest -v                     # framing/reassembly tests (stdlib only, no bleak)
 ```
 
 Capturing from a real strap on Linux is documented in
-[`../tools/linux-capture/README.md`](../tools/linux-capture/README.md).
+[`../Tools/linux-capture/README.md`](../Tools/linux-capture/README.md).
 
 ### macOS app
 
@@ -500,6 +532,15 @@ Schema lives in `Packages/WhoopStore/Sources/WhoopStore/Database.swift` as a **v
   workout detection), and the CSV / Apple Health importers (including real-export tests).
 - **`Fixtures/`** holds a sample WHOOP export for the import tests; `StrandImport` test resources are
   bundled via the package's `Package.swift`.
+- **The golden decoder oracle is where cross-platform decode parity is pinned.** `decoder_oracle.json`
+  lives in two byte-identical copies (`Packages/WhoopProtocol/Tests/WhoopProtocolTests/Resources/`
+  and `android/app/src/test/resources/`) and both `DecoderOracleTests.swift` and `DecoderOracleTest.kt`
+  run the *same* assertions against it: decoded field VALUES per fixture frame, and the assembled
+  `Streams`/`StreamBatch` shape (per-stream row counts + the emptiness verdict) per fixture batch.
+  Pinning values rather than bytes is the point — the wire bytes are identical on both platforms, so
+  a 32-vs-64-bit or signedness split is invisible to a per-platform fixture-hex test. **Extend the
+  oracle rather than adding a parallel mechanism**; a `coverage` manifest in the file makes silently
+  dropping an assertion a test failure, so adding one means listing it there too.
 - **Prefer pure tests.** Because `WhoopProtocol`, `StrandAnalytics`, and `FrameRouter` are
   framework-free, you can (and should) cover new decode/routing/math with captured frames and
   fixtures rather than requiring a strap.

@@ -57,7 +57,9 @@ Commands use the maverick/puffin envelope NOOP already implements
 ## The enable sequence (`Whoop5Config`)
 
 One `SET_CONFIG` (cmd `0x78`) per flag; the 40-byte body is the flag name as ASCII NUL-padded to 32
-bytes, the value byte (an ASCII `'1'`/`'2'`) at offset 32, then 7 zeros. The exact ordered set, with
+bytes, the value byte (an ASCII `'1'`/`'2'`) at offset 32, then 7 zeros. `SET_CONFIG` is the sender
+enum's name for it on both platforms; the protocol schema calls 120 `SET_FF_VALUE`, so that is what a
+strap log shows when the strap answers one. Same opcode, two names. The exact ordered set, with
 values, is in [`Whoop5Config.swift`](../Packages/WhoopProtocol/Sources/WhoopProtocol/Whoop5Config.swift)
 and [`Whoop5Config.kt`](../android/app/src/main/java/com/noop/protocol/Whoop5Config.kt), golden-tested on
 both platforms. `enable_r22_packets` is the one that opens the type-`0x2F` biometric stream; the rest
@@ -145,13 +147,59 @@ tracking the WHOOP app's own SpO₂ across many nights on **multiple devices** (
 coincidental match), including on the device where the two checked nights currently move opposite.
 Until that clears the bar, SpO₂ stays import-only on the 5.0.
 
+Wire-level facts (no SpO₂ opcode, export vs on-device aggregation, sleep-only product) are also summarised
+in [`PROTOCOL.md` §10](PROTOCOL.md#10-spo₂-on-50--mg--what-the-wire-does-and-does-not-carry). This section
+keeps the **promotion bar** and the harness that measures it.
+
+### `@82` validation checklist (what would promote the candidate)
+
+Only research — never a silent UI flip. A promote of `spo2_candidate_82` → `spo2Pct` needs all of:
+
+1. **Multiple devices / firmwares** (not one lucky strap): the nightly aggregate of in-band (70–100)
+   `@82` samples during `sleep_state = asleep` tracks the official app or CSV `blood_oxygen_pct` with
+   real night-to-night spread (not a flat 98 %).
+2. **Offset specificity:** nearby bytes (the 74–92 scan the harness already runs) must *not* track
+   better than `@82`.
+3. **Incomplete nights:** when the export omits SpO₂, the wire candidate should be empty or
+   out-of-band — not invent a number. This is a falsification test: an "always 97 %" decoder fails it.
+4. **Resolution of the #103 contradiction** on the original capture device (or a documented
+   extraction / phase / duty-cycle error on one side).
+5. **No recovery / illness gating** on the candidate until (1)–(4) clear — same rule as other
+   derived biosignals.
+
+The multi-device tool below implements the **measurable** half of this list: default gates include
+≥5 paired nights, export range ≥1 %, r ≥ 0.7, MAE ≤ 1.0, best offset = 82, in-band value variance,
+and duty-window coverage (with `feature_absent` when a long-enough asleep capture never emits `@82`).
+Points 4–5 stay human judgment on [#103](https://github.com/ryanbr/noop/issues/103).
+
+Until that bar is met, SpO₂ stays **import-only** on the 5.0, with `@82` available as instrumentation
+for owners who opt into deep-timeline / experimental logging.
+
+Related capability / UX roadmap: [#761](https://github.com/ryanbr/noop/issues/761) (honest labels when
+SpO₂ / skin temp / stages are unavailable vs experimental).
+
+### Band sleep flag vs hypnogram (quick reference)
+
+v18 byte `@81` high nibble is the strap's **coarse on-device sleep flag** (decoded as `sleep_state`):
+
+| High nibble | Name | Meaning |
+|------------:|------|---------|
+| 0 | wake | awake / active |
+| 1 | still | on-wrist still (not yet scored as sleep) |
+| 2 | asleep | scored night / sleep window |
+| 3 | up | post-sleep up |
+
+Useful for sleep *detection* and for gating sleep-only products (including SpO₂ candidates). It is
+**not** Light / SWS / REM — those stages are off-band. Full field notes live with the historical
+decode in `Interpreter.swift` / the Android twin.
+
 ### Multi-device validation tool (`validate_spo2_candidate.py`)
 
-To make that bar concrete and privacy-preserving, `tools/linux-capture/validate_spo2_candidate.py`
+To make that bar concrete and privacy-preserving, `Tools/linux-capture/validate_spo2_candidate.py`
 turns one or more `(capture.json, WHOOP export)` pairs into a promote checklist:
 
 ```bash
-cd tools/linux-capture
+cd Tools/linux-capture
 python3 validate_spo2_candidate.py capture.json my_whoop_data/ --device strap-a --postable
 python3 validate_spo2_candidate.py --batch devices.json --postable
 ```
@@ -203,7 +251,7 @@ per-night values — HRV, resting HR, skin temperature, SpO₂, respiratory rate
 in the capture. Searching each record type for the byte offset + encoding that reproduces those known
 values across every night pins the field without guesswork.
 
-Three stdlib tools in [`tools/linux-capture/`](../tools/linux-capture/) do this:
+Three stdlib tools in [`Tools/linux-capture/`](../Tools/linux-capture/) do this:
 
 - **`hci_extract.py`** converts a phone HCI log (iOS `.pklg` / Android `btsnoop_hci.log`) of the
   official app into the project's `capture.json` frame format — so an official-app full-sync capture
@@ -233,9 +281,10 @@ lands in `parseFrameWhoop5` / `whoop_protocol.json`.
    same iOS-HCI approach the [judes.club write-up](https://judes.club/writing/cracking-the-whoop-5-bluetooth-protocol/)
    used. Filter to just the WHOOP peripheral and attach it to [#103](https://github.com/ryanbr/noop/issues/103).
 5. **SpO₂ multi-device check:** after you have a history capture + your data export, run
-   `python3 tools/linux-capture/validate_spo2_candidate.py capture.json export/ --device <label> --postable`
+   `python3 Tools/linux-capture/validate_spo2_candidate.py capture.json export/ --device <label> --postable`
    and paste the postable summary on [#103](https://github.com/ryanbr/noop/issues/103). Keep the capture
-   and CSV private; only the aggregate r / MAE / checklist line is needed.
+   and CSV private; only the aggregate r / MAE / checklist line is needed. See the **`@82` validation
+   checklist** above for what “PASS” is meant to mean before any promote.
 
 Credit to **judes.club**, **Asherlc/dofek**, and **b-nnett/goose** for the public protocol work this
 builds on.

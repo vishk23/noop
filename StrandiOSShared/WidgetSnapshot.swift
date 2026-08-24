@@ -11,13 +11,20 @@ public struct WidgetSnapshot: Codable, Equatable {
     public var updated: Date
     // Richer glance fields (#446). All OPTIONAL with nil defaults so a snapshot written by an OLDER app
     // build (which never encoded these keys) still decodes — Codable fills a missing optional with nil.
-    public var effort: Int?      // Effort / strain on NOOP's 0–100 axis
+    public var effort: Int?      // Effort / strain on NOOP's 0–100 axis (ring fill is always this / 100)
     public var rest: Int?        // Rest (sleep_performance) score, 0–100
     public var hrv: Int?         // HRV (ms), whole-number for the glance
     public var restingHr: Int?   // Resting heart rate (bpm)
+    // #313 Effort scale for the glance. Pre-formatted at publish time because the widget extension
+    // cannot read the app's plain UserDefaults `effort.scale` key (it lives outside the App Group).
+    // When nil (older snapshot), the widget falls back to whole-number `effort` on the 0–100 axis.
+    public var effortDisplay: String?
+    /// True when `effortDisplay` is on WHOOP's 0–21 axis; false/nil means 0–100. Accessibility only.
+    public var effortWhoop: Bool?
 
     public init(recovery: Int?, bpm: Int?, batteryPct: Int?, bonded: Bool, updated: Date,
-                effort: Int? = nil, rest: Int? = nil, hrv: Int? = nil, restingHr: Int? = nil) {
+                effort: Int? = nil, rest: Int? = nil, hrv: Int? = nil, restingHr: Int? = nil,
+                effortDisplay: String? = nil, effortWhoop: Bool? = nil) {
         self.recovery = recovery
         self.bpm = bpm
         self.batteryPct = batteryPct
@@ -27,6 +34,8 @@ public struct WidgetSnapshot: Codable, Equatable {
         self.rest = rest
         self.hrv = hrv
         self.restingHr = restingHr
+        self.effortDisplay = effortDisplay
+        self.effortWhoop = effortWhoop
     }
 
     /// App Group suite the app and widget both use. Injected from the `APP_GROUP_ID` build setting
@@ -39,10 +48,40 @@ public struct WidgetSnapshot: Codable, Equatable {
     /// key is somehow absent (each process reads its OWN bundle, so the app and the widget extension
     /// each carry the key in their generated Info.plist).
     public static let suiteName: String = {
-        Bundle.main.object(forInfoDictionaryKey: "AppGroupIdentifier") as? String
-            ?? "group.com.noopapp.noop"
+        resolveSuiteName(infoDictionary: Bundle.main.infoDictionary ?? [:])
     }()
     public static let storageKey = "noop.widget.snapshot"
+
+    /// Resolve the App Group the current signature actually grants.
+    ///
+    /// AltStore / SideStore must make every App Group unique to the user's signing team. During
+    /// re-signing they append the team identifier to the group requested by the downloaded app and
+    /// publish the resulting, provisioned identifiers in `ALTAppGroups` in each bundle's Info.plist.
+    /// Reading only the build-time `AppGroupIdentifier` therefore points at an unprovisioned container
+    /// in a sideloaded build, even though the host app and widget extension were both signed correctly.
+    ///
+    /// Normal Xcode builds don't carry `ALTAppGroups`, so they keep using `AppGroupIdentifier`.
+    static func resolveSuiteName(infoDictionary: [String: Any]) -> String {
+        let configured = (infoDictionary["AppGroupIdentifier"] as? String)?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let altGroups = (infoDictionary["ALTAppGroups"] as? [String])?
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { $0.hasPrefix("group.") && !$0.isEmpty } ?? []
+
+        if let configured, !configured.isEmpty,
+           let provisioned = altGroups.first(where: {
+               $0 == configured || $0.hasPrefix(configured + ".")
+           }) {
+            return provisioned
+        }
+        if altGroups.count == 1, let provisioned = altGroups.first {
+            return provisioned
+        }
+        if let configured, !configured.isEmpty {
+            return configured
+        }
+        return "group.com.noopapp.noop"
+    }
 
     /// Debug-only canary: trips on the first run after a misprovisioning so the silent no-op gets
     /// caught immediately rather than masquerading as "widget shows nothing yet." Release builds do
@@ -53,8 +92,17 @@ public struct WidgetSnapshot: Codable, Equatable {
     }
 
     public static var placeholder: WidgetSnapshot {
+        // Gallery / pre-publish stand-in: realistic Charge · Effort · Rest on the 0–100 axis so the
+        // three-ring Home Screen layouts (and the large grid) preview with filled arcs, not dashes.
         WidgetSnapshot(recovery: 72, bpm: 58, batteryPct: 84, bonded: true, updated: Date(),
-                       effort: 8, rest: 81, hrv: 64, restingHr: 52)
+                       effort: 38, rest: 81, hrv: 64, restingHr: 52,
+                       effortDisplay: "38", effortWhoop: false)
+    }
+
+    /// Honest runtime state when the app has not published a readable snapshot yet. Unlike
+    /// `placeholder`, this is user-visible and must never imply that sample data is real.
+    static var unavailable: WidgetSnapshot {
+        WidgetSnapshot(recovery: nil, bpm: nil, batteryPct: nil, bonded: false, updated: .distantPast)
     }
 
     /// Read the last-published snapshot from the shared suite, if any.
@@ -70,5 +118,36 @@ public struct WidgetSnapshot: Codable, Equatable {
         guard let defaults = UserDefaults(suiteName: WidgetSnapshot.suiteName),
               let data = try? JSONEncoder().encode(self) else { return }
         defaults.set(data, forKey: WidgetSnapshot.storageKey)
+    }
+
+    /// Whether publishing `next` would change anything the widget actually renders. `updated` is
+    /// deliberately excluded: no widget family displays it, and treating a fresh timestamp as content
+    /// would defeat deduplication because every otherwise-identical build creates a new date.
+    ///
+    /// Shared by the full score publish and the live-only fast path so a redundant foreground, repository,
+    /// battery, or connection signal does not rewrite App-Group defaults and ask WidgetKit to rebuild an
+    /// identical timeline. nil means the app has never published, so the first snapshot always writes.
+    static func renderedContentChanged(from previous: WidgetSnapshot?, to next: WidgetSnapshot) -> Bool {
+        guard let previous else { return true }
+        return previous.recovery != next.recovery
+            || previous.bpm != next.bpm
+            || previous.batteryPct != next.batteryPct
+            || previous.bonded != next.bonded
+            || previous.effort != next.effort
+            || previous.rest != next.rest
+            || previous.hrv != next.hrv
+            || previous.restingHr != next.restingHr
+            || previous.effortDisplay != next.effortDisplay
+            || previous.effortWhoop != next.effortWhoop
+    }
+
+    /// A live-only update may reuse score fields only within the same local calendar day. At rollover,
+    /// the full publisher must resolve `Repository.widgetAnchor` again so yesterday's Charge/Rest cannot
+    /// be carried forward indefinitely by a stream of HR updates. Calendar is injectable for deterministic
+    /// tests; production uses the user's current calendar and time zone.
+    static func liveUpdateRequiresFullBuild(previous: WidgetSnapshot?, now: Date,
+                                            calendar: Calendar = .current) -> Bool {
+        guard let previous else { return true }
+        return !calendar.isDate(previous.updated, inSameDayAs: now)
     }
 }

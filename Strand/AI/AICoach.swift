@@ -115,6 +115,7 @@ enum AICoachError: LocalizedError {
     case server(Int, String)
     case network(String)
     case decode
+    case emptyReply(String)   // #1074: verbatim provider-error / empty-reply text (byte-parity with Android emptyReplyMessage)
     case keySaveFailed
     case badCustomURL(String)
 
@@ -139,6 +140,8 @@ enum AICoachError: LocalizedError {
             return "Network problem: \(detail). The coach is the only feature that needs the internet."
         case .decode:
             return "Couldn't read the provider's reply. Try again."
+        case .emptyReply(let message):
+            return message
         }
     }
 }
@@ -182,6 +185,9 @@ final class AICoachEngine: ObservableObject {
     /// local LLM server. Only used when `provider == .custom`. Persisted so it survives relaunch.
     @Published var customBaseURL: String {
         didSet { UserDefaults.standard.set(customBaseURL, forKey: AIProvider.customBaseURLKey) }
+    }
+    @Published var customAuthHeader: CustomAIAuthHeader {
+        didSet { UserDefaults.standard.set(customAuthHeader.rawValue, forKey: AIProvider.customAuthHeaderKey) }
     }
     /// Whether the user has committed the Custom provider (tapped Connect with a base URL). Lets the
     /// keyless local path reach the chat without a stored key, while avoiding a flip mid-typing.
@@ -303,6 +309,7 @@ final class AICoachEngine: ObservableObject {
 
         self.dataConsent = UserDefaults.standard.bool(forKey: Self.consentKey)
         self.customBaseURL = UserDefaults.standard.string(forKey: AIProvider.customBaseURLKey) ?? ""
+        self.customAuthHeader = AIProvider.customAuthHeader
         self.customConnected = UserDefaults.standard.bool(forKey: Self.customConnectedKey)
         self.includeOnDeviceSignals = UserDefaults.standard.bool(forKey: Self.onDeviceSignalsKey)
     }

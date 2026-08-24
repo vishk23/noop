@@ -10,10 +10,56 @@ public struct HRSample: Equatable, Codable {
     public init(ts: Int, bpm: Int) { self.ts = ts; self.bpm = bpm }
 }
 
+/// WHICH sensor channel produced an R-R interval (#1071).
+///
+/// A WHOOP strap has ONE beat source, so its rows carry no channel (nil) and nothing here changes for
+/// them. An Oura ring has more than one: the green-quality tag (0x80) and the SpO2 tag (0x6E) both
+/// decode to R-R and both were stored, so the table held roughly TWO complete copies of every night —
+/// not duplicate rows to de-duplicate, but the SAME heartbeats measured twice. Labelling the channel is
+/// what lets scoring read one copy while both stay on disk as each other's cross-check.
+///
+/// The raw values are the DURABLE, cross-platform storage codes for `rrInterval.srcChannel` and must
+/// stay in lockstep with Kotlin `RrSourceChannel` — they are written to SQLite and cross the `.noopbak`
+/// boundary, so they are a wire format, not an implementation detail. Never renumber a case; only append.
+public enum RRSourceChannel: Int, Equatable, Codable, Sendable, CaseIterable {
+    /// Oura 0x80 `green_ibi_quality_event` — the green-LED beat train, gated on the ring's own
+    /// `quality == 1` flag and a 300-2000 ms physiological window, running the whole night.
+    case greenQuality = 1
+    /// Oura 0x6E `spo2_ibi_and_amplitude_event` — the SpO2/red-channel beat train, on an 8 ms
+    /// quantisation grid with no quality gate, and present ONLY while SpO2 measurement is running.
+    case spo2Ibi = 2
+    /// Oura 0x60 `ibi_and_amplitude_event` — the bit-packed IBI+amplitude family.
+    case ibiAmplitude = 3
+    /// Oura 0x44 `ibi_event` — the SAME bit-packed layout family as 0x60, decoded by the same routine,
+    /// but a DIFFERENT tag on the wire.
+    ///
+    /// Split out (#1071 follow-up) because both tags used to stamp `ibiAmplitude`, which made them
+    /// indistinguishable once stored: a capture showing that channel over-covering its own wall-clock
+    /// could not say whether one tag repeats beats or two tags report the same beats to each other. That
+    /// is the question the channel choice for scoring rests on, and no stored night could answer it.
+    /// Labelling only — both are read exactly as before.
+    case ibiBare = 4
+}
+
 public struct RRInterval: Equatable, Codable {
     public let ts: Int          // wall-clock unix seconds
     public let rrMs: Int
-    public init(ts: Int, rrMs: Int) { self.ts = ts; self.rrMs = rrMs }
+    /// The sensor channel this beat came from, or nil when the source does not distinguish one (every
+    /// WHOOP row, and every row written before the column existed). See `RRSourceChannel`.
+    public let srcChannel: RRSourceChannel?
+    /// #1008 diagnostics: this beat's EMISSION ORDER within the batch that delivered it, as stored in
+    /// `rrInterval.ord`. nil on a decode (nothing has been stored yet) and on rows written before the
+    /// column was surfaced to reads.
+    ///
+    /// It is the one field that separates the two remaining explanations for a second carrying seven
+    /// beats: contiguous ords mean ONE record's array carried them all, so the over-count is in the
+    /// record's contents; repeated or non-monotonic ords mean SEPARATE deliveries each contributed to
+    /// that second, so the over-count is accumulation across offloads. WHOOP's wire format has no
+    /// channel field, so `srcChannel` can never answer this for a strap — `ord` is what is left.
+    public let ord: Int?
+    public init(ts: Int, rrMs: Int, srcChannel: RRSourceChannel? = nil, ord: Int? = nil) {
+        self.ts = ts; self.rrMs = rrMs; self.srcChannel = srcChannel; self.ord = ord
+    }
 }
 
 public extension Array where Element == RRInterval {
@@ -282,7 +328,12 @@ public struct SleepStateSample: Equatable, Codable {
 public struct PpgWaveformSample: Equatable, Codable, Sendable {
     public let ts: Int          // wall-clock unix seconds (one record per second)
     public let samples: [Int]   // raw i16 ADC counts @24 Hz, verbatim from `ppg_waveform` (usually 24)
-    public init(ts: Int, samples: [Int]) { self.ts = ts; self.samples = samples }
+    public let burstIndex: Int?  // raw per-burst counter @21; nil for legacy archives
+    public init(ts: Int, samples: [Int], burstIndex: Int? = nil) {
+        self.ts = ts
+        self.samples = samples
+        self.burstIndex = burstIndex
+    }
 }
 
 /// One wire slot in the 5/MG v18 auxiliary-field record. The `rawValue` is the slot's bit position in
@@ -483,6 +534,45 @@ public struct V18AuxSample: Equatable, Codable, Sendable {
     public var isEmpty: Bool { slotValues.allSatisfy { $0 == nil } }
 }
 
+/// The in-band window for the `@82` SpO2 candidate byte: a value in `70...100` is a MEASUREMENT, and
+/// everything else on that byte is something else entirely.
+///
+/// `@82` is MULTIPLEXED and separable BY VALUE — this is the separation, established over 626,725
+/// production records:
+///   - `70...100`  a real percentage. Distribution modes at 97; per-night medians 94-97; sleep-gated;
+///                 emitted as a run of ~30 one-second samples once per ~1,200 s.
+///   - bit 7 set   status sentinel (`0x80`, `0x88`, `0x90`, `0xA0`, `0xA8` are the observed values).
+///   - `1...69`    diagnostic codes, not a saturation of anything.
+///   - `0`         the strap emitted nothing this second (awake, or between runs).
+///   - `101...127` never observed — the gap is what makes the bit-7 sentinels and the measurements
+///                 unambiguously separable without a side channel.
+///
+/// This is the SAME window `Interpreter` applies when it emits `spo2_candidate_82` (see the
+/// `(70...100).contains(v)` gate there) and the same one `AnalyticsEngine.nightlySpo2CandidateMean`
+/// applies. Named here so the three agree structurally rather than by three matching literals.
+public let spo2CandidateInBand: ClosedRange<Int> = 70...100
+
+/// One in-band `@82` SpO2 percentage, durably banked (v34).
+///
+/// WHY THIS EXISTS AS ITS OWN STREAM. The byte is carried raw in `V18AuxSample.auxByte82`, but
+/// `v18AuxSample` is a rolling capped table (`WhoopStore.v18AuxRetentionRows` = 604,800 rows/device ≈ 7
+/// days at 1 Hz) because the aux blob costs ~30 MB/day. The SpO2 signal inside it is ~2,000 samples per
+/// WEEK — roughly 100k rows/year — so pulling it into its own narrow table makes it retainable forever at
+/// trivial cost, while the wide aux capture stays capped. Without this, every SpO2 reading older than
+/// seven days is destroyed, and the strap has already trimmed its own copy.
+///
+/// LOSSLESS BY CONSTRUCTION. `pct` is the raw in-band byte, verbatim. No run grouping, no ramp trimming,
+/// no smoothing, no dedupe beyond the (deviceId, ts) primary key. Those are all READ-TIME policies — the
+/// cloud reader has already changed its run/ramp rules once, and a device store that had baked the old
+/// policy in would have destroyed the evidence needed to change them. The only thing applied on the way
+/// in is the `spo2CandidateInBand` demultiplex, which is not a policy but the definition of which values
+/// on this byte are percentages at all.
+public struct Spo2PctSample: Equatable, Codable, Sendable {
+    public let ts: Int    // wall-clock unix seconds (one per strap-second that carried a reading)
+    public let pct: Int   // the raw in-band `@82` byte, 70...100
+    public init(ts: Int, pct: Int) { self.ts = ts; self.pct = pct }
+}
+
 public struct Streams: Equatable, Codable {
     public var hr: [HRSample]
     public var rr: [RRInterval]
@@ -523,6 +613,29 @@ public struct Streams: Equatable, Codable {
     /// The #547 gate discards them like any bad-ts record, but these are the GROUND TRUTH that the clock reset
     /// - so we capture (kind, rawTs) for the strap log before dropping. Transient, empty by default, not encoded.
     public var droppedRtcEvents: [DroppedRtcEvent] = []
+    /// #891 diagnostic: packet types this funnel DROPPED this chunk because it has no `case` for them —
+    /// keyed by the rendered type name (`schema.typeName`, so a byte the schema does not name renders
+    /// `type53`), value = how many records carried it.
+    ///
+    /// An offload records nothing about a type it does not handle. `extractHistoricalStreams` switches on
+    /// four of the schema's sixteen packet types and `default: continue`s the rest, and
+    /// `rejectedHistoricalRecords` only archives type-47 — non-47 frames are, in its own words, "excluded
+    /// by construction". So a record type nobody has mapped is dropped twice and counted zero times, and
+    /// the sync reports clean. That is not hypothetical: `HISTORICAL_IMU_DATA_STREAM(52)` is a banked
+    /// raw-stream type our own schema names, and every one of them would vanish here.
+    ///
+    /// The immediate use is #891 — whether a 5/MG banks ECG to flash after the Labrador toggles is the
+    /// leading hypothesis, and it currently cannot be answered by running the experiment, because nothing
+    /// would show the result. The general use is that any future firmware record type is invisible today.
+    ///
+    /// `METADATA` and `CONSOLE_LOGS` are deliberately NOT counted: an offload legitimately carries both,
+    /// they decode to zero rows by design, and tallying them every sync would bury the signal this exists
+    /// to surface. Everything else falls through, including named-but-unhandled types — those are the
+    /// interesting ones.
+    ///
+    /// Transient observability only, like `droppedImplausible`: not persisted, not in `CodingKeys`, empty
+    /// by default so golden fixtures stay byte-identical.
+    public var unhandledPacketTypes: [String: Int] = [:]
     /// #520 diagnostic: a summary of `dynamic_acceleration@41` (the strap's own gravity-removed motion
     /// magnitude) over this chunk's v18 records. The field is decoded but has never been persisted or
     /// scored, so there is no evidence about whether it is a usable stillness signal; this counts what

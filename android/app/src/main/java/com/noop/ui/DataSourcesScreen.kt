@@ -150,9 +150,15 @@ fun DataSourcesScreen(vm: AppViewModel) {
     // reads per screen visit. Workout counts are now exact (the row read was capped at DEFAULT_LIMIT).
     suspend fun refreshCounts() {
         val nowS = System.currentTimeMillis() / 1000
-        whoopDays = vm.repo.daysCount("my-whoop")
-        whoopWorkouts = vm.repo.workoutsCount("my-whoop", 0L, nowS)
-        whoopHasHr = vm.repo.latestHrSampleTs("my-whoop") != null
+        // #1304/#512: count across the active-strap UNION (active ∪ canonical), so a 2nd strap's data
+        // under "whoop-<uuid>" is included instead of silently under-reported. `daysMerged` is Android's
+        // merged-history counterpart to Swift `Repository.days`
+        // (mergeActivityFileSteps(mergeDaily(imported, computed))), so this
+        // matches the iOS badge count, including a strap-only user's computed-only ("-noop") days that an
+        // imported-only count would miss. workoutsUnion mirrors Swift's dataVolumeSnapshot workout union.
+        whoopDays = vm.repo.daysMerged(vm.activeStrapId).size
+        whoopWorkouts = vm.repo.workoutsUnion(vm.activeStrapId, 0L, nowS).size
+        whoopHasHr = vm.repo.latestHrSampleTsUnion(vm.activeStrapId) != null
         appleDays = vm.repo.appleDailyCount("apple-health", "0000-01-01", "9999-12-31")
         appleWorkouts = vm.repo.workoutsCount("apple-health", 0L, nowS)
         hcDays = vm.repo.appleDailyCount("health-connect", "0000-01-01", "9999-12-31")
@@ -301,9 +307,15 @@ fun DataSourcesScreen(vm: AppViewModel) {
             val granted = runCatching {
                 HealthConnectImporter.client(context).permissionController.getGrantedPermissions()
             }.getOrDefault(emptySet())
-            if (granted.any { it in HealthConnectImporter.PERMISSIONS }) {
+            // `any` (not `all`) is deliberate — partial grants are supported (#150). But that alone
+            // would never ASK about a permission added in an update, so a newly-read type would come
+            // back empty forever (#949). Route through the request once when the set has grown.
+            if (granted.any { it in HealthConnectImporter.PERMISSIONS } &&
+                !HealthConnectImporter.hasUnaskedPermissions(context)
+            ) {
                 runImport { HealthConnectImporter.import(context, vm.repo, ProfileStore.from(context).heightCm) }
             } else {
+                HealthConnectImporter.markPermissionsAsked(context)
                 hcPermissionLauncher.launch(HealthConnectImporter.PERMISSIONS)
             }
         }
@@ -314,6 +326,9 @@ fun DataSourcesScreen(vm: AppViewModel) {
     val hcWritePermissionLauncher = rememberLauncherForActivityResult(
         PermissionController.createRequestPermissionResultContract(),
     ) { granted ->
+        // #1525: this prompt already included VO2 max, so whatever the answer was, do not ask again
+        // through the targeted one-shot below.
+        NoopPrefs.setHcVo2MaxAsked(context, true)
         if (granted.containsAll(HealthConnectWriter.PERMISSIONS)) {
             vm.writebackHealthConnectNow()
         } else {
@@ -323,6 +338,20 @@ fun DataSourcesScreen(vm: AppViewModel) {
     }
 
     // Write immediately if the write permissions are already granted, otherwise request them first.
+    /**
+     * #1525: the one-shot ask for the VO2 max write permission, for installs that were set up before it
+     * existed. The outcome is deliberately ignored — VO2 max records are written in their own attempt, so
+     * a decline costs that metric and nothing else, and blocking the writeback on it would be the very
+     * regression keeping VO2 max out of the gate avoids. Either way we mark it asked, so a "no" is
+     * respected instead of re-prompted on every sync.
+     */
+    val hcVo2MaxPermissionLauncher = rememberLauncherForActivityResult(
+        PermissionController.createRequestPermissionResultContract(),
+    ) { _ ->
+        NoopPrefs.setHcVo2MaxAsked(context, true)
+        vm.writebackHealthConnectNow()
+    }
+
     fun startWriteback() {
         scope.launch {
             val granted = runCatching {
@@ -331,13 +360,29 @@ fun DataSourcesScreen(vm: AppViewModel) {
             // Gate on vitals AND exercise perms so a user who enabled writeback before exercise
             // writeback shipped (vitals-only grant) still gets re-prompted for WRITE_EXERCISE/
             // WRITE_DISTANCE — otherwise their workouts silently never reach Health Connect (#412).
+            // #1525: VO2 max is ASKED FOR below but deliberately absent from this gate. Adding it here
+            // would mean every existing user, who granted the older set, fails `containsAll` and gets
+            // re-prompted — and blocks their whole writeback until they accept. Out of the gate, a decline
+            // costs only VO2 max, whose records are written in their own attempt.
             if (granted.containsAll(HealthConnectWriter.PERMISSIONS + HealthConnectWriter.EXERCISE_PERMISSIONS)) {
-                vm.writebackHealthConnectNow()
+                // #1525: this branch is where an existing install lands — it granted everything that
+                // existed at the time, so it never reaches the launcher below and would never be offered
+                // VO2 max. Ask exactly once, then write regardless of the answer.
+                if (!granted.containsAll(HealthConnectWriter.VO2MAX_PERMISSIONS) &&
+                    !NoopPrefs.hcVo2MaxAsked(context)
+                ) {
+                    hcVo2MaxPermissionLauncher.launch(HealthConnectWriter.VO2MAX_PERMISSIONS)
+                } else {
+                    vm.writebackHealthConnectNow()
+                }
             } else {
                 // Request vitals + exercise-session write perms together so GPS workouts can write
                 // back too (the launcher-result handler stays keyed on the vital PERMISSIONS, so
                 // exercise writeback is opt-in + non-fatal if the user declines it). v1.71 / #412.
-                hcWritePermissionLauncher.launch(HealthConnectWriter.PERMISSIONS + HealthConnectWriter.EXERCISE_PERMISSIONS)
+                hcWritePermissionLauncher.launch(
+                    HealthConnectWriter.PERMISSIONS + HealthConnectWriter.EXERCISE_PERMISSIONS +
+                        HealthConnectWriter.VO2MAX_PERMISSIONS,
+                )
             }
         }
     }
@@ -730,7 +775,8 @@ fun DataSourcesScreen(vm: AppViewModel) {
             subtitle = "Re-share your live strap heart rate over Bluetooth as a standard heart-rate " +
                 "sensor, so a gym treadmill, bike, Zwift, Peloton or any fitness app nearby can read " +
                 "it. Works on any WHOOP (4.0 or 5.0/MG) because your phone does the broadcasting. " +
-                "Local Bluetooth only. Nothing leaves your phone. Off by default.",
+                "If your strap or watch already broadcasts heart rate directly to another device, " +
+                "you can leave this off. Local Bluetooth only. Nothing leaves your phone. Off by default.",
         ) {
             if (hrBroadcast) {
                 val (label, tone) =
@@ -762,8 +808,7 @@ fun DataSourcesScreen(vm: AppViewModel) {
                 Column(modifier = Modifier.weight(1f)) {
                     Text(uiString(R.string.l10n_data_sources_screen_broadcast_hr_from_this_phone_10e5605c), style = NoopType.subhead, color = Palette.textPrimary)
                     Text(
-                        uiString(R.string.l10n_data_sources_screen_acts_as_a_standard_bluetooth_heart_f8d13439) +
-                            "bike or app to see your strap's heart rate there.",
+                        uiString(R.string.l10n_data_sources_screen_acts_as_a_standard_bluetooth_heart_f8d13439),
                         style = NoopType.footnote,
                         color = Palette.textTertiary,
                     )
@@ -805,9 +850,7 @@ fun DataSourcesScreen(vm: AppViewModel) {
                         modifier = Modifier.size(16.dp),
                     )
                     Text(
-                        uiString(R.string.l10n_data_sources_screen_broadcast_hr_is_on_your_strap_0ad5368a) +
-                            "which keeps its radio hot and drains the battery faster. Turn it off when " +
-                            "you're not using it with another device.",
+                        uiString(R.string.l10n_data_sources_screen_broadcast_hr_is_on_your_strap_0ad5368a),
                         style = NoopType.caption,
                         color = Palette.statusWarning,
                     )
@@ -846,8 +889,7 @@ fun DataSourcesScreen(vm: AppViewModel) {
             },
             text = {
                 Text(
-                    uiString(R.string.l10n_data_sources_screen_this_permanently_deletes_everything_imported_from_f42e760e) +
-                        "sleep, steps, workouts and more. Your live strap data is untouched. This can't be undone.",
+                    uiString(R.string.l10n_data_sources_screen_this_permanently_deletes_everything_imported_from_f42e760e),
                     style = NoopType.subhead,
                     color = Palette.textSecondary,
                 )

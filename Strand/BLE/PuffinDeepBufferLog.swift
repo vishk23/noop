@@ -61,7 +61,17 @@ final class PuffinDeepBufferLog {
     /// The 2140-B buffers are ~4.3 KB of hex each and arrive in bursts, so a bigger cap than the
     /// EVENT log: 60 MB live keeps roughly a few hours of accumulated high-rate bursts, ample to
     /// reverse the layout, and rotation bounds total disk at ~120 MB.
-    private static let softCapBytes = 60 * 1024 * 1024
+    ///
+    /// Overridable via the `PuffinDeepBufferSoftCapMB` default because the 60 MB figure is sized for
+    /// "a few hours of bursts", which is the STEADY-STATE case. Recovering a dead-strap backlog is the
+    /// other case: the strap banks one 1244-B + one 2140-B buffer per SECOND of history, so a 16 h
+    /// backlog is ~190 MB raw / ~380 MB of hex — it would rotate away most of itself before the drain
+    /// ends, and the ack-trim frees those buffers from the strap permanently as it goes. A one-shot
+    /// raise is the only way to keep a full backlog intact. 0 or unset keeps the 60 MB default.
+    private static var softCapBytes: Int {
+        let mb = UserDefaults.standard.integer(forKey: "PuffinDeepBufferSoftCapMB")
+        return (mb > 0 ? mb : 60) * 1024 * 1024
+    }
 
     /// WHOOP 5/MG inner-record type byte for the R22 deep packets (type 47 / 0x2F), at offset 8 (the
     /// same position `BLEManager.isOffloadFrame` / `PuffinEventLog` index). The 1 Hz historical rollup
@@ -70,6 +80,25 @@ final class PuffinDeepBufferLog {
     private static let innerRecordOffset = 8
     /// Skip the ~124-B ≈1 Hz record; keep the 1244-/2140-B high-rate buffers.
     private static let minBufferBytes = 1000
+
+    /// Lowercase hex, table-driven. Runs on the MainActor in the frame-delivery path, so it avoids the
+    /// obvious `frame.map { String(format: "%02x", $0) }.joined()`, which costs one Foundation formatter
+    /// call + one String allocation PER BYTE. A nibble lookup into a byte array is materially cheaper and
+    /// allocates once. The two properties that matter are pinned by tests rather than asserted here:
+    /// `testHexStringMatchesFormatterForEveryByteValue` (byte-for-byte parity with the encoding it
+    /// replaces, across the whole domain) and `testHexStringIsFastEnoughForTheAckPath` (sub-millisecond
+    /// per buffer). NOTE: this path only runs when the capture toggle (`PuffinFrameRecorder.enabledKey`)
+    /// is ON — it is off by default, so this is research-capture cost, not a cost every user pays.
+    private static let hexDigits: [UInt8] = Array("0123456789abcdef".utf8)
+    nonisolated static func hexString(_ bytes: [UInt8]) -> String {
+        var out = [UInt8]()
+        out.reserveCapacity(bytes.count * 2)
+        for b in bytes {
+            out.append(hexDigits[Int(b >> 4)])
+            out.append(hexDigits[Int(b & 0x0F)])
+        }
+        return String(decoding: out, as: UTF8.self)
+    }
 
     /// Pure predicate: is `frame` a WHOOP 5/MG high-rate deep buffer? A reassembled frame's inner-record
     /// type byte sits at offset 8, so this needs `count > 8` before indexing. Extracted so the offset-8
@@ -139,14 +168,25 @@ final class PuffinDeepBufferLog {
         guard !disabled, Self.isDeepBuffer(frame), isEnabled else { return }
         let tsMs = Int(Date().timeIntervalSince1970 * 1000)
         let strapTs = Self.strapTs(frame).map { String($0) } ?? "null"
-        let hex = frame.map { String(format: "%02x", $0) }.joined()
+        let hex = Self.hexString(frame)
         // #423/#455: run the raw-IMU decoder on the 1244-B buffer so every captured IMU frame carries
         // its decoded activity summary (cadence/energy/jerk/gyro) inline beside the raw hex. This is the
         // first CALLER of `Whoop5RawImu.decode` outside its own tests — it exercises the decoder on real
         // device captures and makes each JSONL line self-checking (raw ↔ decode) with NO stored table,
         // migration, or downstream gate. Instrumentation only, per the derived-signal rule; the 2140-B
         // optical buffer stays raw-only (its layout isn't decoded yet).
-        let imu = Self.decodedImuField(frame)
+        // LIVE frames only — a hygiene measure, and deliberately carrying NO measured throughput claim.
+        // An earlier version of this comment derived a link-rate model ("the link is a metronome") from
+        // the inter-frame gap asymmetry in a single 208 s window; that model did not survive
+        // re-measurement across more windows and has been removed rather than restated. Do not re-derive
+        // a link-rate or throughput conclusion from this file — it logs frames, it does not time them.
+        //
+        // The reason to skip during offload stands on its own, independent of any rate: it is per-frame
+        // work on the MainActor in the delivery path, it buys nothing there, and the raw `hex` on this
+        // very line is the decoder's own input — so the summary is recomputable offline from the archive
+        // at any time. Live frames arrive ~1/s, where the inline summary is free and makes each line
+        // self-checking. Capture captures; analysis is downstream.
+        let imu = isOffload ? "" : Self.decodedImuField(frame)
         let line = "{\"ts_ms\":\(tsMs),\"strap_ts\":\(strapTs),\"size\":\(frame.count),"
             + "\"offload\":\(isOffload),\"char\":\"\(char.uuidString.lowercased())\",\"hex\":\"\(hex)\"\(imu)}\n"
         do {

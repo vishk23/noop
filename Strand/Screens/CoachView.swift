@@ -255,6 +255,22 @@ struct CoachView: View {
                             .foregroundStyle(StrandPalette.textSecondary)
                             .fixedSize(horizontal: false, vertical: true)
                     }
+
+                    VStack(alignment: .leading, spacing: 6) {
+                        Text("Key header").strandOverline()
+                        Picker("Key header", selection: $coach.customAuthHeader) {
+                            ForEach(CustomAIAuthHeader.allCases) { header in
+                                Text(header.displayName).tag(header)
+                            }
+                        }
+                        .labelsHidden()
+                        .pickerStyle(.segmented)
+                        .accessibilityLabel("Key header")
+                        Text("Use Bearer for most local servers; use x-api-key for gateways that require the key in that header.")
+                            .font(StrandFont.footnote)
+                            .foregroundStyle(StrandPalette.textSecondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
                 }
 
                 // Model
@@ -407,6 +423,14 @@ struct CoachView: View {
                         .padding(.vertical, 2)
                         .frame(maxWidth: .infinity, alignment: .leading)
                     }
+                    // #697 parity: this screen builds its OWN ScrollView rather than going through
+                    // ScreenScaffold, so it never inherited the scaffold's horizontal-bounce suppression and
+                    // could still rubber-band left-right on a purely vertical scroll. Same modifier, same
+                    // guard. `.basedOnSize` permits horizontal bounce only when content genuinely overflows
+                    // the width, so nothing that is meant to scroll sideways is affected. (#1532 follow-up)
+                    #if os(iOS)
+                    .scrollBounceBehavior(.basedOnSize, axes: .horizontal)
+                    #endif
                     .frame(minHeight: 220, maxHeight: 460)
                     .onChangeCompat(of: coach.messages.count) { _ in
                         scrollToEnd(proxy)
@@ -570,7 +594,7 @@ struct CoachView: View {
             .accessibilityLabel("Send")
         }
         .padding(8)
-        .background(StrandPalette.surfaceOverlay, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
+        .background(NoopPanelSurface(cornerRadius: 16))
         .overlay(RoundedRectangle(cornerRadius: 16, style: .continuous)
             .strokeBorder(StrandPalette.hairline, lineWidth: 1))
     }

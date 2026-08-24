@@ -3,17 +3,20 @@
 > **iOS is now a direct download (v1.96).** Grab **`NOOP-v<version>-ios.ipa`** from the
 > [Releases](https://github.com/ryanbr/noop/releases) page and install it with **AltStore** or **SideStore** — see
 > **[Install (sideload)](#install-sideload)** below. No Mac, no Xcode, no App Store, and no Apple
-> Developer account needed — **and NOOP stays anonymous**, because the `.ipa` we ship is *unsigned*
-> and **you** sign it on your own iPhone with your own free Apple ID. The app target (`NOOPiOS` +
+> Developer account needed — **and NOOP stays anonymous**, because the `.ipa` has no Apple developer
+> signature and **you** sign it on your own iPhone with your own free Apple ID. It carries only a
+> replaceable ad-hoc capability template so the sideloader can provision HealthKit and the App Group
+> shared with the widget. The app target (`NOOPiOS` +
 > `NOOPiOSWidgets`) also still builds from source in Xcode if you'd rather (**[Build from source](#build-from-source)**).
 > A CI job ([`app-build.yml`](../.github/workflows/app-build.yml)) compiles both the macOS and iOS
 > targets on every change so iOS can't silently break.
 
 ## Install (sideload)
 
-The `.ipa` is **unsigned on purpose** — that's what keeps the project anonymous. iOS won't run an
-unsigned app, so a free sideloading tool signs it **on your device, with your own free Apple ID**.
-Nothing about this touches NOOP's identity or Apple's servers on our side.
+The `.ipa` is **not signed by an Apple developer identity** — that's what keeps the project
+anonymous. Its replaceable ad-hoc signature only describes the capabilities AltStore/SideStore must
+provision; iOS won't run it until the sideloader signs it **on your device, with your own free Apple
+ID**. Nothing about this touches NOOP's identity or Apple's servers on our side.
 
 1. **Install a sideloader on your computer** — [AltStore](https://altstore.io) or
    [SideStore](https://sidestore.io) (both free). Follow their one-time setup (it installs a helper +
@@ -47,15 +50,12 @@ hunting for the `.ipa` each time.
 > - **7-day expiry.** Apps signed with a *free* Apple ID stop launching after 7 days and need
 >   re-signing. **AltStore/SideStore refresh this automatically** in the background — keep the
 >   sideloader installed and NOOP keeps working.
-> - **Some Apple-only features may be limited.** A free signing identity can't grant certain Apple
->   entitlements, so **Apple Health (HealthKit) read/write and the Live Activity / lock-screen
->   widgets may not work** on a free-signed sideload. The core app — pairing your strap, live HR,
->   recovery/strain/sleep, history, the AI Coach, everything on-device — works regardless. This is an
->   Apple signing constraint, not a NOOP limitation, and it's why a HealthKit toggle can appear to do
->   nothing on a sideloaded build. The release IPA retains `NOOPWidgets.appex`, so AltStore/Sideloadly
->   must provision one additional app extension for widgets and Live Activities; removing app extensions
->   while signing disables those surfaces. Building from source with your own Apple ID in Xcode and
->   selecting your Team for both targets grants these entitlements normally.
+> - **Apple-only features require their extensions and capabilities.** Keep the
+>   `NOOPWidgets.appex` extension enabled when AltStore/SideStore asks: it renders the Home/Lock-Screen
+>   widgets and Live Activities and shares data through the provisioned App Group. Removing app
+>   extensions while signing disables those surfaces. Other signing tools must likewise preserve and
+>   provision the requested HealthKit and App Group entitlements. Building from source with your own
+>   Apple ID in Xcode and selecting your Team for both targets configures them automatically.
 
 iOS shares the cross-platform Swift packages with macOS, so the number-crunching (recovery, strain,
 HRV, sleep) is the **same code** and produces the same results. iOS is newer and less battle-tested
@@ -415,7 +415,7 @@ This is the biggest *additive* opportunity on iOS.
 |---|---|
 | **Read** | Query HealthKit live (`HKHealthStore`, `HKSampleQuery`, anchored/observer queries) for HR, RHR, HRV SDNN, SpO₂, wrist/body temperature, respiratory rate, sleep stages, workouts, body composition — the same types `relevantTypes` already enumerates in `AppleHealthImporter`. No manual export needed. |
 | **Write** | Write NOOP-computed values back into Apple Health: HR / HRV / SpO₂ / temperature samples decoded from the strap, sleep analysis from `StrandAnalytics.SleepStager`, and workouts from `WorkoutDetector` — so NOOP data shows up across the user's Health ecosystem. |
-| **Background delivery** | `HKObserverQuery` + `enableBackgroundDelivery` to keep the on-device store in sync without opening the app. |
+| **Background delivery** | `HKObserverQuery` + `enableBackgroundDelivery` keep the on-device store current, while a best-effort `BGAppRefreshTaskRequest` periodically writes already-banked strap data back to Health. Fresh WHOOP offloads write immediately from their completion hook. iOS chooses the actual refresh time. |
 
 Because `AppleHealthImporter` already defines the canonical type set, units, and
 `SleepStage` mapping, an iOS `HealthKitImporter` can map `HKSample` objects onto the
@@ -562,10 +562,8 @@ targets:
 - [x] `MenuBarExtra` replaced by a WidgetKit widget + Live Activity (`StrandiOSWidgets`), reusing `StrandDesign`.
 - [x] iOS action layer: `lockScreen` returns false on iOS, `buzzBack`/`markMoment` portable, **App Intents** exposed (`StrandiOS/System/NOOPAppIntents.swift`).
 - [x] Clipboard + URL-open routed through `Platform.swift` (`PlatformPasteboard`/`PlatformOpen`).
-- [x] `HealthKitBridge` two-way Apple Health (read live + write NOOP metrics). _(See the device-id follow-up flagged below.)_
+- [x] `HealthKitBridge` two-way Apple Health (read live + immediate post-offload and periodic background write-back of NOOP metrics).
 - [ ] **Still TODO (needs hardware):** verify BLE on a **physical iPhone** with a real strap — CoreBluetooth has no Simulator. This is the one thing CI/compile can't cover.
-
-> **Open follow-up:** `HealthKitBridge.writeBack` reads NOOP-computed metrics under `deviceId = "my-whoop"`, but the on-device *computed* scores (recovery/HRV/…) are persisted under the **computed** id `"my-whoop-noop"` — so the Apple-Health write-back may read little/nothing for a strap-only user. Behavioural (not a compile issue); fix when the iOS HealthKit path gets device-tested.
 
 ---
 

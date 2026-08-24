@@ -331,6 +331,26 @@ private func parseFrameWhoop5(_ frame: [UInt8], collectFields: Bool) -> ParsedFr
                        fields: fb.fields, parsed: fb.parsed)
 }
 
+/// The WHOOP 5/MG type-47 `hist_version` values `decodeWhoop5Historical` has a REAL field map for.
+/// Every other version falls through to the "unmapped layout" branch, which decodes nothing and only
+/// describes the payload as an opaque region.
+///
+/// This is the single source of truth for "does NOOP understand this layout": the dispatch `switch` in
+/// `decodeWhoop5Historical` reads nothing else, and `rejectedHistoricalRecords` uses it to decide which
+/// records must be archived raw. Keeping one set means the two can never disagree — the failure mode
+/// this replaced was a record from an unmapped layout that happened to decode a plausible `unix` and
+/// `gravity_x`/`heart_rate` slipping past the archive filter, so its bytes were kept nowhere at all.
+/// `Whoop5HistoricalLayoutMapTests` pins the set against the decoder's actual behaviour.
+public let mappedWhoop5HistoricalVersions: Set<Int> = [18, 20, 21, 26]
+
+/// True when `frame` is a WHOOP 5/MG type-47 record whose layout version has NO field map — the
+/// records that reach the unmapped branch of `decodeWhoop5Historical` and are therefore never
+/// re-derivable from anything NOOP stores. Non-type-47 and too-short frames are false.
+public func isUnmappedWhoop5HistoricalRecord(_ frame: [UInt8]) -> Bool {
+    guard frame.count > 9, Int(frame[8]) == 47 else { return false }
+    return !mappedWhoop5HistoricalVersions.contains(Int(frame[9]))
+}
+
 /// Decode a WHOOP 5.0 HISTORICAL_DATA (type 47) DSP biometric record.
 ///
 /// The layout version is carried in the byte at frame[9] — the inner record's seq slot, which the
@@ -351,16 +371,21 @@ private func decodeWhoop5Historical(_ frame: [UInt8], fb: FieldBuilder, payloadE
     let version = frame.count > 9 ? Int(frame[9]) : -1
     fb.parsed["hist_version"] = .int(version)
     fb.add(9, 1, "hist_version", "meta", value: .int(version))
-    if version == 26 {
+    // One dispatch, one list: every `case` here must appear in `mappedWhoop5HistoricalVersions` and
+    // vice versa, because that set is what decides whether a record gets archived raw. A `switch`
+    // rather than the old if-chain so the mapped versions are readable in one place.
+    switch version {
+    case 26:
         decodeWhoop5HistoricalV26(frame, fb: fb)
         return
-    }
-    if version == 20 || version == 21 {
+    case 20, 21:
         decodeWhoop5HistoricalV2021(frame, fb: fb, version: version, payloadEnd: payloadEnd)
         return
-    }
-    guard version == 18 else {
-        // Unknown historical layout — describe it faithfully without inventing offsets.
+    case 18:
+        break   // falls through to the v18 field decode below
+    default:
+        // Unknown historical layout — describe it faithfully without inventing offsets. The bytes are
+        // NOT lost: `rejectedHistoricalRecords` archives every record that lands here (#77 / #91).
         if let payloadEnd = payloadEnd, 11 < payloadEnd, payloadEnd <= frame.count {
             fb.region(11, payloadEnd, "HISTORICAL_DATA v\(version) (unmapped layout)", "unknown")
         }
@@ -594,7 +619,7 @@ private func decodeWhoop5Historical(_ frame: [UInt8], fb: FieldBuilder, payloadE
 /// reference): the concatenated waveform's autocorrelation peaks at the HR (lag 14 = 102.9 bpm vs a
 /// measured 101.7 bpm), trough-detection gives a 563 ms inter-beat interval (≈106 bpm), the pulse stays
 /// HR-locked even when the wrist is still, and its amplitude is not motion-driven. (Reproduce with
-/// `tools/linux-capture/analyze_v26_waveform.py`; see docs §5.)
+/// `Tools/linux-capture/analyze_v26_waveform.py`; see docs §5.)
 ///
 /// The samples are raw AC-coupled ADC counts — PPG has no absolute unit — so they are exposed verbatim
 /// as `ppg_waveform` with NO invented scale. The bytes before [27] (header + a block index) and the
@@ -771,6 +796,13 @@ private func decodeWhoop5CommandResponse(_ frame: [UInt8], fb: FieldBuilder, sch
     let name = schema.enumName("CommandNumber", respCmd)   // e.g. "GET_BATTERY_LEVEL(26)"
     let pay = Array(frame[11..<payloadEnd])
     fb.region(11, payloadEnd, "response payload", "cmd")
+    // Origin-seq echo + result code, the 4.0 offsets shifted by the usual +4 (#894). The Kotlin twin has
+    // always published both here; this decoder published neither. Bounded by `pay` so a short reply
+    // decodes nothing rather than reading the CRC32 trailer as a result.
+    if pay.count >= 1 { fb.add(11, 1, "resp_seq", "cmd", value: .int(Int(pay[0]))) }
+    if pay.count >= 2 {
+        fb.add(12, 1, "result", "cmd", value: .string(schema.enumName("CommandResult", Int(pay[1]))))
+    }
     if name.hasPrefix("GET_BATTERY_LEVEL"), pay.count >= 3 {
         // Direct percent at pay[2] (47% confirmed against the app) — the 4.0 deci-percent ÷10 is gone.
         fb.add(11 + 2, 1, "battery_pct", "battery", value: .double(Double(pay[2])), note: "%")

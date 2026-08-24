@@ -501,6 +501,50 @@ extension WhoopStore {
                           on: "ouraRaw", columns: ["deviceId", "endpoint", "day"])
         }
 
+        // v26: cloud edit tombstones (Phase 3 cloud journal apply). When a server-side journal edit
+        // deletes a workout / HR range / metric point, NOOP physically deletes the local row(s) AND
+        // records a tombstone here — otherwise the NEXT sync/backfill/live-BLE write would silently
+        // resurrect the same row from the strap or a re-pulled cloud page. `editSeq` is the cloud
+        // journal's own sequence number; the (kind, editSeq) unique key makes replaying the same
+        // journal entry idempotent (INSERT OR IGNORE, never a duplicate tombstone). Additive only —
+        // a NEW table, no existing row touched.
+        migrator.registerMigration("v26-cloud-tombstone") { db in
+            try db.create(table: "cloudTombstone") { t in
+                t.autoIncrementedPrimaryKey("id")
+                t.column("kind", .text).notNull()        // "workout" | "hrRange" | "metricPoint"
+                t.column("deviceId", .text).notNull()
+                t.column("startTs", .integer)             // workout: startTs; hrRange: fromTs
+                t.column("endTs", .integer)               // hrRange: toTs
+                t.column("sport", .text)                  // workout
+                t.column("day", .text)                    // metricPoint
+                t.column("key", .text)                    // metricPoint
+                t.column("editSeq", .integer).notNull()   // server journal seq (idempotency)
+                t.column("createdAt", .integer).notNull()
+                t.uniqueKey(["kind", "editSeq"])
+            }
+            try db.create(index: "idx_cloudTombstone_kind_device", on: "cloudTombstone", columns: ["kind", "deviceId"])
+        }
+
+        // v27: hourly Apple Health step counts. The daily `collect(.stepCount, …)` path in
+        // HealthKitBridge flattens a whole day to one `appleDaily.steps` total, so a dead/absent phone
+        // for part of a day (e.g. the phone died mid-hike) is invisible — steps just read low for the
+        // WHOLE day instead of showing exactly which hours had no recording. HealthKit retains hourly
+        // statistics historically, so this table lets a one-time backfill answer PAST days
+        // retroactively, not just from the day this migration ships. `ts` is the hour-BUCKET START
+        // (unix seconds), aligned to local-clock hour boundaries by the `HKStatisticsCollectionQuery`
+        // anchored at local midnight (see HealthKitBridge); `steps` is the cumulative sum within that
+        // hour. PK (deviceId, ts) mirrors every other per-sample table (hrSample, stepSample, …) and
+        // makes the hourly upsert idempotent. Additive only — a NEW table, no existing row touched, old
+        // readers unaffected.
+        migrator.registerMigration("v27-apple-step-hour") { db in
+            try db.create(table: "appleStepHour") { t in
+                t.column("deviceId", .text).notNull()   // "apple-health"
+                t.column("ts", .integer).notNull()      // hour-start unix seconds (local-hour aligned by HK)
+                t.column("steps", .integer).notNull()
+                t.primaryKey(["deviceId", "ts"])
+            }
+        }
+
         // v26 (Oura efficiency unit heal): the Oura API importer (OuraApiParser.swift) wrote Oura's
         // native 0-100 integer `efficiency` straight into sleepSession.efficiency / dailyMetric.efficiency,
         // but NOOP's own sleep pipeline (StrandAnalytics) stores that shared column as a 0-1 FRACTION
@@ -567,10 +611,56 @@ extension WhoopStore {
                 t.primaryKey(["deviceId", "ts"])
             }
         }
+        // NOTE ON NUMBERING (upstream sync 2026-07-27): the two fork-local migrations below keep their
+        // ORIGINAL `v28-`/`v29-` identifiers even though upstream has since claimed those same ordinals
+        // (`v28-raw-imu`, `v29-score-input-provenance`). GRDB keys `registerMigration` by the identifier
+        // STRING, not by an ordinal, so the duplicate numbers are cosmetic and all six apply exactly once.
+        // Renumbering them past upstream's — the usual rule when sending a migration UPSTREAM, where no
+        // device has applied it yet — would be actively unsafe HERE: a renamed identifier reads as
+        // un-applied on a fork device that already ran it, and `CREATE TABLE phoneTimezone` would then
+        // throw "table already exists" and wedge the migrator on a live database. The same reasoning
+        // already governs `v26-cloud-tombstone`/`v27-apple-step-hour`, which collide with upstream's
+        // `v26-efficiency-heal`/`v27-ppg-waveform` and have shipped that way since the previous sync.
+        // v28: the phone's IANA timezone, recorded one row per LOCAL day. Every timestamp in the DB is
+        // epoch-UTC and nothing records which zone the phone was in when a day was lived, so any
+        // wall-clock interpretation of a historical night (bedtime, "3am", day boundaries) is guesswork
+        // once the traveller crosses zones (e.g. Pacific ↔ Eastern). This table stamps each local day
+        // with `TimeZone.current.identifier` so downstream analysis can localise that specific day's
+        // samples instead of assuming one fixed offset. `day` is the local calendar day ("YYYY-MM-DD")
+        // and PK, so a same-day re-record overwrites in place (idempotent upsert). Additive only — a NEW
+        // table, no existing row touched, old readers unaffected. The value also rides every upload as
+        // the `X-Phone-Timezone` header on POST /ingest so the server knows the CURRENT zone even before
+        // this table lands in a given mirror. Android Room twin deferred (Swift-only contributor); a Room
+        // migration adding `phoneTimezone` is needed before an Android release.
+        migrator.registerMigration("v28-phone-timezone") { db in
+            try db.create(table: "phoneTimezone") { t in
+                t.column("day", .text).primaryKey()   // local calendar day "YYYY-MM-DD"
+                t.column("tzId", .text).notNull()      // IANA identifier, e.g. "America/Los_Angeles"
+            }
+        }
+        // v29: persist nightly SDNN — the 5-min SDNN index (broad-variability twin of avgHrv=RMSSD),
+        // window-matched to a watch's short SDNN rather than the drift-inflated whole-night SD. Additive,
+        // nullable; computed by HRVAnalyzer.sdnnIndex during the nightly analysis.
+        migrator.registerMigration("v29-daily-avg-sdnn") { db in
+            try db.alter(table: "dailyMetric") { t in
+                t.add(column: "avgSdnn", .double)
+            }
+        }
 
         // #423: WHOOP 5/MG raw-IMU offload capture (100 Hz 6-axis). `samples` is a packed i16 LE BLOB of
         // the six wire columns (ax…az,gx…gz). Twin of the Android `rawImuSample` table (MIGRATION_20_21);
         // same column order + PK so a `.noopbak` round-trips byte-for-byte.
+        //
+        // CONSUMER STATUS — deliberately none on this platform, in the same shape as the `ppgWaveformSample`
+        // (v27) and `v18AuxSample` (v31) notes. The writer (`Collector.storeRawImu`) is instrument-first: it
+        // fires only with raw capture enabled AND a 5/MG deep-data unlock, and is bounded to
+        // `WhoopStore.rawImuRetentionRows` (3600 one-second buffers, a rolling window — not a corpus). No
+        // analytic, score, gate, UI or export reads a row: the only SQL is the retention DELETE (`StreamStore`)
+        // plus a COUNT in the storage-stats readout (`LocalAccessCore`); `ImuFeatureExtractor` takes the
+        // protocol struct, never this table, so it is not a consumer either. Swift has NO reader yet, on
+        // purpose — a reader lands WITH a validated consumer, not before ("artifact, not one match", CLAUDE.md).
+        // Android keeps a dormant `rawImuSamples` reader (zero callers) for the eventual cross-check; do NOT
+        // "clean up" either side as dead code — the retained rows are the deliverable. Audit: #978.
         migrator.registerMigration("v28-raw-imu") { db in
             try db.create(table: "rawImuSample") { t in
                 t.column("deviceId", .text).notNull()
@@ -655,6 +745,22 @@ extension WhoopStore {
         // point of this migration is that the data starts accruing NOW so a validated consumer is possible
         // LATER; landing a consumer at the same time would be scoring on evidence that does not exist yet.
         //
+        // CONSUMER STATUS — deliberately none, stated here so nobody has to re-derive it, and in the same
+        // shape as the `ppgWaveformSample` note above (v27). The writers are live on both platforms, but
+        // every `v18AuxSamples` call site on BOTH platforms is a TEST: no analytic, no score, no gate, no
+        // UI, no export reads a row. **Do NOT "clean up" the reader as dead code** — the rows are the point,
+        // and the reader is how they become reachable once a consumer is validated. The same applies to the
+        // four named columns added just below (`gravitySample.dynAccel`, `sleepStateSample.rawByte`,
+        // `skinTempSample.aux1Raw/aux2Raw`): they are SELECTed into their structs, and no consumer touches
+        // the properties, on purpose.
+        //
+        // Why the rows still matter even unread: before this migration these fields were not merely unread,
+        // they were DESTROYED. The strap trims its history the moment an offload is acked, so every one of
+        // them was unrecoverable. This migration converts permanent loss into retained-but-unread, which is
+        // the whole fix and is complete. Fifteen of the slots are unpinned bytes whose names deliberately
+        // assert nothing; wiring them to anything before a census would be exactly the overclaiming this
+        // project has already had to retract. The capture IS the deliverable.
+        //
         // The remaining fifteen v18 slots go to their OWN narrow table rather than fifteen more columns
         // (see `V18AuxCodec` for the wire format and the column-vs-blob tradeoff). Three reasons this is
         // a table and not another column on an existing row:
@@ -691,6 +797,214 @@ extension WhoopStore {
                 t.column("deviceId", .text).notNull()
                 t.column("ts", .integer).notNull()
                 t.column("fields", .blob).notNull()
+                t.primaryKey(["deviceId", "ts"])
+            }
+        }
+
+        // v32 (#1071): record WHICH sensor channel produced each R-R beat.
+        //
+        // An Oura ring reports the SAME heartbeats on more than one tag, and every one of them decoded to
+        // `OuraEvent.ibi` and landed here untagged. Measured over one 488-min sleep window: 61,524 beats
+        // stored where the measured HR curve allows 29,800 (2.06x), and sum(rrMs)/wall-clock = 2.17x. The
+        // two are separable after the fact only by the accident that their quantisation grids differ
+        // (0x6E is `byte * 8`, always a multiple of 8; 0x80 is an 11-bit value on the 1 ms grid), and the
+        // 8 ms stream is ABSENT until SpO2 measurement starts and then tracks its duty cycle exactly —
+        // which is what proves these are two channels rather than accumulated re-syncs.
+        //
+        // The damage is to the VARIABILITY statistics, not the level: a duplicated beat train leaves
+        // meanNN (and so resting HR) correct while RMSSD/SDNN are built entirely from successive
+        // differences and collapse. The app's own `hrv diag` line has been reporting it as
+        // `coverage=2.21 rrIntegrity=crossSecondOverCount` with a non-physiological ~200 ms nocturnal SDNN.
+        //
+        // NOT a de-duplication: both rows are real measurements of the same beat by different optics, and
+        // the second channel is the obvious future cross-check on the first. So nothing is deleted and
+        // nothing is rewritten — the column labels the source and `Reads.rrIntervals` filters at READ.
+        //
+        // Additive nullable column, the v30-rr-ord form: no table rebuild, no existing row touched, and
+        // deliberately NOT in the primary key, which stays (deviceId, ts, rrMs, seq) from v24. Putting it
+        // in the key would make the SAME beat insertable twice under two labels, the data-loss/duplication
+        // regression the v24 note warns about from the other direction.
+        //
+        // Pre-v32 rows stay NULL and are still READ (a WHOOP row is legitimately NULL forever — one beat
+        // source, no channel to name — so a filter that dropped NULL would silently delete every WHOOP
+        // night from scoring). Historical Oura rows therefore keep their old inflated coverage; they were
+        // never labelled, and a backfill would be a guess. For the record, since this is how the defect
+        // was diagnosed: in an existing DB the two channels remain separable by `rrMs % 8`, an 0x6E row
+        // always being a multiple of 8 and an 0x80 row landing there only 1 time in 8 by chance.
+        //
+        // Values are `RRSourceChannel.rawValue` (1 green / 2 spo2 / 3 ibiAmplitude), a DURABLE wire format
+        // shared with Kotlin `RrSourceChannel`. INTEGER rather than a text label because `rrInterval` is
+        // the highest-volume table in the schema (~60k rows a night) and this column rides every one.
+        //
+        // Twin of Room MIGRATION_25_26.
+        migrator.registerMigration("v32-rr-src-channel") { db in
+            try db.alter(table: "rrInterval") { t in
+                t.add(column: "srcChannel", .integer)
+            }
+        }
+        // #1058: per-session step count on a workout. Activity-file imports previously stored steps only
+        // as a whole-day DailyMetric row keyed on (deviceId, day), so a SECOND file for the same day
+        // overwrote the first's steps instead of adding. With steps on the session, the day total is
+        // recomputed as SUM over that day's sessions — additive across files, idempotent on re-import.
+        // Nullable; only foot-sport activity-file sessions populate it (a strap never writes it).
+        migrator.registerMigration("v33-workout-steps") { db in
+            try db.alter(table: "workout") { t in
+                t.add(column: "steps", .integer)
+            }
+        }
+        // #345 follow-up: per-session flag recording that a night was staged on SPARSE motion coverage
+        // (`SleepStager.isGravitySparse`), so the Sleep tab can honestly caption "sleep may be incomplete"
+        // when a sparse night likely under-detected (the "slept 8h, shows 1h" reports). Additive, nullable
+        // (existing rows / imported nights read null = unknown, never flagged); not part of the primary
+        // key. The v13 (`userEdited`) / v14 (`startTsAdjusted`) form. Byte-parity with Room MIGRATION_27_28.
+        migrator.registerMigration("v34-sleep-staging-sparse") { db in
+            // `.integer` (not `.boolean`) so the affinity is INTEGER on BOTH platforms — Room maps Kotlin
+            // Boolean? to INTEGER too — and this column carries no `grdb-boolean-affinity` divergence.
+            // The value is a 0/1 flag; GRDB binds/reads the Swift `Bool?` as 0/1 over an INTEGER column.
+            try db.alter(table: "sleepSession") { t in
+                t.add(column: "stagingSparse", .integer)
+            }
+        }
+        // v35 (#1073): quarantine R-R beats whose timestamp is in the FUTURE. An Oura ring's history
+        // timestamp is occasionally corrupt/misaligned and, before the OuraDriver gate was tightened to
+        // "now", converted to a date years ahead (measured on a live ring: ~1,600 beats stamped 2026→2034)
+        // and was banked — removed from the night it was measured in and queued to poison whichever future
+        // day it lands on. The ingest gate now rejects such samples, but rows already stored have to be
+        // taken out of scoring.
+        //
+        // NOT a delete: these are real heartbeats with a wrong timestamp, so — like the v32 srcChannel
+        // form — the column MARKS them and `Reads.rrIntervals` filters at READ, keeping them inspectable
+        // and recoverable if the ring-time offset is ever characterised (the migration rule warns against
+        // window-wide deletes). `strftime('%s','now')` runs once, at migration time; new rows are gated at
+        // ingest so never land future, and stay NULL. Additive nullable INTEGER, the v32 form: no table
+        // rebuild, no existing key touched, NOT in the primary key.
+        //
+        // Twin of Room MIGRATION_28_29.
+        migrator.registerMigration("v35-rr-future-quarantine") { db in
+            try db.alter(table: "rrInterval") { t in
+                t.add(column: "tsSuspect", .integer)
+            }
+            // CAST so the compare is numeric: `strftime` returns TEXT, and `ts` (INTEGER) > TEXT would
+            // otherwise lean on SQLite's affinity coercion rather than being explicit.
+            try db.execute(sql: "UPDATE rrInterval SET tsSuspect = 1 WHERE ts > CAST(strftime('%s','now') AS INTEGER)")
+        }
+        // v36 (#548): drop calibrated SpO₂ from WHOOP registry capabilities. Live NOOP never fills
+        // spo2Pct from the strap (import-only / experimental @82 candidate); advertising `spo2` made
+        // an empty Blood Oxygen tile look broken. Data-only UPDATE — no schema change. Twin of Room
+        // MIGRATION_29_30. Decode-time strip in DeviceRegistryStore is the belt; this is the suspenders.
+        migrator.registerMigration("v36-whoop-caps-no-spo2") { db in
+            let rows = try Row.fetchAll(
+                db,
+                sql: """
+                    SELECT id, capabilities FROM pairedDevice
+                    WHERE brand = 'WHOOP' OR id = 'my-whoop' OR id LIKE 'whoop-%'
+                    """
+            )
+            for row in rows {
+                let id: String = row["id"]
+                let encoded: String = row["capabilities"]
+                let stripped = WhoopLiveCapabilities.stripSpo2Token(fromEncoded: encoded)
+                if stripped != encoded && !stripped.isEmpty {
+                    try db.execute(
+                        sql: "UPDATE pairedDevice SET capabilities = ? WHERE id = ?",
+                        arguments: [stripped, id]
+                    )
+                }
+            }
+        }
+
+        // v37: persist nightly SDNN — the 5-min SDNN index (broad-variability twin of avgHrv=RMSSD),
+        // window-matched to a watch's short SDNN rather than the drift-inflated whole-night SD. Additive,
+        // nullable; computed by HRVAnalyzer.sdnnIndex during the nightly analysis.
+        //
+        // Numbered v37: upstream migrations advanced to v36 (`v36-whoop-caps-no-spo2`) while this branch
+        // was open, so this branch-local, never-shipped identifier is renumbered to the next free slot.
+        // Renumbering an unshipped identifier is free (GRDB tracks applied migrations by id, not number);
+        // renaming a SHIPPED one is not, so only this id moves.
+        migrator.registerMigration("v37-daily-avg-sdnn") { db in
+            // Fork convergence (`fork-ios-only` lineage in schema_oracle.json): installs that ran this
+            // fork's `v29-daily-avg-sdnn` already carry the column, and re-adding it would abort the
+            // migrator and wedge the database. GRDB has no ifNotExists for columns, so probe first.
+            if try !db.columns(in: "dailyMetric").contains(where: { $0.name == "avgSdnn" }) {
+                try db.alter(table: "dailyMetric") { t in
+                    t.add(column: "avgSdnn", .double)
+                }
+            }
+        }
+        // v38-apple-step-hour: hourly Apple Health step counts. The daily `collect(.stepCount, …)` path
+        // in HealthKitBridge flattens a whole day to one `appleDaily.steps` total, so a dead/absent phone
+        // for part of a day (e.g. the phone died mid-hike) is invisible — steps just read low for the
+        // WHOLE day instead of showing exactly which hours had no recording. HealthKit retains hourly
+        // statistics historically, so this table lets a one-time backfill answer PAST days
+        // retroactively, not just from the day this migration ships. `ts` is the hour-BUCKET START
+        // (unix seconds), aligned to local-clock hour boundaries by the `HKStatisticsCollectionQuery`
+        // anchored at local midnight (see HealthKitBridge); `steps` is the cumulative sum within that
+        // hour. PK (deviceId, ts) mirrors every other per-sample table (hrSample, stepSample, …) and
+        // makes the hourly upsert idempotent. Additive only — a NEW table, no existing row touched, old
+        // readers unaffected.
+        migrator.registerMigration("v38-apple-step-hour") { db in
+            // ifNotExists: forks/sideloads that already carry this table under a different migration
+            // identifier converge cleanly instead of failing the migrator.
+            try db.create(table: "appleStepHour", options: [.ifNotExists]) { t in
+                t.column("deviceId", .text).notNull()   // "apple-health"
+                t.column("ts", .integer).notNull()      // hour-start unix seconds (local-hour aligned by HK)
+                t.column("steps", .integer).notNull()
+                t.primaryKey(["deviceId", "ts"])
+            }
+        }
+        // v39 (#979): keep the v26 per-burst counter beside the waveform it segments. Existing rows stay
+        // nil because the counter was discarded before this migration and cannot be reconstructed.
+        migrator.registerMigration("v39-ppg-burst-index") { db in
+            try db.alter(table: "ppgWaveformSample") { t in
+                t.add(column: "burstIndex", .integer)
+            }
+        }
+
+        // v34: DURABLE per-sample SpO2 percentages from the 5/MG `@82` candidate byte.
+        //
+        // THE PROBLEM THIS FIXES. The strap emits its own computed SpO2 % on `@82` of the v18 record. That
+        // byte is already banked, raw, in `v18AuxSample.fields` (v31) — but `v18AuxSample` is CAPPED at
+        // `WhoopStore.v18AuxRetentionRows` (604,800 rows/device ≈ 7 days at 1 Hz), because the aux blob
+        // costs ~30 MB/day and an uncapped 30 MB/day table is not a thing a phone can carry. So every SpO2
+        // reading rolls off after a week and is gone permanently: the strap trims its own history the
+        // moment an offload is acked, so there is no second copy anywhere.
+        //
+        // Raising the aux cap is the WRONG fix — it would buy a year of SpO2 at the price of ~11 GB of
+        // mostly-unrelated aux bytes. The right fix is a narrow sibling: the in-band SpO2 signal is only
+        // ~2,000 samples/week (a run of ~30 one-second samples once per ~1,200 s, sleep-gated), i.e.
+        // ~100k rows/year, which is trivially retainable forever. This table is that sibling. The aux
+        // capture stays capped and unchanged; this one is never pruned.
+        //
+        // WHY NOT EXTEND `spo2Sample` (v3). Wrong shape, and extending it would corrupt a live reader:
+        //   1. `spo2Sample` is `(deviceId, ts, red, ir)` — two NOT NULL raw ADC channels off the WHOOP 4.0
+        //      v24 layout. We have a computed PERCENTAGE and no red/IR at all, so every insert would have
+        //      to fabricate `red`/`ir` values that were never measured. Absence-becomes-a-fabricated-0 is
+        //      exactly the failure mode the rest of this schema is built to avoid.
+        //   2. `AnalyticsEngine.nightlySpo2RawMeans` averages `red`/`ir` over that table into
+        //      `dailyMetric.spo2Red`/`spo2Ir`. Inserting rows carrying fake zeros would silently drag
+        //      those means toward zero — a live, user-visible tile broken by a storage decision.
+        //   3. The two are different physical quantities from different device generations. A percentage
+        //      and a pair of ADC counts sharing a table would need a discriminator column and every reader
+        //      would have to remember to apply it. A separate table makes the distinction unforgeable.
+        //
+        // `pct` is the RAW in-band byte (70...100), stored verbatim. Run grouping and acquisition-ramp
+        // trimming are deliberately NOT applied here — they are read-time policies, they have already
+        // changed once on the cloud reader, and a store that baked in the old policy would have destroyed
+        // the evidence needed to change them again. The one thing applied on the way in is the
+        // `spo2CandidateInBand` demultiplex (see `Spo2PctSample`), which is not a policy: `@82` carries
+        // measurements, bit-7 status sentinels, sub-70 diagnostic codes and 0 on the same byte, and only
+        // the `70...100` band is a percentage of anything. Storing a sentinel here would be storing a
+        // number that is not the quantity the column is named for.
+        //
+        // NOT PRUNED, by design — the same "durable decoded biometric history" class as `hrSample` and
+        // `ppgWaveformSample`. The `v18AuxSample` sweep in `StreamStore.insert` deletes only
+        // `FROM v18AuxSample`, so this table is untouched by it; `Spo2PctDurableTests` pins that.
+        // PK (deviceId, ts) mirrors every other per-sample table and makes re-ingest idempotent.
+        migrator.registerMigration("v34-spo2-pct-durable") { db in
+            try db.create(table: "spo2PctSample") { t in
+                t.column("deviceId", .text).notNull()
+                t.column("ts", .integer).notNull()      // strap-second, unix seconds
+                t.column("pct", .integer).notNull()     // raw in-band @82 byte, 70...100
                 t.primaryKey(["deviceId", "ts"])
             }
         }
