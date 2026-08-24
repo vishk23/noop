@@ -118,9 +118,9 @@ final class RawHistoryArchiveEvictionTests: XCTestCase {
     /// A synthetic WHOOP 5/MG type-47 record: a non-zero 21-byte header (type @8 = 47, hist_version @9),
     /// then `payloadBytes` of payload, then a 4-byte CRC trailer.
     ///
-    /// `payloadByte: 0` reproduces the measured `enable_raw_data_w_ecg` placeholder — the strap banks one
-    /// such record per second and every byte from offset 21 to the CRC is zero. `marker` writes a single
-    /// distinguishing byte into the payload, which is also what makes a frame informative.
+    /// `payloadByte: 0` reproduces the measured empty record — a 5/MG banks one per second with every
+    /// byte from offset 21 to the CRC trailer zero. `marker` writes a single distinguishing byte into
+    /// the payload, which is also what makes a frame informative.
     private func whoop5Frame(version: UInt8, payloadByte: UInt8,
                              payloadBytes: Int = 64, marker: UInt8? = nil) -> [UInt8] {
         var f = [UInt8](repeating: 0x11, count: 21)          // non-zero header (seq/ts/const bytes)
@@ -152,10 +152,10 @@ final class RawHistoryArchiveEvictionTests: XCTestCase {
         XCTAssertFalse(RawHistoryArchive.hasZeroPayload([0xAA, 0x01], family: .whoop5))
     }
 
-    /// The DEFECT: with `enable_raw_data_w_ecg` armed the strap banks one all-zero record per second, so
-    /// a purely age-ordered archive evicts a real contact-window record within the half hour. An
-    /// informative frame must outrank an all-zero one of the SAME layout version, even when it is the
-    /// oldest line in the file and the empties are the newest.
+    /// The DEFECT: a 5/MG has been measured banking one all-zero record per second, so a purely
+    /// age-ordered archive evicts everything informative within ~21 minutes. An informative frame must
+    /// outrank an all-zero one of the SAME layout version, even when it is the oldest line in the file
+    /// and the empties are the newest.
     func testZeroPayloadFramesAreEvictedBeforeInformativeOnes() {
         let dir = tmpDir("zero"); defer { try? FileManager.default.removeItem(at: dir) }
         let archive = RawHistoryArchive(directory: dir, maxBytes: 4_096,
@@ -210,24 +210,31 @@ final class RawHistoryArchiveEvictionTests: XCTestCase {
                                     "an all-empty version must keep its small floor, not vanish")
     }
 
+    /// The eviction target is a low-water mark BELOW the cap, not the cap itself. Without the headroom an
+    /// archive sitting at the cap read-parse-rewrites the whole file on every subsequent batch, and during
+    /// an offload those batches arrive at up to one record per strap-second on the main actor.
+    func testEvictionLeavesHeadroomSoAOneHzStreamDoesNotRewriteEveryRecord() {
+        let lines = (0..<400).map { jsonl(18, filler: String(format: "%02x", $0 & 0xFF)) }
+        let kept = RawHistoryArchive.evictLines(lines, maxBytes: 4_096, floor: 2)
+        let bytes = kept.reduce(0) { $0 + $1.utf8.count }
+        XCTAssertLessThanOrEqual(bytes, 4_096 - 4_096 / RawHistoryArchive.lowWaterDivisor,
+                                 "eviction must go PAST the cap to 7/8 of it, or every subsequent batch "
+                                     + "rewrites the whole file")
+    }
+
+    /// The shipped floors are the documented ones, and the zero floor is far smaller than the real one —
+    /// a few dated samples of an empty layout, not a share of the archive comparable to real records.
+    func testShippedFloors() {
+        XCTAssertEqual(RawHistoryArchive.perVersionFloor, 64)
+        XCTAssertEqual(RawHistoryArchive.zeroPayloadFloor, 8)
+        XCTAssertLessThan(RawHistoryArchive.zeroPayloadFloor, RawHistoryArchive.perVersionFloor)
+        XCTAssertEqual(RawHistoryArchive.maxBytes, 5 * 1024 * 1024, "the cap was deliberately not raised")
+    }
+
     /// One archived JSONL line for `frame`, in the exact shape `archive` writes.
     private func archiveLine(_ frame: [UInt8], family: DeviceFamily = .whoop5) -> String {
         let hex = frame.map { String(format: "%02x", $0) }.joined()
         return "{\"capturedAtMs\":1,\"trim\":1,\"family\":\"\(family.rawValue)\",\"frameHex\":\"\(hex)\"}\n"
-    }
-
-    // MARK: - operator summary
-
-    /// The summary is the after-an-experiment check: it must separate informative frames from
-    /// placeholders rather than reporting one healthy-looking line count.
-    func testSummarySplitsInformativeFromZeroPayload() {
-        var lines = [archiveLine(whoop5Frame(version: 22, payloadByte: 0, marker: 0xE7))]
-        for _ in 0..<5 { lines.append(archiveLine(whoop5Frame(version: 22, payloadByte: 0))) }
-        let text = RawHistoryArchive.summaryText(lines: lines, sizeBytes: 4_096, newest: 3)
-        XCTAssertTrue(text.contains("whoop5 v22"), text)
-        XCTAssertTrue(text.contains("1 informative, 5 all-zero payload"), text)
-        XCTAssertTrue(text.contains("Newest 3 capture(s)"), text)
-        XCTAssertTrue(RawHistoryArchive.summaryText(lines: [], sizeBytes: 0).contains("EMPTY"))
     }
 
     /// `evictLines` is the pure core: a flood of common-version lines plus two rare-version lines (the

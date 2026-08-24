@@ -8,8 +8,8 @@ import XCTest
 /// `heart_rate`/`gravity_x`?". That screen is the wrong question for a layout NOOP has no field map
 /// for: a record from an unmapped version that answered yes was kept NOWHERE — not as rows (nothing
 /// mapped it) and not as bytes (it passed the archive filter) — and the strap freed it on the very next
-/// trim ack. An on-demand capture (the MG's ~30 s ECG record, banked to flash and pulled back in a
-/// later offload) is exactly the shape of record that can look well-formed enough to pass.
+/// trim ack. A record type NOOP has not mapped yet — banked to flash by a newer firmware and pulled
+/// back in a later offload — is exactly the shape that can look well-formed enough to pass.
 ///
 /// The screen survived in practice only because of an accident: the unmapped branch of
 /// `decodeWhoop5Historical` reads no offsets, so today nothing but `hist_version` ever lands in

@@ -13,9 +13,9 @@ import org.junit.Test
  * [rejectedHistoricalRecords] used to ask only "did [decodeHistorical] produce a record?". That screen is
  * the wrong QUESTION for a layout NOOP has no field map for: a record from an unmapped version that
  * answered yes would be kept NOWHERE — not as rows (nothing mapped it) and not as bytes (it passed the
- * archive filter) — and the strap frees it on the very next trim ack. An on-demand capture (the MG's ~30 s
- * ECG record, banked to flash and pulled back in a later offload) is exactly the shape of record that can
- * look well-formed enough to pass.
+ * archive filter) — and the strap frees it on the very next trim ack. A record type NOOP has not mapped
+ * yet — banked to flash by a newer firmware and pulled back in a later offload — is exactly the shape
+ * that can look well-formed enough to pass.
  *
  * The screen survives in practice only because of an accident: [decodeWhoop5Historical] returns null for
  * every version but 18 (`unmappedLayoutsDecodeNothing` pins that this is true right now). One added
@@ -56,7 +56,11 @@ class UnmappedHistoricalLayoutTest {
     @Test fun unmappedLayoutIsArchivedEvenThoughItsBytesDecodeCleanlyAsV18() {
         // Precondition: read as its true version, this record decodes everything the old screen wanted.
         val asV18 = decodeHistorical(bytes(whoop5V18Hex), DeviceFamily.WHOOP5)!!
-        assertEquals("precondition: these bytes DO decode a unix", 1780916150, asV18["unix"])
+        // #869 widened the decoded `unix` from Int to Long — a u32 with bit 31 set narrowed to a NEGATIVE
+        // Int, which the #547 plausibility gate then dropped, silently losing all history from 2038-01-19
+        // (and today on a future-dated strap). The value here is unchanged; only its type is wider, so the
+        // literal needs the L or assertEquals compares Integer against Long and fails on the box.
+        assertEquals("precondition: these bytes DO decode a unix", 1780916150L, asV18["unix"])
         assertEquals("precondition: these bytes DO decode a heart rate", 102, asV18["heart_rate"])
         assertTrue("precondition: these bytes DO decode a gravity vector", asV18["gravity_x"] is Double)
 

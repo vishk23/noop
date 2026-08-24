@@ -197,12 +197,13 @@ class RawHistoryArchive(
          * [PER_VERSION_FLOOR], because such a record carries no information beyond "the strap banked a
          * record at time T".
          *
-         * Measured motivation: with `enable_raw_data_w_ecg` armed, a WHOOP MG banks one 1584-byte record
-         * PER SECOND whose every byte from offset 21 to the CRC32 trailer is zero (invariant across 1,307
-         * captured frames). At ~3.2 KB per hex JSONL line that fills the whole 5 MB archive in ~25
-         * minutes, so under a purely age-ordered policy an actual ECG record captured during the
-         * electrode-contact window is evicted by placeholders within the half hour. Keeping a handful
-         * still proves the artefact exists (and dates it); keeping thousands buys nothing and costs the
+         * Measured motivation, from a WHOOP MG offload: 1,275 consecutive type-47 records of layout
+         * version 16, 1584 bytes each, every byte from offset 21 to the 4-byte CRC32 trailer zero in
+         * EVERY one. The records' own frame clock advanced by 1 s across 933 of the gaps and 0 s across
+         * the other 339 — a contiguous 1 Hz producer, not a burst. At ~3.2 KB per hex JSONL line the 5 MB
+         * archive holds about 1,500 of them, i.e. ~21 minutes of retention: under a purely age-ordered
+         * policy every informative record older than that is gone, evicted by frames that carry nothing.
+         * Keeping a handful still proves the artefact exists (and dates it); keeping thousands costs the
          * evidence. Twin of the Swift `RawHistoryArchive.zeroPayloadFloor`.
          */
         const val ZERO_PAYLOAD_FLOOR = 8
@@ -302,12 +303,12 @@ class RawHistoryArchive(
          *     layout (WHOOP 4 v19, WHOOP 5 v20/v21) always survives even when common versions fill the
          *     archive.
          *
-         * Band 2 is what keeps an ECG capture recoverable. A 5/MG with `enable_raw_data_w_ecg` armed banks
-         * one all-zero 1584-byte record per second; age-ordered eviction alone would flush a real
-         * contact-window record out of a 5 MB archive within ~25 minutes of placeholders, and an all-zero
-         * payload demonstrably carries nothing that would be worth that trade. Band 4's split floor means
-         * a version whose records are ALL empty still keeps a few dated samples of the artefact, while the
-         * full [floor] stays reserved for records that actually contain something.
+         * Band 2 is what keeps a rare informative record recoverable. A 5/MG has been measured banking one
+         * all-zero 1584-byte record per second (see [ZERO_PAYLOAD_FLOOR]); age-ordered eviction alone
+         * flushes the whole archive within ~21 minutes of that, and an all-zero payload carries nothing
+         * that would be worth the trade. Band 4's split floor means a version whose records are ALL empty
+         * still keeps a few dated samples of the artefact, while the full [floor] stays reserved for
+         * records that actually contain something.
          *
          * Once eviction has to run at all it evicts to [LOW_WATER_DIVISOR] below the cap rather than to
          * exactly the cap, so a 1 Hz stream no longer rewrites the whole file once per record.

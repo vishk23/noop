@@ -41,13 +41,13 @@ struct RawHistoryArchive {
     /// `perVersionFloor`, because such a record carries no information beyond "the strap banked a record
     /// at time T".
     ///
-    /// Measured motivation: with `enable_raw_data_w_ecg` armed, a WHOOP MG banks one 1584-byte record
-    /// PER SECOND whose every byte from offset 21 to the CRC32 trailer is zero (invariant across 1,307
-    /// captured frames). At ~3.2 KB per hex JSONL line that fills the whole 5 MB archive in ~25 minutes,
-    /// so under a purely age-ordered policy an actual ECG record captured during the electrode-contact
-    /// window is evicted by placeholders within the half hour — the most likely reason the 2026-07-27
-    /// contact frames were already gone by the 2026-08-03 analysis. Keeping a handful still proves the
-    /// artefact exists (and dates it); keeping thousands buys nothing and costs the evidence.
+    /// Measured motivation, from a WHOOP MG offload: 1,275 consecutive type-47 records of layout version
+    /// 16, 1584 bytes each, every byte from offset 21 to the 4-byte CRC32 trailer zero in EVERY one. The
+    /// records' own frame clock advanced by 1 s across 933 of the gaps and 0 s across the other 339 — a
+    /// contiguous 1 Hz producer, not a burst. At ~3.2 KB per hex JSONL line the 5 MB archive holds about
+    /// 1,500 of them, i.e. ~21 minutes of retention: under a purely age-ordered policy every
+    /// informative record older than that is gone, evicted by frames that carry nothing. Keeping a
+    /// handful still proves the artefact exists (and dates it); keeping thousands costs the evidence.
     static let zeroPayloadFloor = 8
 
     /// First byte of a record's PAYLOAD region — everything past the record header, ending at the 4-byte
@@ -115,6 +115,11 @@ struct RawHistoryArchive {
         self.maxBytes = maxBytes
         self.perVersionFloor = perVersionFloor
         self.zeroPayloadFloor = zeroPayloadFloor
+        #if os(iOS)
+        // Migrate an archive created by an older build while launch is normally foreground/unlocked.
+        // The write path repeats this before every append so a first background write is covered too.
+        try? prepareStorageForBackgroundAccess()
+        #endif
     }
 
     /// The archive file URL (does not create anything).
@@ -147,6 +152,14 @@ struct RawHistoryArchive {
     func archive(_ frames: [[UInt8]], trim: UInt32, family: DeviceFamily) -> Result {
         guard !frames.isEmpty else { return .written(count: 0) }
         let url = fileURL
+        // Ensure the directory exists AND (on iOS) carries after-first-unlock protection before the reads
+        // below, so a locked background wake can read the existing archive and rewrite it rather than
+        // failing the mandatory pre-ack write. Directory creation is the only hard failure here.
+        do {
+            try prepareStorageForBackgroundAccess()
+        } catch {
+            return .failed
+        }
         let capturedAtMs = Date().timeIntervalSince1970 * 1000
         // Build the new JSONL lines (each newline-terminated). The version that drives floor-aware
         // retention (#344) is re-derived per line from the stored frame inside `evictLines`.
@@ -181,16 +194,16 @@ struct RawHistoryArchive {
         }
 
         // Over cap: rewrite with floor-aware eviction. Read existing lines (oldest first), append the
-        // new lines (which sort newest), then drop oldest surplus until we fit — never dropping a line
-        // within the newest `perVersionFloor` of its version. `evictLines` is the pure, unit-tested core.
+        // new lines (which sort newest), then drop the weakest-value surplus until we fit — never a line
+        // inside a per-version floor. `evictLines` is the pure, unit-tested core and documents the bands.
         let existing = (try? String(contentsOf: url, encoding: .utf8))
             .map { $0.split(separator: "\n", omittingEmptySubsequences: true).map { String($0) + "\n" } } ?? []
         let kept = RawHistoryArchive.evictLines(existing + newLines, maxBytes: maxBytes,
                                                floor: perVersionFloor, zeroFloor: zeroPayloadFloor)
         let data = Data(kept.joined().utf8)
         do {
-            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
             try data.write(to: url, options: .atomic)   // atomic rewrite; durable before the ack
+            applyBackgroundProtectionToArchive()        // atomic replace makes a new inode — re-protect it
             return .written(count: frames.count)
         } catch {
             return .failed
@@ -199,7 +212,7 @@ struct RawHistoryArchive {
 
     /// Append `data` to `url`, fsyncing before returning so it is durable BEFORE the trim ack.
     private func appendDurably(_ data: Data, to url: URL) throws {
-        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        try prepareStorageForBackgroundAccess()
         if FileManager.default.fileExists(atPath: url.path) {
             let handle = try FileHandle(forWritingTo: url)
             defer { try? handle.close() }
@@ -208,7 +221,39 @@ struct RawHistoryArchive {
             try handle.synchronize()   // durable BEFORE the ack — the point of the archive
         } else {
             try data.write(to: url, options: .atomic)
+            applyBackgroundProtectionToArchive()   // new file — set its protection (existing files keep theirs)
         }
+    }
+
+    /// Make the reject archive readable after the first unlock, matching the primary SQLite store's policy
+    /// in `StorePaths`. Background BLE can be woken while the phone is locked; the iOS default (complete)
+    /// protection would otherwise make this mandatory pre-ack write fail and force the strap to resend the
+    /// same history chunk. Applied to the directory (future files inherit it) and any archive left by an
+    /// older build. Non-iOS platforms only need the directory created — protection classes don't apply.
+    private func prepareStorageForBackgroundAccess() throws {
+        let fm = FileManager.default
+        try fm.createDirectory(at: directory, withIntermediateDirectories: true)
+        #if os(iOS)
+        let protection: [FileAttributeKey: Any] = [
+            .protectionKey: FileProtectionType.completeUntilFirstUserAuthentication,
+        ]
+        try? fm.setAttributes(protection, ofItemAtPath: directory.path)
+        if fm.fileExists(atPath: fileURL.path) {
+            try? fm.setAttributes(protection, ofItemAtPath: fileURL.path)
+        }
+        #endif
+    }
+
+    /// Atomic replacement creates a NEW inode, so re-apply the file protection after every fresh write
+    /// rather than relying on directory inheritance alone. Best-effort — the directory policy is the
+    /// durable guarantee; this closes the window on the specific file.
+    private func applyBackgroundProtectionToArchive() {
+        #if os(iOS)
+        try? FileManager.default.setAttributes(
+            [.protectionKey: FileProtectionType.completeUntilFirstUserAuthentication],
+            ofItemAtPath: fileURL.path
+        )
+        #endif
     }
 
     /// How one archived line is classified for retention: which version bucket it belongs to, and
@@ -229,7 +274,8 @@ struct RawHistoryArchive {
     /// The frame bytes + family of one archived JSONL line, or `nil` if the line is malformed.
     /// Hand-parsed to match the hand-built writer: the only dynamic fields are `family` and the
     /// [0-9a-f] `frameHex`. Shared by `readAll`, retention, and the operator summary so all three agree
-    /// on exactly which lines are readable. Twin of the Android `RawHistoryArchive.parseArchiveLine`.
+    /// on exactly which lines are readable — retention must never protect a line the read-back would then
+    /// skip. Twin of the Android `RawHistoryArchive.parseArchiveLine`.
     static func parseArchiveLine<S: StringProtocol>(_ line: S) -> (frame: [UInt8], family: DeviceFamily)? {
         guard let fr = line.range(of: "\"family\":\""),
               let hr = line.range(of: "\"frameHex\":\"") else { return nil }
@@ -265,17 +311,16 @@ struct RawHistoryArchive {
     ///  4. floor-protected lines, never evicted: the newest `zeroFloor` zero-payload lines of each
     ///     version and the newest `floor` informative lines of each version.
     ///
-    /// Band 2 is what keeps an ECG capture recoverable. A 5/MG with `enable_raw_data_w_ecg` armed banks
-    /// one all-zero 1584-byte record per second; age-ordered eviction alone would flush a real
-    /// contact-window record out of a 5 MB archive within ~25 minutes of placeholders, and an all-zero
-    /// payload demonstrably carries nothing that would be worth that trade. Band 4's split floor means a
-    /// version whose records are ALL empty still keeps a few dated samples of the artefact, while the
-    /// full `floor` stays reserved for records that actually contain something.
+    /// Band 2 is what keeps a rare informative record recoverable. A 5/MG has been measured banking one
+    /// all-zero 1584-byte record per second (see `zeroPayloadFloor`); age-ordered eviction alone flushes
+    /// the whole archive within ~21 minutes of that, and an all-zero payload carries nothing that would
+    /// be worth the trade. Band 4's split floor means a version whose records are ALL empty still keeps a
+    /// few dated samples of the artefact, while the full `floor` stays reserved for records that
+    /// actually contain something.
     ///
     /// Bounded: if everything left is floor-protected it stops even if still over cap (the floor wins —
-    /// `(floor + zeroFloor) × distinctVersions` is tiny). Twin of the Android
-    /// `RawHistoryArchive.evictLines`, whose `zeroFloor` is defaulted for the same reason it is here — so
-    /// existing call sites do not have to churn.
+    /// `(floor + zeroFloor) × distinctVersions` is tiny). Mirrors the Android
+    /// `RawHistoryArchive.evictLines`.
     static func evictLines(_ lines: [String], maxBytes: Int, floor: Int,
                            zeroFloor: Int = RawHistoryArchive.zeroPayloadFloor) -> [String] {
         // Mark the newest `floor` informative and newest `zeroFloor` zero-payload indices of each version
@@ -315,8 +360,8 @@ struct RawHistoryArchive {
     }
 
     /// Every archived frame with its strap family, oldest first — the read-back of the JSONL that
-    /// `archive` writes. Malformed lines are skipped; an absent/empty file yields []. (Hand-parsed to
-    /// match the hand-built writer: the only dynamic fields are `family` and the [0-9a-f] `frameHex`.)
+    /// `archive` writes. Malformed lines are skipped; an absent/empty file yields []. Parsed through the
+    /// same `parseArchiveLine` retention uses, so the two can never disagree on what is readable.
     func readAll() -> [(frame: [UInt8], family: DeviceFamily)] {
         guard let text = try? String(contentsOf: fileURL, encoding: .utf8) else { return [] }
         return text.split(separator: "\n").compactMap { RawHistoryArchive.parseArchiveLine($0) }

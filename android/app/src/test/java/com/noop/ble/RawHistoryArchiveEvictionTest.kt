@@ -60,9 +60,9 @@ class RawHistoryArchiveEvictionTest {
      * A synthetic WHOOP 5/MG type-47 record: a non-zero 21-byte header (type @8 = 47, hist_version @9),
      * then [payloadBytes] of payload, then a 4-byte CRC trailer.
      *
-     * [payloadByte] = 0 reproduces the measured `enable_raw_data_w_ecg` placeholder — the strap banks one
-     * such record per second and every byte from offset 21 to the CRC is zero. [marker] writes a single
-     * distinguishing byte into the payload, which is also what makes a frame informative.
+     * [payloadByte] = 0 reproduces the measured empty record — a 5/MG banks one per second with every
+     * byte from offset 21 to the CRC trailer zero. [marker] writes a single distinguishing byte into the
+     * payload, which is also what makes a frame informative.
      */
     private fun whoop5Frame(
         version: Int,
@@ -110,10 +110,10 @@ class RawHistoryArchiveEvictionTest {
     }
 
     /**
-     * THE DEFECT. With `enable_raw_data_w_ecg` armed the strap banks one all-zero record per second, so a
-     * purely age-ordered archive evicts a real contact-window record within the half hour. An informative
-     * frame must outrank an all-zero one of the SAME layout version, even when it is the OLDEST line in
-     * the file and the empties are the newest — so no floor can be what saves it.
+     * THE DEFECT. A 5/MG has been measured banking one all-zero record per second, so a purely
+     * age-ordered archive evicts everything informative within ~21 minutes. An informative frame must
+     * outrank an all-zero one of the SAME layout version, even when it is the OLDEST line in the file and
+     * the empties are the newest — so no floor can be what saves it.
      */
     @Test fun evictLinesEvictsZeroPayloadBeforeInformative() {
         val informative = archiveLine(whoop5Frame(22, payloadByte = 0, marker = 0xE7))

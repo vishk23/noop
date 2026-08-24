@@ -28,14 +28,31 @@ public struct CachedSleepSession: Equatable, Codable {
     public let startTsAdjusted: Int?
     /// The onset to display / stage from: the user's correction if present, else the detected `startTs`.
     public var effectiveStartTs: Int { startTsAdjusted ?? startTs }
+    /// True when this night's on-device staging ran on SPARSE motion coverage (`SleepStager.isGravitySparse`
+    /// — the same signal that downgrades Rest confidence, #345). A sparse night is unreliable and can
+    /// UNDER-detect: the gravity-only spine fragments and the sub-60-min pieces are dropped, so a real ~8h
+    /// night can collapse to ~1h. The UI reads this to caption "sleep may be incomplete" honestly instead
+    /// of presenting the short total as fact. nil for imported nights and pre-migration rows (unknown, not
+    /// flagged). Set per session to the DAY's value; only NOOP-computed nights populate it. Byte-parity twin.
+    public let stagingSparse: Bool?
     public init(startTs: Int, endTs: Int, efficiency: Double?, restingHr: Int?,
                 avgHrv: Double?, stagesJSON: String?, userEdited: Bool = false,
-                startTsAdjusted: Int? = nil) {
+                startTsAdjusted: Int? = nil, stagingSparse: Bool? = nil) {
         self.startTs = startTs; self.endTs = endTs
         self.efficiency = efficiency; self.restingHr = restingHr
         self.avgHrv = avgHrv; self.stagesJSON = stagesJSON
         self.userEdited = userEdited
         self.startTsAdjusted = startTsAdjusted
+        self.stagingSparse = stagingSparse
+    }
+
+    /// A copy re-keyed to `newStartTs`, every other field (including the stage segments) unchanged. Used by
+    /// the #1284 generation-side onset keying to set the session's PK to the rounded 0x49 onset (the stable
+    /// per-night anchor); the onset key differs from the end-anchored first-code time by at most the grid.
+    public func withStartTs(_ newStartTs: Int) -> CachedSleepSession {
+        CachedSleepSession(startTs: newStartTs, endTs: endTs, efficiency: efficiency, restingHr: restingHr,
+                           avgHrv: avgHrv, stagesJSON: stagesJSON, userEdited: userEdited,
+                           startTsAdjusted: startTsAdjusted, stagingSparse: stagingSparse)
     }
 }
 
@@ -72,7 +89,7 @@ public struct DailyMetric: Equatable, Codable {
     /// BROAD autonomic-variability twin of `avgHrv` (which is RMSSD for the strap: the fast, vagal,
     /// "recovered today?" metric). The 5-min index — not a single whole-night SD — is stored deliberately:
     /// whole-night SD is dominated by the slow HR drift across sleep stages (reads 2-3× high) and is not
-    /// comparable to a watch's short-window SDNN; the index is. v29 column, nullable: WHOOP/on-device nights
+    /// comparable to a watch's short-window SDNN; the index is. v31 column, nullable: WHOOP/on-device nights
     /// compute it from the night's R-R (`HRVAnalyzer.sdnnIndex`); Apple rows mirror their own SDNN reading;
     /// Oura/other imports carry no SDNN so it stays nil.
     public let avgSdnn: Double?
@@ -136,8 +153,8 @@ extension WhoopStore {
                 try db.execute(sql: """
                     INSERT INTO sleepSession
                         (deviceId, startTs, endTs, efficiency, restingHr, avgHrv, stagesJSON,
-                         userEdited, startTsAdjusted)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                         userEdited, startTsAdjusted, stagingSparse)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(deviceId, startTs) DO UPDATE SET
                         -- A user-corrected night keeps its hand-set bed/wake times and stage breakdown;
                         -- a recompute/import refresh (this path) updates only the derived vitals. The
@@ -149,9 +166,12 @@ extension WhoopStore {
                         avgHrv = excluded.avgHrv,
                         stagesJSON = CASE WHEN sleepSession.userEdited THEN sleepSession.stagesJSON ELSE excluded.stagesJSON END,
                         startTsAdjusted = CASE WHEN sleepSession.userEdited THEN sleepSession.startTsAdjusted ELSE excluded.startTsAdjusted END,
-                        userEdited = sleepSession.userEdited
+                        userEdited = sleepSession.userEdited,
+                        -- Derived from the day's motion coverage, so a recompute always refreshes it.
+                        stagingSparse = excluded.stagingSparse
                     """, arguments: [deviceId, s.startTs, s.endTs, s.efficiency,
-                                     s.restingHr, s.avgHrv, s.stagesJSON, s.userEdited, s.startTsAdjusted])
+                                     s.restingHr, s.avgHrv, s.stagesJSON, s.userEdited, s.startTsAdjusted,
+                                     s.stagingSparse])
                 n += db.changesCount
             }
             return n
@@ -453,7 +473,7 @@ extension WhoopStore {
         try syncRead { db in
             try Row.fetchAll(db, sql: """
                 SELECT startTs, endTs, efficiency, restingHr, avgHrv, stagesJSON, userEdited,
-                       startTsAdjusted FROM sleepSession
+                       startTsAdjusted, stagingSparse FROM sleepSession
                 WHERE deviceId = ? AND startTs >= ? AND startTs <= ?
                 ORDER BY startTs ASC LIMIT ?
                 """, arguments: [deviceId, from, to, limit])
@@ -461,7 +481,8 @@ extension WhoopStore {
                     CachedSleepSession(startTs: $0["startTs"], endTs: $0["endTs"],
                                        efficiency: $0["efficiency"], restingHr: $0["restingHr"],
                                        avgHrv: $0["avgHrv"], stagesJSON: $0["stagesJSON"],
-                                       userEdited: $0["userEdited"], startTsAdjusted: $0["startTsAdjusted"])
+                                       userEdited: $0["userEdited"], startTsAdjusted: $0["startTsAdjusted"],
+                                       stagingSparse: $0["stagingSparse"])
                 }
         }
     }
