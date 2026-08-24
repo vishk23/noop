@@ -110,6 +110,53 @@ public enum Baselines {
     public static let minNightsTrust: Int = 14
     /// Missing-night count after which a baseline is marked stale.
     public static let staleDays: Int = 14
+    /// How many days a nightly VITAL may be carried forward and still be presented as the "latest"
+    /// reading. A carry exists so one missed night doesn't blank a tile — not so a months-old value
+    /// reads as tonight's measurement. Past this age the tile must show "—": a silent stale number is
+    /// worse than no number, because the reader takes it for a current measurement (which is exactly
+    /// what a 14-day-old imported respiratory rate did, surfacing as "Respiratory 15.6" on the Sleep
+    /// tab's Night detail with no date beside it). A week comfortably covers a missed night or a
+    /// weekend off-strap while staying decisively short of `staleDays`, past which the personal
+    /// baseline that judges the value is itself stale. Byte-twin of the Android `vitalCarryDays`.
+    public static let vitalCarryDays: Int = 7
+
+    /// The freshest `(day, value)` pair that is still fresh enough to present as "latest", or nil when
+    /// the newest one is older than `vitalCarryDays` relative to `todayKey`. Both keys are `yyyy-MM-dd`,
+    /// which compares chronologically as a string, so no calendar math (or time zone) is involved —
+    /// `points` need only be sorted oldest→newest. Shared by every "latest vital" resolver so the Sleep
+    /// tab's Night detail, the Health tab's Vital Signs and the Android twin cannot disagree about when
+    /// a carried value has gone stale.
+    public static func freshestCarried<T>(_ points: [(day: String, value: T)],
+                                          todayKey: String,
+                                          carryDays: Int = vitalCarryDays) -> (day: String, value: T)? {
+        guard let newest = points.last else { return nil }
+        return newest.day >= cutoffKey(todayKey: todayKey, carryDays: carryDays) ? newest : nil
+    }
+
+    /// The oldest `yyyy-MM-dd` a carried vital may bear: `todayKey − carryDays` days. The parse, the
+    /// calendar and the format all pin UTC, so the arithmetic is pure key math and never shifts a day
+    /// under a local time zone or a DST edge. An unparseable key yields `todayKey`, which admits only
+    /// today — fail closed, never carry.
+    public static func cutoffKey(todayKey: String, carryDays: Int = vitalCarryDays) -> String {
+        guard let today = dayKeyFormatter.date(from: todayKey),
+              let cutoff = utcCalendar.date(byAdding: .day, value: -carryDays, to: today)
+        else { return todayKey }
+        return dayKeyFormatter.string(from: cutoff)
+    }
+
+    private static let utcCalendar: Calendar = {
+        var c = Calendar(identifier: .gregorian)
+        c.timeZone = TimeZone(identifier: "UTC")!
+        return c
+    }()
+
+    private static let dayKeyFormatter: DateFormatter = {
+        let f = DateFormatter()
+        f.locale = Locale(identifier: "en_US_POSIX")
+        f.timeZone = TimeZone(identifier: "UTC")
+        f.dateFormat = "yyyy-MM-dd"
+        return f
+    }()
 
     // MARK: - Early-life anti-anchoring (Reddit HRV report)
     //
@@ -177,6 +224,16 @@ public enum Baselines {
         "strain": MetricCfg(minVal: 0.0, maxVal: 100.0, floorSpread: 5.0,
                             halfLifeB: 14.0, halfLifeS: 21.0),
 
+        // Readiness HRV baseline, folded in the LOG domain with hard-outlier rejection OFF (RD2 · the
+        // window-fold spine mode — see Baselines.update's `rejectHardOutliers`). ReadinessEngine
+        // z-scores lnRMSSD (RD1: HRV is right-skewed), so these bounds/floor are in LN(ms) units — NOT
+        // the raw-ms "hrv" config above (which the RecoveryScorer folds linearly, untouched).
+        // minVal/maxVal = ln(8)/ln(250), the plausible HRV band in ln. floorSpread 0.08 (ln) sits just
+        // below a real wearer's own ln-HRV night-to-night spread (~0.10, measured on real WHOOP nights),
+        // so personal spread drives the z while an ultra-stable baseline is floored against saturation.
+        "readiness_hrv_ln": MetricCfg(minVal: 2.079, maxVal: 5.521, floorSpread: 0.08,
+                                      halfLifeB: 14.0, halfLifeS: 21.0),
+
         // Daytime/waking-hours configs (DaytimeStress baseline-relative mode, added alongside
         // the day-relative default). Distinct from "resting_hr"/"hrv" above, which each fold ONE
         // NIGHTLY value (sleep). These fold ONE DAYTIME aggregate per day into a cross-day
@@ -198,16 +255,6 @@ public enum Baselines {
                                 halfLifeB: 14.0, halfLifeS: 21.0),
         "daytime_rmssd": MetricCfg(minVal: 5.0, maxVal: 250.0, floorSpread: 7.0,
                                    halfLifeB: 14.0, halfLifeS: 21.0),
-
-        // Readiness HRV baseline, folded in the LOG domain with hard-outlier rejection OFF (RD2 · the
-        // window-fold spine mode — see Baselines.update's `rejectHardOutliers`). ReadinessEngine
-        // z-scores lnRMSSD (RD1: HRV is right-skewed), so these bounds/floor are in LN(ms) units — NOT
-        // the raw-ms "hrv" config above (which the RecoveryScorer folds linearly, untouched).
-        // minVal/maxVal = ln(8)/ln(250), the plausible HRV band in ln. floorSpread 0.08 (ln) sits just
-        // below a real wearer's own ln-HRV night-to-night spread (~0.10, measured on real WHOOP nights),
-        // so personal spread drives the z while an ultra-stable baseline is floored against saturation.
-        "readiness_hrv_ln": MetricCfg(minVal: 2.079, maxVal: 5.521, floorSpread: 0.08,
-                                      halfLifeB: 14.0, halfLifeS: 21.0),
     ]
 
     /// Convenience accessors for the standard configs.

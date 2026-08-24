@@ -650,6 +650,17 @@ extension WhoopStore {
         // #423: WHOOP 5/MG raw-IMU offload capture (100 Hz 6-axis). `samples` is a packed i16 LE BLOB of
         // the six wire columns (ax…az,gx…gz). Twin of the Android `rawImuSample` table (MIGRATION_20_21);
         // same column order + PK so a `.noopbak` round-trips byte-for-byte.
+        //
+        // CONSUMER STATUS — deliberately none on this platform, in the same shape as the `ppgWaveformSample`
+        // (v27) and `v18AuxSample` (v31) notes. The writer (`Collector.storeRawImu`) is instrument-first: it
+        // fires only with raw capture enabled AND a 5/MG deep-data unlock, and is bounded to
+        // `WhoopStore.rawImuRetentionRows` (3600 one-second buffers, a rolling window — not a corpus). No
+        // analytic, score, gate, UI or export reads a row: the only SQL is the retention DELETE (`StreamStore`)
+        // plus a COUNT in the storage-stats readout (`LocalAccessCore`); `ImuFeatureExtractor` takes the
+        // protocol struct, never this table, so it is not a consumer either. Swift has NO reader yet, on
+        // purpose — a reader lands WITH a validated consumer, not before ("artifact, not one match", CLAUDE.md).
+        // Android keeps a dormant `rawImuSamples` reader (zero callers) for the eventual cross-check; do NOT
+        // "clean up" either side as dead code — the retained rows are the deliverable. Audit: #978.
         migrator.registerMigration("v28-raw-imu") { db in
             try db.create(table: "rawImuSample") { t in
                 t.column("deviceId", .text).notNull()
@@ -876,6 +887,126 @@ extension WhoopStore {
             // CAST so the compare is numeric: `strftime` returns TEXT, and `ts` (INTEGER) > TEXT would
             // otherwise lean on SQLite's affinity coercion rather than being explicit.
             try db.execute(sql: "UPDATE rrInterval SET tsSuspect = 1 WHERE ts > CAST(strftime('%s','now') AS INTEGER)")
+        }
+        // v36 (#548): drop calibrated SpO₂ from WHOOP registry capabilities. Live NOOP never fills
+        // spo2Pct from the strap (import-only / experimental @82 candidate); advertising `spo2` made
+        // an empty Blood Oxygen tile look broken. Data-only UPDATE — no schema change. Twin of Room
+        // MIGRATION_29_30. Decode-time strip in DeviceRegistryStore is the belt; this is the suspenders.
+        migrator.registerMigration("v36-whoop-caps-no-spo2") { db in
+            let rows = try Row.fetchAll(
+                db,
+                sql: """
+                    SELECT id, capabilities FROM pairedDevice
+                    WHERE brand = 'WHOOP' OR id = 'my-whoop' OR id LIKE 'whoop-%'
+                    """
+            )
+            for row in rows {
+                let id: String = row["id"]
+                let encoded: String = row["capabilities"]
+                let stripped = WhoopLiveCapabilities.stripSpo2Token(fromEncoded: encoded)
+                if stripped != encoded && !stripped.isEmpty {
+                    try db.execute(
+                        sql: "UPDATE pairedDevice SET capabilities = ? WHERE id = ?",
+                        arguments: [stripped, id]
+                    )
+                }
+            }
+        }
+
+        // v37: persist nightly SDNN — the 5-min SDNN index (broad-variability twin of avgHrv=RMSSD),
+        // window-matched to a watch's short SDNN rather than the drift-inflated whole-night SD. Additive,
+        // nullable; computed by HRVAnalyzer.sdnnIndex during the nightly analysis.
+        //
+        // Numbered v37: upstream migrations advanced to v36 (`v36-whoop-caps-no-spo2`) while this branch
+        // was open, so this branch-local, never-shipped identifier is renumbered to the next free slot.
+        // Renumbering an unshipped identifier is free (GRDB tracks applied migrations by id, not number);
+        // renaming a SHIPPED one is not, so only this id moves.
+        migrator.registerMigration("v37-daily-avg-sdnn") { db in
+            // Fork convergence (`fork-ios-only` lineage in schema_oracle.json): installs that ran this
+            // fork's `v29-daily-avg-sdnn` already carry the column, and re-adding it would abort the
+            // migrator and wedge the database. GRDB has no ifNotExists for columns, so probe first.
+            if try !db.columns(in: "dailyMetric").contains(where: { $0.name == "avgSdnn" }) {
+                try db.alter(table: "dailyMetric") { t in
+                    t.add(column: "avgSdnn", .double)
+                }
+            }
+        }
+        // v38-apple-step-hour: hourly Apple Health step counts. The daily `collect(.stepCount, …)` path
+        // in HealthKitBridge flattens a whole day to one `appleDaily.steps` total, so a dead/absent phone
+        // for part of a day (e.g. the phone died mid-hike) is invisible — steps just read low for the
+        // WHOLE day instead of showing exactly which hours had no recording. HealthKit retains hourly
+        // statistics historically, so this table lets a one-time backfill answer PAST days
+        // retroactively, not just from the day this migration ships. `ts` is the hour-BUCKET START
+        // (unix seconds), aligned to local-clock hour boundaries by the `HKStatisticsCollectionQuery`
+        // anchored at local midnight (see HealthKitBridge); `steps` is the cumulative sum within that
+        // hour. PK (deviceId, ts) mirrors every other per-sample table (hrSample, stepSample, …) and
+        // makes the hourly upsert idempotent. Additive only — a NEW table, no existing row touched, old
+        // readers unaffected.
+        migrator.registerMigration("v38-apple-step-hour") { db in
+            // ifNotExists: forks/sideloads that already carry this table under a different migration
+            // identifier converge cleanly instead of failing the migrator.
+            try db.create(table: "appleStepHour", options: [.ifNotExists]) { t in
+                t.column("deviceId", .text).notNull()   // "apple-health"
+                t.column("ts", .integer).notNull()      // hour-start unix seconds (local-hour aligned by HK)
+                t.column("steps", .integer).notNull()
+                t.primaryKey(["deviceId", "ts"])
+            }
+        }
+        // v39 (#979): keep the v26 per-burst counter beside the waveform it segments. Existing rows stay
+        // nil because the counter was discarded before this migration and cannot be reconstructed.
+        migrator.registerMigration("v39-ppg-burst-index") { db in
+            try db.alter(table: "ppgWaveformSample") { t in
+                t.add(column: "burstIndex", .integer)
+            }
+        }
+
+        // v34: DURABLE per-sample SpO2 percentages from the 5/MG `@82` candidate byte.
+        //
+        // THE PROBLEM THIS FIXES. The strap emits its own computed SpO2 % on `@82` of the v18 record. That
+        // byte is already banked, raw, in `v18AuxSample.fields` (v31) — but `v18AuxSample` is CAPPED at
+        // `WhoopStore.v18AuxRetentionRows` (604,800 rows/device ≈ 7 days at 1 Hz), because the aux blob
+        // costs ~30 MB/day and an uncapped 30 MB/day table is not a thing a phone can carry. So every SpO2
+        // reading rolls off after a week and is gone permanently: the strap trims its own history the
+        // moment an offload is acked, so there is no second copy anywhere.
+        //
+        // Raising the aux cap is the WRONG fix — it would buy a year of SpO2 at the price of ~11 GB of
+        // mostly-unrelated aux bytes. The right fix is a narrow sibling: the in-band SpO2 signal is only
+        // ~2,000 samples/week (a run of ~30 one-second samples once per ~1,200 s, sleep-gated), i.e.
+        // ~100k rows/year, which is trivially retainable forever. This table is that sibling. The aux
+        // capture stays capped and unchanged; this one is never pruned.
+        //
+        // WHY NOT EXTEND `spo2Sample` (v3). Wrong shape, and extending it would corrupt a live reader:
+        //   1. `spo2Sample` is `(deviceId, ts, red, ir)` — two NOT NULL raw ADC channels off the WHOOP 4.0
+        //      v24 layout. We have a computed PERCENTAGE and no red/IR at all, so every insert would have
+        //      to fabricate `red`/`ir` values that were never measured. Absence-becomes-a-fabricated-0 is
+        //      exactly the failure mode the rest of this schema is built to avoid.
+        //   2. `AnalyticsEngine.nightlySpo2RawMeans` averages `red`/`ir` over that table into
+        //      `dailyMetric.spo2Red`/`spo2Ir`. Inserting rows carrying fake zeros would silently drag
+        //      those means toward zero — a live, user-visible tile broken by a storage decision.
+        //   3. The two are different physical quantities from different device generations. A percentage
+        //      and a pair of ADC counts sharing a table would need a discriminator column and every reader
+        //      would have to remember to apply it. A separate table makes the distinction unforgeable.
+        //
+        // `pct` is the RAW in-band byte (70...100), stored verbatim. Run grouping and acquisition-ramp
+        // trimming are deliberately NOT applied here — they are read-time policies, they have already
+        // changed once on the cloud reader, and a store that baked in the old policy would have destroyed
+        // the evidence needed to change them again. The one thing applied on the way in is the
+        // `spo2CandidateInBand` demultiplex (see `Spo2PctSample`), which is not a policy: `@82` carries
+        // measurements, bit-7 status sentinels, sub-70 diagnostic codes and 0 on the same byte, and only
+        // the `70...100` band is a percentage of anything. Storing a sentinel here would be storing a
+        // number that is not the quantity the column is named for.
+        //
+        // NOT PRUNED, by design — the same "durable decoded biometric history" class as `hrSample` and
+        // `ppgWaveformSample`. The `v18AuxSample` sweep in `StreamStore.insert` deletes only
+        // `FROM v18AuxSample`, so this table is untouched by it; `Spo2PctDurableTests` pins that.
+        // PK (deviceId, ts) mirrors every other per-sample table and makes re-ingest idempotent.
+        migrator.registerMigration("v34-spo2-pct-durable") { db in
+            try db.create(table: "spo2PctSample") { t in
+                t.column("deviceId", .text).notNull()
+                t.column("ts", .integer).notNull()      // strap-second, unix seconds
+                t.column("pct", .integer).notNull()     // raw in-band @82 byte, 70...100
+                t.primaryKey(["deviceId", "ts"])
+            }
         }
         return migrator
     }

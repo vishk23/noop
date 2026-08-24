@@ -6,6 +6,8 @@ import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.material.icons.automirrored.filled.KeyboardArrowRight
+import androidx.compose.material.icons.filled.MonitorHeart
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -78,9 +80,11 @@ import com.noop.analytics.FitnessAgeReadiness
 import com.noop.analytics.FitnessReadinessItem
 import com.noop.analytics.FitnessReadinessRole
 import com.noop.analytics.FitnessReadinessStatus
+import com.noop.analytics.SkinTempDisplay
 import com.noop.analytics.VitalBands
 import com.noop.ble.LiveState
 import com.noop.data.DailyMetric
+import com.noop.data.Vo2MaxEstimator
 import java.time.Instant
 import java.time.LocalDate
 import java.time.ZoneId
@@ -88,6 +92,8 @@ import java.time.format.DateTimeFormatter
 import java.util.Locale
 import kotlin.math.roundToInt
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
 
 // MARK: - Health Monitor (ported from Strand/Screens/HealthView.swift)
 //
@@ -108,6 +114,7 @@ fun HealthScreen(
     onVitalClick: (String) -> Unit = {},
     onOpenLabBook: () -> Unit = {},
     onOpenFusedRecord: () -> Unit = {},
+    onOpenSettings: () -> Unit = {},
 ) {
     val context = LocalContext.current
     val profile = remember { ProfileStore.from(context.applicationContext) }
@@ -118,6 +125,9 @@ fun HealthScreen(
     // analytics pass and published by the ViewModel. Cycle awareness gates on its opt-in pref.
     val v5Signals by vm.v5Signals.collectAsStateWithLifecycle()
     val cycleEnabled by vm.cycleTrackingEnabled.collectAsStateWithLifecycle()
+    val cycleHidden by vm.cycleAwarenessHidden.collectAsStateWithLifecycle()
+    val periodStarts by vm.periodStarts.collectAsStateWithLifecycle()
+    var showCycleTracker by remember { mutableStateOf(false) }
     val hrMax = profile.hrMax
 
     // Health Monitor shows live HR too, so it must keep the realtime stream on while it's visible —
@@ -137,6 +147,10 @@ fun HealthScreen(
     // Mirrors the shipped Today liveSnap fix. Appearance-preserving.
     val live by vm.live.collectAsStateWithLifecycle()
     val bpm by vm.bpm.collectAsStateWithLifecycle()
+    // #103: collect reactively (not .value) so the Latest-readings card recomposes on its own when the
+    // SpO₂ candidate map updates, matching VitalSignsScreen — not only incidentally via `days`.
+    val spo2CandidateByDay by vm.spo2CandidateByDay.collectAsStateWithLifecycle()
+    val hrvOverCountByDay by vm.hrvOverCountByDay.collectAsStateWithLifecycle()   // #1118
     val hasLiveHr by remember { derivedStateOf { displayHr(bpm, live) != null } }
 
     // LIQUID SKY BACKDROP (the pilot pattern — LiquidScreenSky.kt): the time-of-day liquid sky settles into
@@ -151,10 +165,10 @@ fun HealthScreen(
     LazyScreenScaffold(
         title = uiString(R.string.l10n_health_screen_health_monitor_c4abc3fc),
         subtitle = "Live vitals, streamed from the strap.",
-        topBackground = if (showDayCycleBackground) { { LiquidScreenSky(fillHeight = skyBehindCards) } } else null,
+        topBackground = screenBackdropSlot(showDayCycleBackground, skyBehindCards),
         // Sky-behind-cards fills the viewport so the transparent cards reveal the sky the whole way
         // down (Today / Trends / Sleep / metric-detail parity - same two prefs, same two behaviours).
-        fullBleedBackground = showDayCycleBackground && skyBehindCards,
+        fullBleedBackground = screenBackdropFullBleed(showDayCycleBackground, skyBehindCards),
     ) {
         if (today == null && !hasLiveHr) {
             // Even with no history yet, a freshly-connected strap can be told to sync now (#364) — the
@@ -176,7 +190,13 @@ fun HealthScreen(
                     title = uiString(R.string.l10n_health_screen_vital_signs_e7d9e1b1),
                     overline = "Latest readings",
                     trailing = null,
-                    vitals = latestVitals(days, UnitPrefs.temperature(LocalContext.current)),
+                    vitals = latestVitals(
+                        days,
+                        UnitPrefs.temperature(LocalContext.current),
+                        spo2CandidateByDay,
+                        NoopPrefs.spo2CandidateDisplay(LocalContext.current),
+                        hrvOverCountByDay = hrvOverCountByDay,   // #1118
+                    ),
                     onVitalClick = onVitalClick,
                     captionMode = VitalCaptionMode.AS_OF,
                 )
@@ -185,7 +205,7 @@ fun HealthScreen(
             // age), with an honest readiness checklist behind a tap. Authoritative value comes from the
             // metricSeries the IntelligenceEngine writes; readiness is derived from what this screen sees.
             item { Spacer(Modifier.height(Metrics.selectorTopUp)) }
-            item { FitnessAgeSection(vm = vm, days = days, profile = profile) }
+            item { FitnessAgeSection(vm = vm, days = days, profile = profile, onOpenSettings = onOpenSettings) }
             item { VitalitySection(vm = vm, days = days, profile = profile) }
             // SKIN TEMPERATURE (v5 pillar) — Cycle awareness (opt-in), Body clock + an illness heads-up,
             // each from a pure engine RESULT the ViewModel publishes. A section of Health, never its own
@@ -198,8 +218,10 @@ fun HealthScreen(
                     // #801: gate the cycle-awareness OPT-IN to profiles it can apply to (sex-gated, pure
                     // helper). Cycle phase is read from the menstrual skin-temperature shift, so the
                     // invitation is NOT offered for male profiles. Matches iOS SkinTempSection.cycleOptInApplies.
-                    cycleOptInApplies = cycleOptInApplies(profile.sex),
+                    cycleOptInApplies = cycleAwarenessVisible(profile.sex, cycleHidden),
                     onEnableCycle = { vm.setCycleTrackingEnabled(true) },
+                    onLogPeriod = { vm.logPeriodStart() },
+                    onOpenCycleTracker = { showCycleTracker = true },
                     // #801: symmetric off-control. Cycle awareness could be turned ON here but only OFF from
                     // Automations; let the user turn it off in-place where they turned it on.
                     onTurnOffCycle = { vm.setCycleTrackingEnabled(false) },
@@ -218,6 +240,19 @@ fun HealthScreen(
                     onOpenFusedRecord = onOpenFusedRecord,
                 )
             }
+        }
+    }
+
+    if (showCycleTracker) {
+        v5Signals?.cycle?.let { cycle ->
+            CycleTrackerDialog(
+                result = cycle,
+                starts = periodStarts,
+                onLog = vm::logPeriodStart,
+                onDelete = vm::deletePeriodStart,
+                onDeleteAll = vm::deleteAllPeriodStarts,
+                onDismiss = { showCycleTracker = false },
+            )
         }
     }
 }
@@ -426,6 +461,12 @@ private fun RecordRow(
  */
 internal fun cycleOptInApplies(sex: String): Boolean = sex.lowercase(Locale.US) != "male"
 
+/** #hide-cycle: whether the cycle-awareness OFFER is VISIBLE — eligible by sex AND not hidden by the
+ *  user's "not for me" opt-out. USER-controlled, never age-based. Pure, unit-tested; twin of iOS
+ *  ProfileStore.cycleAwarenessVisible(sex:hidden:). */
+internal fun cycleAwarenessVisible(sex: String, hidden: Boolean): Boolean =
+    cycleOptInApplies(sex) && !hidden
+
 @Composable
 private fun SkinTempSuiteSection(
     signals: V5HealthSignals.Snapshot?,
@@ -433,6 +474,8 @@ private fun SkinTempSuiteSection(
     // #801: whether the cycle-awareness opt-in invitation is offered for this profile (sex-gated).
     cycleOptInApplies: Boolean,
     onEnableCycle: () -> Unit,
+    onLogPeriod: () -> Unit,
+    onOpenCycleTracker: () -> Unit,
     // #801: symmetric off-control, surfaced on the live card.
     onTurnOffCycle: () -> Unit,
 ) {
@@ -450,7 +493,14 @@ private fun SkinTempSuiteSection(
         // opt-in invitation is shown ONLY for profiles it can apply to (sex-gated); a male profile that
         // previously enabled it still sees its existing card, only the invitation is gated.
         if (cycleEnabled) {
-            signals?.cycle?.let { CycleAwarenessCard(result = it, onTurnOff = onTurnOffCycle) }
+            signals?.cycle?.let {
+                CycleAwarenessCard(
+                    result = it,
+                    onLogPeriod = onLogPeriod,
+                    onOpenDetail = onOpenCycleTracker,
+                    onTurnOff = onTurnOffCycle,
+                )
+            }
         } else if (cycleOptInApplies) {
             CycleAwarenessOptInCard(onEnable = onEnableCycle)
         }
@@ -581,7 +631,7 @@ private fun ContributorBar(
 // latest "fitness_age" the IntelligenceEngine writes into metricSeries under the computed "-noop"
 // source — this section only READS it; it never recomputes the headline. Honest framing throughout:
 // it's a fitness comparison (± 5 yr band), never a biological age, and weight/height/waist live under
-// "Unlocks your VO₂max", never as if they sharpen the age. When no value exists yet we show the
+// "Sharpens your VO₂max", never as if they sharpen the age. When no value exists yet we show the
 // readiness checklist instead, so the user knows exactly what's still needed.
 
 /** Fitness Age readiness from what a screen can see: RHR coverage over the last 7 merged daily rows
@@ -607,12 +657,13 @@ private fun rememberFitnessReadiness(days: List<DailyMetric>, profile: ProfileSt
 }
 
 @Composable
-private fun FitnessAgeSection(vm: AppViewModel, days: List<DailyMetric>, profile: ProfileStore) {
+private fun FitnessAgeSection(vm: AppViewModel, days: List<DailyMetric>, profile: ProfileStore, onOpenSettings: () -> Unit = {}) {
     val context = LocalContext.current
     // Latest weekly value + its optional VO₂max companion, read once (metricSeries has no Flow, so we
     // re-read whenever the merged history changes — a fresh sync/import is what moves these).
     var fitnessAge by remember { mutableStateOf<Double?>(null) }
     var vo2max by remember { mutableStateOf<Double?>(null) }
+    var vo2maxEstimator by remember { mutableStateOf<Vo2MaxEstimator?>(null) }
     // Manual-refresh plumbing: the not-ready card's refresh button recomputes Fitness Age NOW and bumps
     // this tick, which re-keys the read below so a freshly written value shows without waiting for a sync.
     var refreshTick by remember { mutableStateOf(0) }
@@ -622,11 +673,19 @@ private fun FitnessAgeSection(vm: AppViewModel, days: List<DailyMetric>, profile
         val fa = runCatching {
             vm.repo.latestMetricComputedUnion(vm.activeStrapId, "fitness_age")?.value
         }.getOrNull()
-        val vo2 = runCatching {
-            vm.repo.latestMetricComputedUnion(vm.activeStrapId, "vo2max_est")?.value
+        val vo2Row = runCatching {
+            vm.repo.latestMetricComputedUnion(vm.activeStrapId, "vo2max_est")
         }.getOrNull()
+        val estimator = vo2Row?.let { row ->
+            runCatching {
+                Vo2MaxEstimator.fromProvenanceId(
+                    vm.repo.scoreInputSource(row.deviceId, row.day, row.key),
+                )
+            }.getOrNull()
+        }
         fitnessAge = fa
-        vo2max = vo2
+        vo2max = vo2Row?.value
+        vo2maxEstimator = estimator
     }
 
     // Readiness from what THIS screen can see: the last 7 merged daily rows. RHR coverage drives the
@@ -647,11 +706,36 @@ private fun FitnessAgeSection(vm: AppViewModel, days: List<DailyMetric>, profile
                 fitnessAge = value,
                 chronoAge = profile.age,
                 vo2max = vo2max,
+                vo2maxEstimator = vo2maxEstimator,
                 onHowAccurate = { showChecklist = !showChecklist },
                 checklistOpen = showChecklist,
             )
+            // #1391: VO₂max is shown even without a waist (the Uth HR-ratio fallback), so a waist no longer
+            // "unlocks" the number — it upgrades it to the more accurate Nes waist-based estimate. Key on
+            // waist being unset and nudge for it (tap → Settings) to sharpen the figure already displayed.
+            if (profile.waistCm <= 0.0) {
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clip(RoundedCornerShape(12.dp))
+                        .clickable(onClick = onOpenSettings)
+                        .padding(vertical = Metrics.space8),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(Metrics.space8),
+                ) {
+                    Icon(Icons.Filled.MonitorHeart, contentDescription = null,
+                        tint = Palette.metricCyan, modifier = Modifier.size(16.dp))
+                    Text(
+                        uiString(R.string.l10n_health_screen_add_your_waist_for_a_more_accurate_vo_max_829f5e1e),
+                        style = NoopType.footnote, color = Palette.textSecondary,
+                        modifier = Modifier.weight(1f),
+                    )
+                    Icon(Icons.AutoMirrored.Filled.KeyboardArrowRight, contentDescription = null,
+                        tint = Palette.textTertiary, modifier = Modifier.size(16.dp))
+                }
+            }
             if (showChecklist) {
-                FitnessReadinessCard(readiness = readiness, headed = false)
+                FitnessReadinessCard(readiness = readiness, headed = false, onOpenSettings = onOpenSettings)
             }
         } else {
             // No weekly value yet — lead with a concrete countdown, then the checklist. The refresh button
@@ -786,8 +870,6 @@ private fun VitalityHero(
 // The frosted translucent-black hero-card wrapper (mock rgba(13,14,20,.80), radius 26, white@0.11
 // hairline) that floats the hero over the day-of-sky so the vessel + white count-up stay crisp — the
 // card does the contrast work, not a muted sky. Byte-matched to the Today pilot's LIQUID_HERO_* values.
-private val HEALTH_HERO_FILL: Color =
-    Color(red = 13f / 255f, green = 14f / 255f, blue = 20f / 255f, alpha = 0.80f)
 private val HEALTH_HERO_RADIUS: Dp = 26.dp
 
 /** Wrap a hero's content in the frosted liquid glass surface so it floats over the sky backdrop. Applied
@@ -799,8 +881,8 @@ private fun LiquidHeroCard(content: @Composable () -> Unit) {
         modifier = Modifier
             .fillMaxWidth()
             .clip(RoundedCornerShape(HEALTH_HERO_RADIUS))
-            .background(HEALTH_HERO_FILL)
-            .border(1.dp, Color.White.copy(alpha = 0.11f), RoundedCornerShape(HEALTH_HERO_RADIUS))
+            .background(Palette.heroFill.copy(alpha = Palette.heroFill.alpha * CardAppearance.opacity))
+            .border(1.dp, Palette.heroBorder.copy(alpha = Palette.heroBorder.alpha * CardAppearance.opacity), RoundedCornerShape(HEALTH_HERO_RADIUS))
             .padding(Metrics.cardPadding),
     ) {
         content()
@@ -851,6 +933,7 @@ private fun FitnessAgeHero(
     fitnessAge: Double,
     chronoAge: Int,
     vo2max: Double?,
+    vo2maxEstimator: Vo2MaxEstimator?,
     onHowAccurate: () -> Unit,
     checklistOpen: Boolean,
 ) {
@@ -897,11 +980,18 @@ private fun FitnessAgeHero(
                     )
                 }
                 if (vo2max != null) {
-                    StatePill(
-                        title = uiString(R.string.l10n_health_screen_vo_max_vo2max_roundtoint_c32a04b3, vo2max.roundToInt()),
-                        tone = StrandTone.Accent,
-                        showsDot = false,
-                    )
+                    Column(horizontalAlignment = Alignment.End) {
+                        StatePill(
+                            title = uiString(R.string.l10n_health_screen_vo_max_vo2max_roundtoint_c32a04b3, vo2max.roundToInt()),
+                            tone = StrandTone.Accent,
+                            showsDot = false,
+                        )
+                        Text(
+                            text = uiString(vo2MaxAttributionLabelRes(vo2maxEstimator)),
+                            style = NoopType.footnote,
+                            color = Palette.textTertiary,
+                        )
+                    }
                 }
             }
 
@@ -958,7 +1048,7 @@ private fun fitnessReadyLead(rhrDays: Int, hasAge: Boolean, hasSex: Boolean): St
 }
 
 /** The readiness checklist card: each input as a ✓ / ⚠ / ○ glyph + its detail, grouped by role into
- *  "Drives your Fitness Age" and "Unlocks your VO₂max". When [headed] (no value yet) it leads with the
+ *  "Drives your Fitness Age" and "Sharpens your VO₂max". When [headed] (no value yet) it leads with the
  *  [lead] countdown and floats the required-missing items to the top of their group. */
 @Composable
 private fun FitnessReadinessCard(
@@ -969,6 +1059,7 @@ private fun FitnessReadinessCard(
     // immediate Fitness Age recompute; [refreshing] swaps it for a spinner while that runs.
     onRefresh: (() -> Unit)? = null,
     refreshing: Boolean = false,
+    onOpenSettings: (() -> Unit)? = null,
 ) {
     val drivesAge = readiness.items
         .filter { it.role == FitnessReadinessRole.DRIVES_AGE }
@@ -1017,8 +1108,8 @@ private fun FitnessReadinessCard(
                 }
             }
 
-            ReadinessGroup(title = uiString(R.string.l10n_health_screen_drives_your_fitness_age_9d0d1219), items = drivesAge)
-            ReadinessGroup(title = uiString(R.string.l10n_health_screen_unlocks_your_vo_max_b3c67dda), items = unlocksVo2)
+            ReadinessGroup(title = uiString(R.string.l10n_health_screen_drives_your_fitness_age_9d0d1219), items = drivesAge, onOpenSettings = onOpenSettings)
+            ReadinessGroup(title = uiString(R.string.l10n_health_screen_sharpens_your_vo_max_c9d52991), items = unlocksVo2, onOpenSettings = onOpenSettings)
 
             Text(
                 uiString(R.string.l10n_health_screen_weight_height_and_waist_add_a_fd2699f5),
@@ -1038,16 +1129,20 @@ private fun readinessSortKey(item: FitnessReadinessItem): Int = when {
 }
 
 @Composable
-private fun ReadinessGroup(title: String, items: List<FitnessReadinessItem>) {
+private fun ReadinessGroup(title: String, items: List<FitnessReadinessItem>, onOpenSettings: (() -> Unit)? = null) {
     if (items.isEmpty()) return
     Column(verticalArrangement = Arrangement.spacedBy(Metrics.space8)) {
         Overline(title)
-        items.forEach { ReadinessRow(it) }
+        items.forEach { ReadinessRow(it, onOpenSettings) }
     }
 }
 
 @Composable
-private fun ReadinessRow(item: FitnessReadinessItem) {
+private fun ReadinessRow(item: FitnessReadinessItem, onOpenSettings: (() -> Unit)? = null) {
+    // #2: a still-unsatisfied input that CAN be filled in Settings (age/sex/body metrics/waist) gets a
+    // "Fix in Settings" tap; strap-driven inputs (resting-HR/activity coverage) don't. Mirrors iOS.
+    val fixable = onOpenSettings != null && item.status != FitnessReadinessStatus.SATISFIED &&
+        item.key in setOf("age", "sex", "bodyMetrics", "waist")
     val glyph = when (item.status) {
         FitnessReadinessStatus.SATISFIED -> "✓"
         FitnessReadinessStatus.PARTIAL -> "⚠"
@@ -1077,13 +1172,22 @@ private fun ReadinessRow(item: FitnessReadinessItem) {
             color = Palette.textPrimary,
             modifier = Modifier.weight(1f),
         )
-        Text(
-            item.detail,
-            style = NoopType.footnote,
-            color = Palette.textTertiary,
-            maxLines = 1,
-            overflow = TextOverflow.Ellipsis,
-        )
+        if (fixable) {
+            Text(
+                uiString(R.string.l10n_health_screen_fix_in_settings_d7472915),
+                style = NoopType.footnote,
+                color = Palette.accent,
+                modifier = Modifier.clickable { onOpenSettings?.invoke() },
+            )
+        } else {
+            Text(
+                item.detail,
+                style = NoopType.footnote,
+                color = Palette.textTertiary,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+        }
     }
 }
 
@@ -1092,13 +1196,18 @@ private fun yearWord(years: Int): String = if (kotlin.math.abs(years) == 1) "yea
 @Composable
 fun VitalSignsScreen(vm: AppViewModel, onVitalClick: (String) -> Unit = {}) {
     val days by vm.recentDays.collectAsStateWithLifecycle()
+    val spo2CandidateByDay by vm.spo2CandidateByDay.collectAsStateWithLifecycle()
+    val hrvOverCountByDay by vm.hrvOverCountByDay.collectAsStateWithLifecycle()   // #1118
     var selectedDayOffset by remember { mutableIntStateOf(0) }
     val selectedDay = remember(selectedDayOffset) { LocalDate.now().minusDays(selectedDayOffset.toLong()) }
     val selectedDayKey = remember(selectedDay) { selectedDay.toString() }
     val selectedMetric = remember(days, selectedDayKey) { days.lastOrNull { it.day == selectedDayKey } }
     val tempUnit = UnitPrefs.temperature(LocalContext.current)
-    val vitals = remember(selectedMetric, days, tempUnit) {
-        selectedMetric?.let { vitalsFor(it, days, tempUnit) }.orEmpty()
+    // Read the toggle here in the composable body, NOT inside remember{} — LocalContext.current is a
+    // @Composable read and is illegal inside the calculation lambda; pass the resolved value in + key on it.
+    val spo2CandidateDisplay = NoopPrefs.spo2CandidateDisplay(LocalContext.current)
+    val vitals = remember(selectedMetric, days, tempUnit, spo2CandidateByDay, spo2CandidateDisplay, hrvOverCountByDay) {
+        selectedMetric?.let { vitalsFor(it, days, tempUnit, spo2CandidateByDay, spo2CandidateDisplay, hrvOverCountByDay) }.orEmpty()
     }
 
     ScreenScaffold(
@@ -1630,7 +1739,11 @@ private data class VitalDetailModel(
  *  (Fitness Age + Vitality under the computed strap, Steps estimate, Apple active energy). Each Today
  *  dashboard card taps through to ITS OWN focused trend here (2026-07-03), so these load their
  *  series from the repo on demand rather than off the cached `days` columns. Mirrors iOS metricDetail. */
-private val SERIES_BACKED_VITAL_KEYS = setOf("fitness_age", "vitality", "steps_est", "active_kcal", "rest")
+// #1391/#1404: vo2max_est is a COMPUTED weekly series under the "-noop" spine, like fitness_age/vitality —
+// so its detail must route to buildSeriesVitalDetail (which reads metricSeriesComputedUnion), NOT the
+// DailyMetric-backed buildVitalDetail. #1404 added the vo2max_est CASE to the series builder but omitted it
+// here, so isSeriesBacked was false and the tap-through fell to the DailyMetric builder → empty trend.
+private val SERIES_BACKED_VITAL_KEYS = setOf("fitness_age", "vitality", "steps_est", "active_kcal", "rest", "vo2max_est")
 
 @Composable
 fun VitalDetailScreen(vm: AppViewModel, key: String) {
@@ -1639,6 +1752,22 @@ fun VitalDetailScreen(vm: AppViewModel, key: String) {
     val tempUnit = UnitPrefs.temperature(context)
     // The Effort detail renders per the user's Effort display scale (0-100 vs 0-21), like the Today tile.
     val effortScale = UnitPrefs.effortScale(context)
+    // #103/queue-11a follow-up: same reactive source the Key Metrics tile already collects (empty when
+    // the toggle is OFF, since the engine writes nothing) — reused here so this screen's spo2 candidate
+    // fallback (in buildVitalDetail) stays in sync with the tile it drills in from.
+    //
+    // The FLOW is swapped per metric, not the collect call. Only the Blood Oxygen detail reads this map,
+    // but this composable serves every vital, and subscribing the real flow runs a database union
+    // (`metricSeriesComputedUnion`) that Resting HR / HRV / Skin Temp would pay for and discard —
+    // `WhileSubscribed(5_000)` means arriving more than five seconds after the tile unsubscribed re-runs
+    // it, which is the normal Today → Health → tap path. Gating the CALL instead (`key == "spo2" && …`)
+    // would put a composable in a conditionally-evaluated position and corrupt the slot table when the
+    // key changes; swapping the flow keeps exactly one unconditional call site. It also keeps the
+    // `remember` below stable for every other vital, since the map is then a constant.
+    val candidateFlow: StateFlow<Map<String, Double>> = remember(key) {
+        if (key == "spo2") vm.spo2CandidateByDay else MutableStateFlow(emptyMap())
+    }
+    val spo2CandidateByDay by candidateFlow.collectAsStateWithLifecycle()
     // Profile drives the Fitness Age readiness/countdown shown when that vital has no value yet.
     val profile = remember { ProfileStore.from(context.applicationContext) }
     val isSeriesBacked = key in SERIES_BACKED_VITAL_KEYS
@@ -1659,7 +1788,9 @@ fun VitalDetailScreen(vm: AppViewModel, key: String) {
         }
     }
     val detail = if (isSeriesBacked) seriesDetail
-    else remember(days, key, tempUnit, effortScale) { buildVitalDetail(days, key, tempUnit, effortScale) }
+    else remember(days, key, tempUnit, effortScale, spo2CandidateByDay) {
+        buildVitalDetail(days, key, tempUnit, effortScale, spo2CandidateByDay)
+    }
     var range by remember { mutableStateOf(VitalDetailRange.MONTH) }
 
     // The subtitle tracks how much history the metric has, so we never promise a "historical trend" the
@@ -1679,10 +1810,10 @@ fun VitalDetailScreen(vm: AppViewModel, key: String) {
             loadedPoints == 1 -> "Your latest reading — trend to follow."
             else -> "Historical trend from cached daily metrics."
         },
-        topBackground = if (showDayCycleBackground) { { LiquidScreenSky(fillHeight = skyBehindCards) } } else null,
+        topBackground = screenBackdropSlot(showDayCycleBackground, skyBehindCards),
         // Sky-behind-cards needs the full-viewport container too — the band container's status-bar
         // offset left the lower cards on plain canvas (tester report).
-        fullBleedBackground = showDayCycleBackground && skyBehindCards,
+        fullBleedBackground = screenBackdropFullBleed(showDayCycleBackground, skyBehindCards),
     ) {
         if (isSeriesBacked && !seriesLoaded) {
             DataPendingNote(
@@ -1818,6 +1949,7 @@ fun VitalDetailScreen(vm: AppViewModel, key: String) {
                     color = detail.color,
                     fill = true,
                     selectionEnabled = true, // the Vital Signs detail chart is meant to be tappable
+                    segmentIds = if (key == "vo2max_est") vo2MaxTrendSegmentIds(filteredReadings) else null,
                 )
                 Box(
                     modifier = Modifier
@@ -1906,8 +2038,12 @@ private fun VitalReadingsTable(rows: List<VitalReadingRow>) {
                         style = NoopType.bodyNumber,
                         color = Palette.textPrimary,
                     )
+                    val sourceLabel = when (val source = row.source) {
+                        is DisplayText.Resource -> uiString(source.id, *source.args.toTypedArray())
+                        is DisplayText.Dynamic -> source.value
+                    }
                     Text(
-                        row.source,
+                        sourceLabel,
                         style = NoopType.footnote,
                         color = provenanceLabelTint(row.source),
                         textAlign = TextAlign.End,
@@ -1937,6 +2073,7 @@ private fun buildVitalDetail(
     key: String,
     tempUnit: TemperatureUnit,
     effortScale: EffortScale = EffortScale.HUNDRED,
+    spo2CandidateByDay: Map<String, Double> = emptyMap(),
 ): VitalDetailModel? {
     return when (key) {
     // The Today Key-Metrics Recovery tile's drill-in: the Recovery (Charge) trend timeline, matching the
@@ -1967,14 +2104,25 @@ private fun buildVitalDetail(
         readings = days.mapNotNull { row -> row.respRateBpm?.let { VitalReading(row.day, it, row.deviceId) } },
         format = { String.format(Locale.US, "%.1f", it) },
     )
-    "spo2" -> VitalDetailModel(
-        key = key,
-        title = uiString(R.string.l10n_health_screen_blood_oxygen_a8ad9ff5),
-        unit = "%",
-        color = Palette.metricCyan,
-        readings = days.mapNotNull { row -> row.spo2Pct?.let { VitalReading(row.day, it, row.deviceId) } },
-        format = { String.format(Locale.US, "%.0f", it) },
-    )
+    "spo2" -> {
+        // #103/queue-11a follow-up: fill in the spo2 candidate fallback for any day with no calibrated
+        // spo2Pct — the SAME fallback the Key Metrics tile already shows (found 2026-08-24: an
+        // Oura-only or WHOOP-4.0-only install with the toggle ON saw a real number on the tile but an
+        // empty/stale screen here, since this branch never got #1568's candidate wiring). Calibrated
+        // days always win; this only ADDS days the calibrated column is missing, never overwrites one.
+        val calibrated = days.mapNotNull { row -> row.spo2Pct?.let { row.day to VitalReading(row.day, it, row.deviceId) } }.toMap()
+        val candidateOnly = spo2CandidateByDay
+            .filterKeys { it !in calibrated }
+            .map { (day, value) -> day to VitalReading(day, value, SPO2_CANDIDATE_ATTRIBUTION_SOURCE) }
+        VitalDetailModel(
+            key = key,
+            title = uiString(R.string.l10n_health_screen_blood_oxygen_a8ad9ff5),
+            unit = "%",
+            color = Palette.metricCyan,
+            readings = (calibrated.values + candidateOnly.map { it.second }).sortedBy { it.day },
+            format = { String.format(Locale.US, "%.0f", it) },
+        )
+    }
     "rhr" -> VitalDetailModel(
         key = key,
         title = uiString(R.string.l10n_health_screen_resting_heart_rate_9700f4d8),
@@ -1993,27 +2141,25 @@ private fun buildVitalDetail(
     )
     "skin" -> {
         val latest = days.asReversed().asSequence().mapNotNull { it.skinTempDevC }.firstOrNull() ?: return null
-        val absolute = VitalBands.isAbsoluteSkinTemp(latest)
-        val unit = UnitFormatter.temperatureUnit(tempUnit)
-        val format: (Double) -> String = { c ->
-            val full = if (absolute) {
-                UnitFormatter.temperatureFromCelsius(c, tempUnit, decimals = 1)
-            } else {
-                UnitFormatter.temperatureDeltaFromCelsius(c, tempUnit, decimals = 1)
-            }
-            full.removeSuffix(" $unit")
+        val kind = SkinTempDisplay.kind(latest)
+        val fahrenheit = tempUnit == TemperatureUnit.FAHRENHEIT
+        val unit = SkinTempDisplay.unitSymbol(kind, fahrenheit)
+        val title = if (kind == SkinTempDisplay.Kind.ABSOLUTE) {
+            uiString(R.string.l10n_health_screen_skin_temperature_f59127f6)
+        } else {
+            uiString(R.string.skin_temp_delta_title)
         }
         VitalDetailModel(
             key = key,
-            title = uiString(R.string.l10n_health_screen_skin_temperature_f59127f6),
+            title = title,
             unit = unit,
             color = Palette.metricAmber,
             readings = days.mapNotNull { row ->
                 row.skinTempDevC
-                    ?.takeIf { VitalBands.isAbsoluteSkinTemp(it) == absolute }
+                    ?.takeIf { VitalBands.isAbsoluteSkinTemp(it) == (kind == SkinTempDisplay.Kind.ABSOLUTE) }
                     ?.let { value -> VitalReading(row.day, value, row.deviceId) }
             },
-            format = format,
+            format = { c -> SkinTempDisplay.numberString(c, kind, fahrenheit, decimals = 1) },
         )
     }
     else -> null
@@ -2056,6 +2202,30 @@ private suspend fun buildSeriesVitalDetail(vm: AppViewModel, key: String): Vital
             .map { VitalReading(it.day, it.value, it.deviceId) },
         format = { it.roundToInt().toString() },
     )
+    // #1391: the VO₂max card (opt-in, #1393) taps through here. Like its sibling computed metrics
+    // (fitness_age / vitality above), the weekly estimate is persisted under the "-noop" computed spine
+    // (IntelligenceEngine writes "vo2max_est"), so its trend reads the COMPUTED union — not the raw
+    // resolvedSeries the imported vitals use, which carries no vo2max_est. Without this case the tap-through
+    // fell to the default and the trend chart was empty (the reported bug). Parity with iOS, which handles
+    // `.vo2max` alongside `.fitnessAge` / `.vitality` and reads `exploreSeries("vo2max_est")`.
+    "vo2max_est" -> {
+        val points = vm.repo.metricSeriesComputedUnion(
+            vm.activeStrapId, "vo2max_est", "0000-01-01", "9999-12-31",
+        )
+        VitalDetailModel(
+            key = key,
+            title = uiString(R.string.l10n_health_screen_vo2max_21214fb6),
+            unit = "ml/kg",
+            color = Palette.chargeColor,
+            readings = points.map { point ->
+                val estimator = Vo2MaxEstimator.fromProvenanceId(
+                    vm.repo.scoreInputSource(point.deviceId, point.day, point.key),
+                )
+                VitalReading(point.day, point.value, vo2MaxAttributionSource(estimator))
+            },
+            format = { it.roundToInt().toString() },
+        )
+    }
     "steps_est" -> {
         // #377: the Today Steps tile resolves a REAL step count FIRST — the WHOOP 5/MG on-device @57
         // counter (DailyMetric.steps) ?: imported Health Connect / Apple Health ?: the motion-model

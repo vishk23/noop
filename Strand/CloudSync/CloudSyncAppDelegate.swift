@@ -73,7 +73,29 @@ final class CloudSyncAppDelegate: NSObject, UIApplicationDelegate {
             UserDefaults.standard.set("requested \(Date())", forKey: Self.registrationBreadcrumbKey)
             application.registerForRemoteNotifications()
         }
+        // SwiftUI honours only ONE `@UIApplicationDelegateAdaptor`, so on a CLOUD_SYNC build this
+        // delegate stands in for `HomeScreenQuickActionAppDelegate` and must carry its quick-action
+        // duties too (here and in `configurationForConnecting` below), or the Home Screen shortcuts
+        // silently vanish from a cloud-sync build.
+        HomeScreenQuickAction.install(in: application)
         return true
+    }
+
+    /// Quick-action stand-in duty #2 (see `didFinishLaunchingWithOptions`): name the scene delegate
+    /// that receives Home Screen quick actions, exactly as `HomeScreenQuickActionAppDelegate` does.
+    func application(
+        _ application: UIApplication,
+        configurationForConnecting connectingSceneSession: UISceneSession,
+        options: UIScene.ConnectionOptions
+    ) -> UISceneConfiguration {
+        let configuration = UISceneConfiguration(
+            name: nil,
+            sessionRole: connectingSceneSession.role
+        )
+        if connectingSceneSession.role == .windowApplication {
+            configuration.delegateClass = HomeScreenQuickActionSceneDelegate.self
+        }
+        return configuration
     }
 
     /// Expected on EVERY launch of this branch (see the type's doc comment: no `aps-environment`

@@ -46,7 +46,7 @@ final class ContentTokenTests: XCTestCase {
         _ = try await store.upsertWorkouts(
             [WorkoutRow(startTs: 100, endTs: 200, sport: "running", source: "whoop", durationS: 100,
                         energyKcal: nil, avgHr: nil, maxHr: nil, strain: nil, distanceM: nil,
-                        zonesJSON: nil, notes: nil)], deviceId: "dev1")
+                        zonesJSON: nil, notes: nil, steps: nil)], deviceId: "dev1")
         let after = try await store.contentToken()
         XCTAssertNotEqual(before, after)
     }

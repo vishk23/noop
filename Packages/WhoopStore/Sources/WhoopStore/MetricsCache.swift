@@ -45,6 +45,15 @@ public struct CachedSleepSession: Equatable, Codable {
         self.startTsAdjusted = startTsAdjusted
         self.stagingSparse = stagingSparse
     }
+
+    /// A copy re-keyed to `newStartTs`, every other field (including the stage segments) unchanged. Used by
+    /// the #1284 generation-side onset keying to set the session's PK to the rounded 0x49 onset (the stable
+    /// per-night anchor); the onset key differs from the end-anchored first-code time by at most the grid.
+    public func withStartTs(_ newStartTs: Int) -> CachedSleepSession {
+        CachedSleepSession(startTs: newStartTs, endTs: endTs, efficiency: efficiency, restingHr: restingHr,
+                           avgHrv: avgHrv, stagesJSON: stagesJSON, userEdited: userEdited,
+                           startTsAdjusted: startTsAdjusted, stagingSparse: stagingSparse)
+    }
 }
 
 /// One cached daily-metrics row pulled from the server's /v1/daily. Natural key (deviceId, day).
@@ -80,7 +89,7 @@ public struct DailyMetric: Equatable, Codable {
     /// BROAD autonomic-variability twin of `avgHrv` (which is RMSSD for the strap: the fast, vagal,
     /// "recovered today?" metric). The 5-min index — not a single whole-night SD — is stored deliberately:
     /// whole-night SD is dominated by the slow HR drift across sleep stages (reads 2-3× high) and is not
-    /// comparable to a watch's short-window SDNN; the index is. v29 column, nullable: WHOOP/on-device nights
+    /// comparable to a watch's short-window SDNN; the index is. v31 column, nullable: WHOOP/on-device nights
     /// compute it from the night's R-R (`HRVAnalyzer.sdnnIndex`); Apple rows mirror their own SDNN reading;
     /// Oura/other imports carry no SDNN so it stays nil.
     public let avgSdnn: Double?

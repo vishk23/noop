@@ -106,17 +106,184 @@ object Whoop5EcgProbe {
      * [requestsRealtimeData] deliberately has NO default: every construction site must state it, because
      * the verdicts that read silence as evidence turn on this flag and a silently-omitted `true` is
      * exactly the bug this field exists to prevent.
+     *
+     * [sentArgument] is the ARGUMENT byte the command was sent with, when it is known. [label] carries
+     * only the opcode, because it is also the key an app layer matches a COMMAND_RESPONSE against and
+     * the reply echoes no argument — so the argument cannot live in the label without breaking that
+     * match. It is recorded separately because two runs of the same opcode can differ only in this byte:
+     * `mainControlECGDataGeneration` takes `stop`/`start`/`restart` (0/1/2), so a start run and a restart
+     * run render identically without it and a future reader of a copied report cannot tell which one
+     * produced the verdict. Reported as the RAW NUMBER, never a token name, so it cannot drift from the
+     * bytes actually put on the wire. `null` is "not known" — the honest value for an UNSOLICITED reply.
+     * It is display-only and feeds no verdict, so unlike [requestsRealtimeData] a default is safe: an
+     * omission loses an annotation, never changes a claim.
      */
     data class Step(
         val label: String,
         val outcome: CommandOutcome,
         val requestsRealtimeData: Boolean,
+        val sentArgument: Int? = null,
         val replyHex: String? = null,
     ) {
         /** How the report annotates the step, so a reader can see WHY the verdict is what it is. */
         val roleNote: String
             get() = if (requestsRealtimeData) "asks for realtime ECG data"
                     else "cannot produce ECG data (configuration or OFF)"
+
+        /** The [label], plus the argument when it is known — what every report line leads with. */
+        val labelWithArgument: String
+            get() = if (sentArgument == null) label else "$label arg=$sentArgument"
+    }
+
+    /**
+     * A bounded census of EVERY unclassified 5/MG frame seen while a probe run is armed — the ones the
+     * structural triage rejected as well as the ones it accepted.
+     *
+     * ## Why the rejects are the point
+     *
+     * The packet TYPE byte the Labrador records arrive under is NOT attested, so the probe hunts for it
+     * with a shape heuristic. Logging only the heuristic's HITS makes that hunt unfalsifiable: when the
+     * heuristic is wrong, the frame it was wrong about is discarded, the report truthfully says "no frame
+     * passed the structural triage", and the bytes that would have shown the mistake are gone. That is
+     * exactly what a hardcoded 2-bytes-per-sample length agreement did to every 3-byte frame before
+     * [Whoop5Ecg.FILTERED_WIDTH_CANDIDATES] widened it.
+     *
+     * It makes no claim about anything it records: it is a census, and every line in it is a frame the
+     * probe could not classify.
+     *
+     * ## Bounds
+     *
+     * At most [MAX_SAMPLES_PER_TYPE] recorded frames per distinct type byte and [MAX_TYPES] distinct type
+     * bytes. Everything past a cap is COUNTED, never silently dropped.
+     *
+     * The Kotlin twin of the Swift `Whoop5EcgProbe.FrameCensus`. Android has no ECG app layer to feed it —
+     * nothing on this platform sends the Labrador commands — so this exists for parity and is covered by
+     * its own tests, exactly like the rest of this file.
+     */
+    class FrameCensus {
+
+        /** One recorded frame. Nothing here is interpreted — these are measurements of the buffer. */
+        data class Sample(
+            val frameLength: Int,
+            /** Inner payload length, or null when the frame yielded none (failed a CRC / too short). */
+            val payloadLength: Int?,
+            /**
+             * `numberOfECGSamples` as the status header would read it, or null when the payload is too
+             * short to hold a header. Reading it does NOT claim this frame is an ECG record.
+             */
+            val numberOfECGSamples: Int?,
+            /**
+             * The bytes-per-sample widths the payload's length agreed with. Empty means the triage
+             * rejected the frame, which is the case this census exists to preserve.
+             */
+            val widths: List<Int>,
+            /** The frame's first [HEAD_BYTES] bytes, lowercase hex. */
+            val headHex: String,
+        ) {
+            val line: String
+                get() {
+                    val payload = payloadLength?.toString() ?: "?"
+                    val samples = numberOfECGSamples?.toString() ?: "?"
+                    val widthText = if (widths.isEmpty()) "none" else widths.joinToString(",")
+                    return "len=$frameLength payload=$payload samples=$samples widths=$widthText head=$headHex"
+                }
+        }
+
+        /** Everything seen under one type byte. */
+        data class Bucket(val typeByte: Int, var count: Int, val samples: MutableList<Sample>)
+
+        private val bucketList = mutableListOf<Bucket>()
+
+        /** Buckets in FIRST-SEEN order, which is the order the report prints them in. */
+        val buckets: List<Bucket> get() = bucketList
+
+        /** Every frame offered to the census, including those past a cap. */
+        var framesSeen = 0
+            private set
+
+        /** Frames dropped because their type byte was past the [MAX_TYPES]th distinct one. */
+        var framesBeyondTypeCap = 0
+            private set
+
+        val isEmpty: Boolean get() = framesSeen == 0
+
+        /**
+         * Fold one frame into the census.
+         *
+         * The caller CRC-gates the frame first; this reads the type byte directly and gets the payload
+         * through [Whoop5Ecg.innerPayload], which re-checks both CRCs itself, so a frame that somehow
+         * arrives unverified yields a null payload length rather than a decoded field. Frames with no type
+         * byte at all (fewer than 9 bytes) are not records and are ignored.
+         */
+        fun record(
+            frame: ByteArray,
+            payloadStart: Int = Whoop5Ecg.PUFFIN_PAYLOAD_START,
+            maxPadding: Int = Whoop5Ecg.DEFAULT_MAX_PADDING,
+        ) {
+            if (frame.size <= 8) return
+            framesSeen++
+            val typeByte = frame[8].toInt() and 0xFF
+            val bucket = bucketList.firstOrNull { it.typeByte == typeByte }
+            if (bucket == null) {
+                if (bucketList.size >= MAX_TYPES) {
+                    framesBeyondTypeCap++
+                    return
+                }
+                bucketList.add(
+                    Bucket(typeByte, 1, mutableListOf(sample(frame, payloadStart, maxPadding)))
+                )
+                return
+            }
+            bucket.count++
+            if (bucket.samples.size >= MAX_SAMPLES_PER_TYPE) return
+            bucket.samples.add(sample(frame, payloadStart, maxPadding))
+        }
+
+        /** The census as report lines, already indented for [report]. */
+        val lines: List<String>
+            get() {
+                val out = mutableListOf<String>()
+                for (bucket in bucketList) {
+                    out.add("  type=0x%02x  frames=%d".format(bucket.typeByte, bucket.count))
+                    for (s in bucket.samples) out.add("    ${s.line}")
+                    if (bucket.count > bucket.samples.size) {
+                        out.add("    (+${bucket.count - bucket.samples.size} more of this type, not recorded)")
+                    }
+                }
+                if (framesBeyondTypeCap > 0) {
+                    out.add(
+                        "  ($framesBeyondTypeCap frame(s) of further type bytes past the " +
+                            "$MAX_TYPES-type cap, counted only)"
+                    )
+                }
+                return out
+            }
+
+        companion object {
+            /** Recorded frames per distinct type byte. Three examples answer "what does this look like". */
+            const val MAX_SAMPLES_PER_TYPE = 3
+
+            /** Distinct type bytes tracked. Well past what a live link shows, and keeps the report readable. */
+            const val MAX_TYPES = 16
+
+            /** Leading bytes of each recorded frame rendered as hex: the envelope, the header, first samples. */
+            const val HEAD_BYTES = 64
+
+            /** Measure one frame. Public so a test can build a [Sample] without a census. */
+            fun sample(
+                frame: ByteArray,
+                payloadStart: Int = Whoop5Ecg.PUFFIN_PAYLOAD_START,
+                maxPadding: Int = Whoop5Ecg.DEFAULT_MAX_PADDING,
+            ): Sample {
+                val payload = Whoop5Ecg.innerPayload(frame, payloadStart)
+                val widths = payload?.let {
+                    Whoop5Ecg.filteredBytesPerSampleCandidates(it, maxPadding = maxPadding)
+                } ?: emptyList()
+                val samples = payload?.let { Whoop5Ecg.decodeHeader(it)?.numberOfECGSamples }
+                val head = frame.take(HEAD_BYTES).joinToString("") { "%02x".format(it.toInt() and 0xFF) }
+                return Sample(frame.size, payload?.size, samples, widths, head)
+            }
+        }
     }
 
     /** The gate verdict, kept separate from the report text so it is assertable in a test. */
@@ -221,11 +388,11 @@ object Whoop5EcgProbe {
         val failures = steps.filter { it.outcome is CommandOutcome.Failure }
         if (failures.isNotEmpty()) {
             // A refusal is only evidence about the BLOCK question when what was refused asked for data.
-            val dataFailures = failures.filter { it.requestsRealtimeData }.map { it.label }
+            val dataFailures = failures.filter { it.requestsRealtimeData }.map { it.labelWithArgument }
             if (dataFailures.isNotEmpty()) return Verdict.DataRequestRefused(dataFailures)
-            return Verdict.CommandRefused(failures.map { it.label })
+            return Verdict.CommandRefused(failures.map { it.labelWithArgument })
         }
-        val unsupported = steps.filter { it.outcome is CommandOutcome.Unsupported }.map { it.label }
+        val unsupported = steps.filter { it.outcome is CommandOutcome.Unsupported }.map { it.labelWithArgument }
         if (unsupported.isNotEmpty()) return Verdict.OpcodeUnsupported(unsupported)
         if (ecgPacketsSeen > 0) return Verdict.EcgCandidatesArrived(ecgPacketsSeen)
         if (steps.isEmpty()) return Verdict.NoReplies
@@ -233,9 +400,9 @@ object Whoop5EcgProbe {
         // Past this point the verdict INTERPRETS SILENCE, which only carries information about the ECG
         // data path when the run asked that path for something and the strap said yes.
         val requests = steps.filter { it.requestsRealtimeData }
-        if (requests.isEmpty()) return Verdict.NoDataRequested(steps.map { it.label })
+        if (requests.isEmpty()) return Verdict.NoDataRequested(steps.map { it.labelWithArgument })
         if (requests.none { it.outcome is CommandOutcome.Success }) {
-            return Verdict.DataRequestNotAccepted(requests.map { it.label })
+            return Verdict.DataRequestNotAccepted(requests.map { it.labelWithArgument })
         }
         if (steps.all { it.outcome is CommandOutcome.Success }) {
             return Verdict.AcceptedButSilent(windowSeconds)
@@ -248,12 +415,17 @@ object Whoop5EcgProbe {
      *
      * [candidateFrames] are the type/length lines for frames that passed the structural triage in
      * [Whoop5Ecg.plausibleFilteredPayload].
+     *
+     * [census] is the same question asked WITHOUT the heuristic: every unclassified frame the run saw,
+     * bucketed by type byte, hits and misses alike. It defaults to empty so a caller that has none still
+     * renders — see [FrameCensus] for why the misses matter more than the hits.
      */
     fun report(
         steps: List<Step>,
         ecgPacketsSeen: Int,
         candidateFrames: List<String>,
         windowSeconds: Int,
+        census: FrameCensus = FrameCensus(),
     ): String {
         val sb = StringBuilder()
         sb.append("WHOOP MG ECG (Labrador) TURN-ON PROBE\n")
@@ -264,7 +436,7 @@ object Whoop5EcgProbe {
         } else {
             // Each step carries WHY it does or does not bear on the block question, so the verdict above
             // can be checked against its own inputs without reading the source.
-            for (step in steps) sb.append("  ${step.label}: ${step.outcome.token} — ${step.roleNote}\n")
+            for (step in steps) sb.append("  ${step.labelWithArgument}: ${step.outcome.token} — ${step.roleNote}\n")
         }
         sb.append("\nECG-shaped packets seen in ${windowSeconds}s: $ecgPacketsSeen\n")
         if (steps.isNotEmpty() && steps.none { it.requestsRealtimeData }) {
@@ -294,7 +466,27 @@ object Whoop5EcgProbe {
             sb.append("Candidate packet types (structural triage only, NOT a confirmed mapping):\n")
             for (line in candidateFrames) sb.append("  $line\n")
         }
-        val replies = steps.mapNotNull { step -> step.replyHex?.let { "  ${step.label}: $it" } }
+        // The census goes IMMEDIATELY under the triage result, because it is the check on it: "no frame
+        // passed the structural triage" is only informative next to what the frames actually were.
+        // Twin of the Swift `Whoop5EcgProbe.report` block; the wording is byte-identical.
+        if (census.isEmpty) {
+            sb.append(
+                "Unclassified-frame census: no unclassified frame arrived at all — the triage had " +
+                    "nothing to reject.\n"
+            )
+        } else {
+            sb.append(
+                "Unclassified-frame census — EVERY frame this run could not classify, triage hits and " +
+                    "misses alike, bucketed by the inner record's type byte. The ECG type byte is not " +
+                    "attested, so this, not the triage, is the record of what arrived. widths= are the " +
+                    "bytes-per-sample the payload length agreed with; none = the triage rejected it. " +
+                    "Recorded: ${census.framesSeen} frame(s), first ${FrameCensus.MAX_SAMPLES_PER_TYPE} per " +
+                    "type byte, first ${FrameCensus.MAX_TYPES} type bytes, first ${FrameCensus.HEAD_BYTES} " +
+                    "bytes each:\n"
+            )
+            for (line in census.lines) sb.append("$line\n")
+        }
+        val replies = steps.mapNotNull { step -> step.replyHex?.let { "  ${step.labelWithArgument}: $it" } }
         if (replies.isNotEmpty()) {
             sb.append("\nRaw replies:\n")
             sb.append(replies.joinToString("\n") + "\n")

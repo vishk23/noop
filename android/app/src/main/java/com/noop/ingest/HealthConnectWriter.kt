@@ -12,6 +12,8 @@ import androidx.health.connect.client.records.Record
 import androidx.health.connect.client.records.RespiratoryRateRecord
 import androidx.health.connect.client.records.RestingHeartRateRecord
 import androidx.health.connect.client.records.SleepSessionRecord
+import androidx.health.connect.client.records.Vo2MaxRecord
+import com.noop.data.MetricSeriesRow
 import androidx.health.connect.client.records.metadata.Metadata
 import androidx.health.connect.client.units.Length
 import androidx.health.connect.client.units.Percentage
@@ -73,6 +75,34 @@ object HealthConnectWriter {
 
     /** How far back to write. Recomputation only ever touches recent nights; 60 days is generous. */
     private const val WINDOW_DAYS = 60L
+
+    /**
+     * Whether a strap-derived nightly SpO2 is written back to Health Connect as an
+     * [OxygenSaturationRecord]. Twin of the Swift `HealthKitBridge.exportsSpo2ToHealthKit`.
+     *
+     * FALSE, deliberately, and it is not an oversight to be tidied away.
+     *
+     * This export loop reads only the COMPUTED NOOP device rows — imported rows never pass through it —
+     * so before v34 populated `spo2Pct` for WHOOP nights this branch never fired even once. Turning the
+     * field on therefore does not "resume" an export; it STARTS one, and what it would start writing is a
+     * number nobody has checked against a reference oximeter.
+     *
+     * Why that bar is higher here than for the in-app card. A value in the app is read in context, next
+     * to its own provenance, by the person who built it. A Health Connect record is different in kind: it
+     * lands in the system health record under Android's own Blood Oxygen heading, sits alongside
+     * clinically-sourced readings with nothing distinguishing it, and is readable by every other app the
+     * user has authorised. Deleting it later is fiddly and does not recall what already propagated.
+     *
+     * The evidence genuinely does not reach that bar yet. The decode is well supported — distribution,
+     * run structure, sleep gating, night-to-night stability — but ALL of it says "this byte is a real
+     * oxygen measurement", none of it says "97 means 97". Upstream declines to promote the same metric
+     * for the same reason: two straps were checked against the WHOOP app and moved in OPPOSITE directions.
+     *
+     * Flip this to `true` (in lockstep with the Swift constant, or the platforms disagree about what
+     * leaves the device) once paired reference-oximeter nights exist and the bias is characterised — and,
+     * if the bias is a fixed offset, correct for it before writing rather than here.
+     */
+    const val EXPORTS_SPO2_TO_HEALTH_CONNECT = false
 
     private val WRITE_RECORDS: List<KClass<out Record>> = listOf(
         RestingHeartRateRecord::class,
@@ -139,7 +169,8 @@ object HealthConnectWriter {
                     metadata = meta("hrv", d.day, version),
                 ))
             }
-            d.spo2Pct?.let {
+            // DELIBERATELY NOT EXPORTED while [EXPORTS_SPO2_TO_HEALTH_CONNECT] is false — see the constant.
+            d.spo2Pct?.takeIf { EXPORTS_SPO2_TO_HEALTH_CONNECT }?.let {
                 records.add(OxygenSaturationRecord(
                     time = instant, zoneOffset = offset, percentage = Percentage(it),
                     metadata = meta("spo2", d.day, version),
@@ -171,6 +202,11 @@ object HealthConnectWriter {
         runCatching { writeHeartRate(client, context, repo, deviceId, version) }
             .fold({ total += it }, { failures += it.writebackCategory() })
         runCatching { writeSleep(client, repo, deviceId) }
+            .fold({ total += it }, { failures += it.writebackCategory() })
+        // #1525: separate attempt on purpose. The daily records above go in ONE insertRecords call, so a
+        // missing permission there loses resting HR, HRV, SpO2 and respiratory rate together. On its own,
+        // an ungranted VO2 max permission costs only VO2 max and is categorized like any other failure.
+        runCatching { writeVo2Max(client, repo, deviceId, version) }
             .fold({ total += it }, { failures += it.writebackCategory() })
         val result = WritebackResult(total, failures.distinct())
         recordStatus(context, result)
@@ -297,7 +333,72 @@ object HealthConnectWriter {
         return insertChunked(client, records)
     }
 
+    /**
+     * VO2 max writeback (#1525). NOOP computes this weekly and persists it as the `vo2max_est` metric
+     * series, keyed to the week's Saturday — nothing exported it before, so a value the app already had
+     * never reached Health Connect.
+     *
+     * Read through [WhoopRepository.metricSeriesComputedUnion], which is what that series' own doc says
+     * the weekly computed scores MUST use: it merges the active strap's computed sibling with the
+     * canonical "my-whoop-noop", so a re-added strap does not silently export half its history.
+     *
+     * Declared as MEASUREMENT_METHOD_OTHER rather than HEART_RATE_RATIO. The stored value is whichever
+     * estimator ran — the Nes multivariable regression when a waist is set, the Uth HR-ratio formula
+     * otherwise (#1493) — and the row does not record which. HEART_RATE_RATIO would be true of only one
+     * of them, so the honest label is the general one.
+     *
+     * Timestamped at local noon on the series' day, matching the daily records above.
+     */
+    private suspend fun writeVo2Max(
+        client: HealthConnectClient,
+        repo: WhoopRepository,
+        deviceId: String,
+        version: Long,
+    ): Int {
+        val zone = ZoneId.systemDefault()
+        val cutoff = LocalDate.now().minusDays(WINDOW_DAYS).toString()
+        val today = LocalDate.now().toString()
+        val rows = repo.metricSeriesComputedUnion(deviceId, "vo2max_est", cutoff, today)
+        val records = buildVo2MaxRecords(rows, version, zone)
+        if (records.isEmpty()) return 0
+        return insertChunked(client, records)
+    }
+
+    /**
+     * Pure: map `vo2max_est` series rows to records, testable without a client — the same split
+     * [buildExerciseRecords] uses below.
+     *
+     * Skips a day whose key will not parse, and any value at or below zero: a stored 0 means the estimator
+     * declined that week, and exporting it would publish "VO2 max: 0" as a fitness reading rather than
+     * saying nothing. Timestamped at local noon on the series' own day, matching the daily records, and
+     * keyed by day in the clientRecordId so a re-export upserts instead of duplicating.
+     */
+    internal fun buildVo2MaxRecords(
+        rows: List<MetricSeriesRow>,
+        version: Long,
+        zone: ZoneId,
+    ): List<Record> = rows.mapNotNull { row ->
+        val date = runCatching { LocalDate.parse(row.day) }.getOrNull() ?: return@mapNotNull null
+        if (row.value <= 0.0) return@mapNotNull null
+        val time = date.atTime(LocalTime.NOON).atZone(zone)
+        Vo2MaxRecord(
+            time = time.toInstant(),
+            zoneOffset = time.offset,
+            vo2MillilitersPerMinuteKilogram = row.value,
+            measurementMethod = Vo2MaxRecord.MEASUREMENT_METHOD_OTHER,
+            metadata = meta("vo2max", row.day, version),
+        )
+    }
+
     // --- Workout (ExerciseSession) writeback (GPS workouts, v1.71) ---
+
+    /**
+     * Write permission for VO2 max (#1525). Deliberately NOT in [WRITE_RECORDS]: that set feeds both the
+     * daily batch and the UI's `containsAll` gate, so adding it there would re-prompt every existing user
+     * and block ALL writeback until they re-granted. Requested alongside the others, but its records are
+     * written in their own attempt, so a decline costs only VO2 max.
+     */
+    val VO2MAX_PERMISSIONS: Set<String> = setOf(HealthPermission.getWritePermission(Vo2MaxRecord::class))
 
     /** Write-permission strings for exercise sessions + distance; union into the writeback request. */
     val EXERCISE_PERMISSIONS: Set<String> = setOf(
@@ -339,5 +440,22 @@ object HealthConnectWriter {
             .fold({ WritebackResult(it, emptyList()) }, { WritebackResult(0, listOf(it.writebackCategory())) })
         recordStatus(context, result)
         return result
+    }
+
+    /** Remove a workout's session + distance records from Health Connect by client-record id (the same ids
+     *  [buildExerciseRecords] assigns: "noop-workout-$startTs" + "-dist"). Used when an edit MOVES the start
+     *  time so the old record doesn't orphan beside the new one — mirroring the iOS delete-before-write.
+     *  Best-effort; a missing record is a no-op. (#1195) */
+    suspend fun deleteExercise(context: Context, startTs: Long) {
+        if (HealthConnectClient.getSdkStatus(context) != HealthConnectClient.SDK_AVAILABLE) return
+        val client = HealthConnectClient.getOrCreate(context)
+        runCatching {
+            client.deleteRecords(ExerciseSessionRecord::class,
+                recordIdsList = emptyList(), clientRecordIdsList = listOf("noop-workout-$startTs"))
+        }
+        runCatching {
+            client.deleteRecords(DistanceRecord::class,
+                recordIdsList = emptyList(), clientRecordIdsList = listOf("noop-workout-dist-$startTs"))
+        }
     }
 }

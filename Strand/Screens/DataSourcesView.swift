@@ -619,7 +619,7 @@ struct DataSourcesView: View {
                         strain: nil,                 // never a fabricated cardiovascular strain
                         distanceM: nil,
                         zonesJSON: nil,
-                        notes: s.volumeLoadNote()
+                        notes: s.volumeLoadNote(), steps: nil
                     )
                 }
                 try await store.upsertWorkouts(rows, deviceId: LiftingImporter.sourceId)
