@@ -41,9 +41,18 @@ public struct WorkoutRow: Equatable, Codable {
     public let zonesJSON: String?
     public let notes: String?
     public let steps: Int?               // #1058: per-session steps (activity-file foot sports); nil otherwise
+    /// NO DEFAULTS HERE, deliberately (#1444). Swift rebuilds a row field by field, so a defaulted
+    /// parameter lets an existing call site keep compiling while it silently starts writing nothing.
+    /// That is exactly how `steps` was dropped at six sites — two of which persisted the loss — with
+    /// nothing in the read path able to tell "never had steps" from "had steps, then lost them".
+    /// Requiring every field makes each call site state its intent and turns the next added column into
+    /// a compile error instead of silent data loss. Keep it that way: add a field WITHOUT a default and
+    /// fix the call sites the compiler points at. (Kotlin needs no equivalent rule because `copy()`
+    /// carries unmentioned fields — but note that only protects a rebuild whose receiver IS the stored
+    /// row, which is why the Android edit sheet lost `steps` anyway.)
     public init(startTs: Int, endTs: Int, sport: String, source: String, durationS: Double?,
                 energyKcal: Double?, avgHr: Int?, maxHr: Int?, strain: Double?, distanceM: Double?,
-                zonesJSON: String?, notes: String?, steps: Int? = nil) {
+                zonesJSON: String?, notes: String?, steps: Int?) {
         self.startTs = startTs; self.endTs = endTs; self.sport = sport; self.source = source
         self.durationS = durationS; self.energyKcal = energyKcal; self.avgHr = avgHr
         self.maxHr = maxHr; self.strain = strain; self.distanceM = distanceM
@@ -139,11 +148,18 @@ extension WhoopStore {
     }
 
     /// Upsert workouts. Natural key (deviceId, startTs, sport). Returns rows changed.
+    ///
+    /// Resurrection guard: a cloud-journal delete tombstones a workout's (startTs, sport) — see
+    /// `CloudTombstoneStore`. A row matching a tombstone is dropped BEFORE the insert, so a later
+    /// re-import (backfill replay, cloud re-pull) can't resurrect a workout the user deleted.
     @discardableResult
     public func upsertWorkouts(_ rows: [WorkoutRow], deviceId: String) async throws -> Int {
         try syncWrite { db in
+            let tombstoned = Set(try WhoopStore.workoutTombstoneRows(db, deviceId: deviceId)
+                .map { WorkoutTombstoneKey(startTs: $0.startTs, sport: $0.sport) })
             var n = 0
             for r in rows {
+                if tombstoned.contains(WorkoutTombstoneKey(startTs: r.startTs, sport: r.sport)) { continue }
                 try db.execute(sql: """
                     INSERT INTO workout
                         (deviceId, startTs, endTs, sport, source, durationS, energyKcal,
@@ -248,6 +264,17 @@ extension WhoopStore {
                                strain: $0["strain"], distanceM: $0["distanceM"],
                                zonesJSON: $0["zonesJSON"], notes: $0["notes"], steps: $0["steps"])
                 }
+        }
+    }
+
+    /// True when a workout exists at the exact natural key (deviceId, startTs, sport). A cheap
+    /// existence check for a resurrection/staleness guard (`CloudEditApplier`'s `fix_workout`
+    /// handler) that only needs a boolean, not a fully decoded `WorkoutRow`.
+    public func workoutExists(deviceId: String, startTs: Int, sport: String) async throws -> Bool {
+        try syncRead { db in
+            try Row.fetchOne(db, sql: """
+                SELECT 1 FROM workout WHERE deviceId = ? AND startTs = ? AND sport = ? LIMIT 1
+                """, arguments: [deviceId, startTs, sport]) != nil
         }
     }
 

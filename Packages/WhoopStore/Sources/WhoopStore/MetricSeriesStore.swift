@@ -27,6 +27,10 @@ extension WhoopStore {
     /// Upsert metric points. Natural key (deviceId, day, key). Returns rows changed.
     /// Idempotent: re-upserting the same (deviceId, day, key) updates `value` in place rather than
     /// creating a duplicate.
+    ///
+    /// Resurrection guard: a cloud-journal delete tombstones a metric point's (day, key) — see
+    /// `CloudTombstoneStore`. A row matching a tombstone is dropped BEFORE the insert, so a later
+    /// re-derive/re-upsert can't resurrect a point the user deleted.
     @discardableResult
     public func upsertMetricSeries(_ rows: [MetricPoint], deviceId: String) async throws -> Int {
         try syncWrite { db in
@@ -35,9 +39,18 @@ extension WhoopStore {
     }
 
     /// Transaction-sharing primitive used by computed-score persistence.
+    ///
+    /// The resurrection guard lives HERE, not in the async wrapper, so the two writers cannot drift:
+    /// `ScoreInputProvenanceStore` persists computed headline scores through this same primitive, and a
+    /// guard that only covered the wrapper would let a score the user deleted in the cloud journal come
+    /// back the next time it was re-derived. `metricPointTombstoneRows` reads on the caller's `db`, so it
+    /// shares the enclosing transaction rather than opening a second connection.
     static func upsertMetricSeries(_ rows: [MetricPoint], deviceId: String, in db: Database) throws -> Int {
+        let tombstoned = Set(try WhoopStore.metricPointTombstoneRows(db, deviceId: deviceId)
+            .map { MetricPointTombstoneKey(day: $0.day, key: $0.key) })
         var n = 0
         for r in rows {
+            if tombstoned.contains(MetricPointTombstoneKey(day: r.day, key: r.key)) { continue }
             try db.execute(sql: """
                 INSERT INTO metricSeries
                     (deviceId, day, key, value)
@@ -87,6 +100,33 @@ extension WhoopStore {
                 let latest: String = row["latest"]
             else { return nil }
             return (earliest, latest)
+        }
+    }
+
+    /// Delete one point identified by the metric-series natural key. User-entered local series use this
+    /// to provide a real delete (rather than leaving a sentinel value behind). Returns the number of rows
+    /// removed; deleting an absent point is an idempotent zero-row change.
+    @discardableResult
+    public func deleteMetricSeriesPoint(deviceId: String, day: String, key: String) async throws -> Int {
+        try syncWrite { db in
+            try db.execute(sql: """
+                DELETE FROM metricSeries
+                WHERE deviceId = ? AND day = ? AND key = ?
+                """, arguments: [deviceId, day, key])
+            return db.changesCount
+        }
+    }
+
+    /// Delete every point for one source/key pair in a single statement. Returns the number of rows
+    /// removed; deleting an absent series is an idempotent zero-row change.
+    @discardableResult
+    public func deleteMetricSeries(deviceId: String, key: String) async throws -> Int {
+        try syncWrite { db in
+            try db.execute(sql: """
+                DELETE FROM metricSeries
+                WHERE deviceId = ? AND key = ?
+                """, arguments: [deviceId, key])
+            return db.changesCount
         }
     }
 }

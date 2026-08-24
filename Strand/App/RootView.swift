@@ -17,6 +17,7 @@ enum NavItem: String, CaseIterable, Identifiable, Hashable {
     case workouts = "Workouts"
     case health = "Health"
     case stress = "Stress"
+    case crossDeviceHRV = "Cross-Device HRV"
     case labBook = "Lab Book"
     case rhythm = "Rhythm"
     case appleHealth = "Apple Health"
@@ -25,9 +26,11 @@ enum NavItem: String, CaseIterable, Identifiable, Hashable {
     case backupSync = "Backup & Sync"
     case fusedRecord = "Your Data, Fused"
     case devices = "Devices"
+    case noopLimitations = "NOOP Limitations"
     case notifications = "Notifications"
     case automation = "Automations"
     case smartAlarm = "Smart Alarm"
+    case powerSaving = "Power saving"
     case settings = "Settings"
     case testCentre = "Test Centre"
 
@@ -52,6 +55,7 @@ enum NavItem: String, CaseIterable, Identifiable, Hashable {
         case .workouts: return "Workouts"
         case .health: return "Health"
         case .stress: return "Stress"
+        case .crossDeviceHRV: return "Cross-Device HRV"
         case .labBook: return "Lab Book"
         case .rhythm: return "Rhythm"
         case .appleHealth: return "Apple Health"
@@ -60,12 +64,14 @@ enum NavItem: String, CaseIterable, Identifiable, Hashable {
         case .backupSync: return "Backup & Sync"
         case .fusedRecord: return "Your Data, Fused"
         case .devices: return "Devices"
+        case .noopLimitations: return "NOOP Limitations"
         case .notifications: return "Notifications"
         case .automation: return "Automations"
         // "Alarms" is the ONE alarm surface (#766): the strap's silent wake-alarm (moved in from
         // Automations) and the evening wind-down reminder, in one place. Previously "Wind-Down" (#730).
         // The case name and rawValue stay `smartAlarm`/"Smart Alarm" as the in-memory nav identifier only.
         case .smartAlarm: return "Alarms"
+        case .powerSaving: return "Power saving"
         case .settings: return "Settings"
         case .testCentre: return "Test Centre"
         }
@@ -94,6 +100,7 @@ enum NavItem: String, CaseIterable, Identifiable, Hashable {
         case .workouts: return String(localized: "Workouts")
         case .health: return String(localized: "Health")
         case .stress: return String(localized: "Stress")
+        case .crossDeviceHRV: return String(localized: "Cross-Device HRV")
         case .labBook: return String(localized: "Lab Book")
         case .rhythm: return String(localized: "Rhythm")
         case .appleHealth: return String(localized: "Apple Health")
@@ -102,10 +109,12 @@ enum NavItem: String, CaseIterable, Identifiable, Hashable {
         case .backupSync: return String(localized: "Backup & Sync")
         case .fusedRecord: return String(localized: "Your Data, Fused")
         case .devices: return String(localized: "Devices")
+        case .noopLimitations: return String(localized: "NOOP Limitations")
         case .notifications: return String(localized: "Notifications")
         case .automation: return String(localized: "Automations")
         // Mirrors the `titleKey` remap above (#766): the row reads "Alarms", not the raw "Smart Alarm".
         case .smartAlarm: return String(localized: "Alarms")
+        case .powerSaving: return String(localized: "Power saving")
         case .settings: return String(localized: "Settings")
         case .testCentre: return String(localized: "Test Centre")
         }
@@ -128,6 +137,7 @@ enum NavItem: String, CaseIterable, Identifiable, Hashable {
         case .workouts: return "figure.run"
         case .health: return "heart.text.square.fill"
         case .stress: return "gauge.with.dots.needle.50percent"
+        case .crossDeviceHRV: return "waveform.path.ecg.rectangle"
         case .labBook: return "books.vertical.fill"
         case .rhythm: return "waveform.path"
         case .appleHealth: return "heart.fill"
@@ -136,9 +146,11 @@ enum NavItem: String, CaseIterable, Identifiable, Hashable {
         case .backupSync: return "externaldrive.fill.badge.icloud"
         case .fusedRecord: return "square.stack.3d.up.fill"
         case .devices: return "badge.plus.radiowaves.right"
+        case .noopLimitations: return "list.bullet.rectangle"
         case .notifications: return "bell.badge.fill"
         case .automation: return "wand.and.stars"
         case .smartAlarm: return "alarm.fill"
+        case .powerSaving: return "battery.25"
         case .settings: return "gearshape.fill"
         case .testCentre: return "stethoscope"
         }
@@ -170,11 +182,11 @@ struct NavGroup: Identifiable {
         // all collapse under this single Insights group rather than scattering across the flat list.
         NavGroup(title: "Insights", id: "insights", items: [
             .intelligence, .insightsHub, .coach, .explore, .compare, .insights,
-            .labBook, .rhythm, .trends,
+            .labBook, .rhythm, .trends, .crossDeviceHRV,
         ]),
         NavGroup(title: "Data & App", id: "data_app", items: [
-            .devices, .dataSources, .appleHealth, .xiaomi, .backupSync, .fusedRecord,
-            .notifications, .automation, .smartAlarm, .settings, .testCentre,
+            .devices, .noopLimitations, .dataSources, .appleHealth, .xiaomi, .backupSync, .fusedRecord,
+            .notifications, .automation, .smartAlarm, .powerSaving, .settings, .testCentre,
         ]),
     ]
 
@@ -189,6 +201,7 @@ struct RootView: View {
     // status pill is isolated into SidebarStatus so HR/frame ticks don't re-render the whole
     // NavigationSplitView shell + sidebar list.
     @EnvironmentObject var repo: Repository
+    @EnvironmentObject var model: AppModel
     /// Cross-screen navigation requests (e.g. Live → "Manage devices"). Observed here so a screen can
     /// switch the sidebar selection without owning it — see `NavRouter`.
     @EnvironmentObject var router: NavRouter
@@ -301,6 +314,23 @@ struct RootView: View {
             Task.detached(priority: .utility) {
                 await FolderBackup.catchUpIfDue(checkpoint: { await backupRepo.checkpointForBackup() })
             }
+            #if CLOUD_SYNC
+            // Cloud Sync: zero-touch on-launch catch-up (Phase 3.5) — bundle-injected build credentials
+            // (or a manual Keychain save) need no further setup; `CloudSyncSettings.isConfigured` gates
+            // silently otherwise. `autoSyncIfDue` is a plain MainActor call that spawns its own `Task`
+            // internally (mirrors `pullNow`/`syncNow`'s own shape), so — unlike `FolderBackup` above,
+            // whose async functions the CALLER wraps in `Task.detached` — this needs no detached wrapper
+            // of its own to stay off the launch-critical path. The 20h gate lives in
+            // `CloudSyncModel.isAutoSyncDue`.
+            let cloudSync = CloudSyncModel()
+            let intelligence = model.intelligence
+            let repository = repo
+            cloudSync.postApplyRefresh = {
+                await intelligence.analyzeRecent()
+                await repository.refresh()
+            }
+            cloudSync.autoSyncIfDue(repo: repo)
+            #endif
         }
         // Honour a cross-screen request to open a top-level destination (e.g. Live's "Manage devices"),
         // then clear it so the same tap can fire again later. Devices maps to the `.devices` sidebar item.
@@ -426,6 +456,7 @@ struct RootView: View {
         case .workouts: WorkoutsView()
         case .health: HealthView()
         case .stress: StressView()
+        case .crossDeviceHRV: CrossDeviceHRVView()
         case .labBook: LabBookView()
         case .rhythm: RhythmHost()
         case .appleHealth: AppleHealthView()
@@ -434,9 +465,11 @@ struct RootView: View {
         case .backupSync: BackupSyncView()
         case .fusedRecord: FusedRecordHost()
         case .devices: DevicesView()
+        case .noopLimitations: NoopLimitationsView()
         case .notifications: NotificationSettingsView()
         case .automation: AutomationsView()
         case .smartAlarm: SmartAlarmView()
+        case .powerSaving: PowerSavingView()
         case .settings: settingsDetail
         case .testCentre: TestCentreView()
         }
@@ -539,7 +572,7 @@ private struct SidebarStatus: View {
             Spacer()
         }
         .padding(10)
-        .background(StrandPalette.surfaceRaised, in: RoundedRectangle(cornerRadius: 10))
+        .background(NoopPanelSurface(cornerRadius: 10))
     }
 
     // Shares LiveState.connectionStatus* with the Settings strap card so the two never disagree (#266):

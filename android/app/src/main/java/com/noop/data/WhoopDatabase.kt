@@ -51,8 +51,10 @@ import androidx.sqlite.db.SupportSQLiteDatabase
         PpgWaveformSampleEntity::class,
         RawImuSampleEntity::class,
         V18AuxSampleEntity::class,
+        AppleStepHour::class,
+        Spo2PctSampleEntity::class,
     ],
-    version = 29,
+    version = 34,
     // #775: ON so Room's KSP processor writes the generated schema (every table's exact `CREATE TABLE`,
     // columns in declaration order with affinity/NOT NULL/default, PK and indices) as JSON. That export
     // is what lets a plain JVM test — no device, no Robolectric — read Android's REAL schema and compare
@@ -67,6 +69,9 @@ abstract class WhoopDatabase : RoomDatabase() {
 
     companion object {
         const val DB_NAME = "noop_whoop.db"
+        /** Room schema version — MUST equal the `@Database(version = …)` above. Surfaced in the backup
+         *  manifest (#1410) so an export states its schema. Bump both together on a migration. */
+        const val SCHEMA_VERSION = 34
 
         @Volatile
         private var instance: WhoopDatabase? = null
@@ -813,6 +818,166 @@ abstract class WhoopDatabase : RoomDatabase() {
             }
         }
 
+        /**
+         * #548: drop calibrated SpO₂ from WHOOP registry capabilities (import-only metric).
+         * Data-only UPDATE — no schema change. Twin of Swift WhoopStore `v36-whoop-caps-no-spo2`.
+         * Token strip matches [WhoopLiveCapabilities.stripSpo2Token].
+         */
+        internal val MIGRATION_29_30 = object : Migration(29, 30) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                val cursor = db.query(
+                    "SELECT `id`, `capabilities` FROM `pairedDevice` " +
+                        "WHERE `brand` = 'WHOOP' OR `id` = 'my-whoop' OR `id` LIKE 'whoop-%'",
+                )
+                cursor.use { c ->
+                    val idIdx = c.getColumnIndex("id")
+                    val capsIdx = c.getColumnIndex("capabilities")
+                    while (c.moveToNext()) {
+                        val id = c.getString(idIdx)
+                        val encoded = c.getString(capsIdx) ?: continue
+                        val stripped = WhoopLiveCapabilities.stripSpo2Token(encoded)
+                        if (stripped != encoded && stripped.isNotEmpty()) {
+                            db.execSQL(
+                                "UPDATE `pairedDevice` SET `capabilities` = ? WHERE `id` = ?",
+                                arrayOf(stripped, id),
+                            )
+                        }
+                    }
+                }
+            }
+        }
+
+        /**
+         * v30 -> v31: ADDITIVE, adds the `appleStepHour` table, the Android twin of the Swift WhoopStore
+         * `v38-apple-step-hour` migration. Hourly Apple-Health step counts: `appleDaily.steps` flattens a
+         * whole day to one total, so a dead/absent phone for part of a day is invisible; this per-hour
+         * table records exactly which hours had a recording. `ts` is the hour-bucket start (unix seconds),
+         * `steps` the cumulative sum within that hour, composite PK (deviceId, ts) so the hourly upsert is
+         * idempotent.
+         *
+         * CREATE TABLE only (no existing data touched), so already-offloaded raw streams survive. The SQL
+         * MUST match Room's generated schema for [AppleStepHour] exactly: deviceId TEXT NOT NULL, ts
+         * INTEGER NOT NULL, steps INTEGER NOT NULL (all Kotlin non-null, no SQL DEFAULT), composite
+         * PRIMARY KEY (deviceId, ts) in declaration order. SCHEMA-ONLY twin: the Apple-Health IMPORT that
+         * fills it is iOS-only (HealthKit has no Android analogue), so Android carries the table for
+         * `.noopbak` byte-parity but no importer writes it — as it already does for [AppleDaily]. No
+         * destructive fallback (see the class doc). Exposed as [APPLE_STEP_HOUR_MIGRATION_SQL] so a
+         * plain-JVM unit test can pin the shape without Robolectric.
+         */
+        internal val APPLE_STEP_HOUR_MIGRATION_SQL: List<String> = listOf(
+            "CREATE TABLE IF NOT EXISTS `appleStepHour` (`deviceId` TEXT NOT NULL, " +
+                "`ts` INTEGER NOT NULL, `steps` INTEGER NOT NULL, PRIMARY KEY(`deviceId`, `ts`))",
+        )
+
+        internal val MIGRATION_30_31 = object : Migration(30, 31) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                for (stmt in APPLE_STEP_HOUR_MIGRATION_SQL) db.execSQL(stmt)
+            }
+        }
+
+        /**
+         * v31 -> v32: append the nullable five-minute SDNN-index column to `dailyMetric`. Existing rows
+         * remain null: avgHrv is RMSSD for native/Health Connect rows and must never be backfilled as SDNN.
+         */
+        internal val DAILY_SDNN_MIGRATION_SQL: List<String> = listOf(
+            "ALTER TABLE `dailyMetric` ADD COLUMN `avgSdnn` REAL",
+        )
+
+        internal val MIGRATION_31_32 = object : Migration(31, 32) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                for (stmt in DAILY_SDNN_MIGRATION_SQL) db.execSQL(stmt)
+            }
+        }
+
+        /** #979: append the nullable v26 burst counter beside its persisted waveform. */
+        internal val PPG_BURST_INDEX_MIGRATION_SQL: List<String> = listOf(
+            "ALTER TABLE `ppgWaveformSample` ADD COLUMN `burstIndex` INTEGER",
+        )
+
+        internal val MIGRATION_32_33 = object : Migration(32, 33) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                for (stmt in PPG_BURST_INDEX_MIGRATION_SQL) db.execSQL(stmt)
+            }
+        }
+
+        /**
+         * Retain the WHOOP 5/MG's own computed SpO2 percentage forever instead of losing it after seven
+         * days. Twin of the Swift GRDB migration `v34-spo2-pct-durable`.
+         *
+         * THE PROBLEM THIS FIXES. The 5/MG emits its own SpO2 % on `@82` of the v18 record. That byte has
+         * been banked since MIGRATION_24_25 — but only inside `v18AuxSample.fields`, a table CAPPED at
+         * [WhoopRepository.V18_AUX_RETENTION_ROWS] (604,800 rows/device, ~7 days at 1 Hz) because the aux
+         * blob costs ~30 MB/day. So every reading rolled off after a week and was gone permanently: the
+         * strap trims its own history the moment NOOP acks the offload, so there is no second copy
+         * anywhere. Raising the aux cap is the WRONG fix — it buys a year of SpO2 at the price of ~11 GB
+         * of mostly-unrelated aux bytes. The in-band signal is only ~2,000 samples/week (~100k rows/year),
+         * so it gets a narrow sibling that is NEVER pruned while the wide aux capture stays capped and
+         * unchanged. See [Spo2PctSampleEntity] for why this is not a column on `spo2Sample`.
+         *
+         * ADDITIVE ONLY: one CREATE TABLE, no rebuild, no row touched, no existing column changed — the
+         * MIGRATION_9_10 form (a brand-new table). No destructive fallback (see the class doc): a silent
+         * rebuild would lose already-acked, non-resendable strap history.
+         *
+         * `pct` is NOT NULL because a row is written only when the byte carried an in-band measurement;
+         * absence is encoded as "no row", never as a fabricated 0. That matters here more than usual: `0`
+         * is a real value ON THE WIRE ("the strap emitted nothing this second"), so a NULLable column
+         * holding 0 would be indistinguishable from a genuine sentinel.
+         *
+         * VERSION SEQUENCING. Room 33 -> 34 pairs with GRDB `v34-spo2-pct-durable`, which is NOT the
+         * baseline `v34` (that is `v34-sleep-staging-sparse`): GRDB's identifiers and Room's integer
+         * versions are independent counters that have drifted apart since the fork's iOS-only migrations
+         * (see `grdbMigrationLineages` in `schema_oracle.json`). Room's version is a dense integer
+         * sequence and MUST be the next free one — this migration was renumbered from 25 -> 26 when the
+         * upstream merge brought its own 25..33 chain (the fork's Android app has no installed base, so
+         * no device carries the old number). Both are pinned by SchemaOracleTest.
+         *
+         * The CREATE TABLE column order matches [Spo2PctSampleEntity]'s field order and the GRDB schema,
+         * so a migrated schema, a freshly-created one, and a `.noopbak` from iOS all agree.
+         *
+         * Exposed as [SPO2_PCT_DURABLE_MIGRATION_SQL] so a plain-JVM unit test can assert its shape
+         * without an emulator, like the migrations above.
+         */
+        internal val SPO2_PCT_DURABLE_MIGRATION_SQL: List<String> = listOf(
+            "CREATE TABLE IF NOT EXISTS `spo2PctSample` (`deviceId` TEXT NOT NULL, " +
+                "`ts` INTEGER NOT NULL, `pct` INTEGER NOT NULL, " +
+                "PRIMARY KEY(`deviceId`, `ts`))",
+        )
+
+        internal val MIGRATION_33_34 = object : Migration(33, 34) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                for (stmt in SPO2_PCT_DURABLE_MIGRATION_SQL) db.execSQL(stmt)
+            }
+        }
+
+        /**
+         * Every migration the builder registers, as a VALUE rather than an argument list.
+         *
+         * It was previously spelled inline in `addMigrations(...)`, which meant nothing could check it. A
+         * migration could be written, tested and still left out of the chain: the focused tests assert a
+         * migration's SQL and its start/end versions, not that it is registered. Sabotaging the chain —
+         * removing an entry — left the whole suite green, and removing an OLDER entry did too, so this was
+         * a property of the suite rather than of any one change.
+         *
+         * The consequence is bounded but real. There is deliberately no destructive fallback (see the
+         * builder), so a hole makes Room throw on upgrade rather than silently rebuild — a loud failure for
+         * every existing user on the version that ships it, and with `exportSchema=false` nothing catches
+         * it beforehand. Guarded by WhoopDatabaseMigrationChainTest.
+         *
+         * Starts at 2 -> 3 on purpose: v1 predates this regime and has no upgrade path, which is why the
+         * test asserts NO HOLES up to [SCHEMA_VERSION] rather than coverage from 1.
+         */
+        internal val ALL_MIGRATIONS: Array<Migration> = arrayOf(
+            MIGRATION_2_3, MIGRATION_3_4, MIGRATION_4_5,
+            MIGRATION_5_6, MIGRATION_6_7, MIGRATION_7_8, MIGRATION_8_9, MIGRATION_9_10,
+            MIGRATION_10_11, MIGRATION_11_12, MIGRATION_12_13, MIGRATION_13_14,
+            MIGRATION_14_15, MIGRATION_15_16, MIGRATION_16_17, MIGRATION_17_18,
+            MIGRATION_18_19, MIGRATION_19_20, MIGRATION_20_21, MIGRATION_21_22,
+            MIGRATION_22_23, MIGRATION_23_24, MIGRATION_24_25, MIGRATION_25_26,
+            MIGRATION_26_27, MIGRATION_27_28, MIGRATION_28_29, MIGRATION_29_30,
+            MIGRATION_30_31, MIGRATION_31_32, MIGRATION_32_33, MIGRATION_33_34,
+        )
+
+
         private fun build(appContext: Context): WhoopDatabase =
             Room.databaseBuilder(appContext, WhoopDatabase::class.java, DB_NAME)
                 // #1014: replace ONLY the corruption handling of the default open-helper. The
@@ -823,20 +988,13 @@ abstract class WhoopDatabase : RoomDatabase() {
                 // Real additive migration, NO destructive fallback (see the class doc): with
                 // exportSchema=false a silent rebuild would lose already-acked, non-resendable strap
                 // history on any schema mismatch. Room throws loudly instead; CI guards the SQL.
-                .addMigrations(
-                    MIGRATION_2_3, MIGRATION_3_4, MIGRATION_4_5,
-                    MIGRATION_5_6, MIGRATION_6_7, MIGRATION_7_8, MIGRATION_8_9, MIGRATION_9_10,
-                    MIGRATION_10_11, MIGRATION_11_12, MIGRATION_12_13, MIGRATION_13_14,
-                    MIGRATION_14_15, MIGRATION_15_16, MIGRATION_16_17, MIGRATION_17_18,
-                    MIGRATION_18_19, MIGRATION_19_20, MIGRATION_20_21, MIGRATION_21_22,
-                    MIGRATION_22_23, MIGRATION_23_24, MIGRATION_24_25, MIGRATION_25_26,
-                    MIGRATION_26_27, MIGRATION_27_28, MIGRATION_28_29,
-                )
+                .addMigrations(*ALL_MIGRATIONS)
                 // #1037: a FRESH install builds the schema straight at the current version and runs NO
                 // migrations, so the MIGRATION_7_8 "my-whoop" registry seed never fires and the WHOOP,
                 // though paired and streaming fine, never appears in the Devices list. Seed the canonical
                 // row on create too (same idempotent INSERT OR IGNORE as the migration) so a first-ever
                 // install still lists its WHOOP. iOS/GRDB re-runs migrations on a fresh DB, so it never hit this.
+                // #548: no calibrated SpO₂ in the seed (import-only).
                 .addCallback(object : RoomDatabase.Callback() {
                     override fun onCreate(db: SupportSQLiteDatabase) {
                         val now = System.currentTimeMillis() / 1000
@@ -845,7 +1003,7 @@ abstract class WhoopDatabase : RoomDatabase() {
                                 "(`id`, `brand`, `model`, `nickname`, `sourceKind`, `capabilities`, " +
                                 "`status`, `addedAt`, `lastSeenAt`) VALUES " +
                                 "('my-whoop', 'WHOOP', 'WHOOP', NULL, 'liveBLE', " +
-                                "'hr,hrv,spo2,skinTemp,sleep,strainLoad', 'active', $now, $now)",
+                                "'${WhoopLiveCapabilities.encoded("WHOOP")}', 'active', $now, $now)",
                         )
                     }
                 })

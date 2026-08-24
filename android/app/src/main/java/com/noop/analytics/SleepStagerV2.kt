@@ -126,6 +126,7 @@ object SleepStagerV2 {
     }
 
     /** The pure recipe, exactly as before — extracted so [stageSession] can memoize it. */
+    @Suppress("UNUSED_PARAMETER") // `resp` keeps this a drop-in for SleepStager.stageSession(…resp:) (parity)
     private fun stageSessionUncached(
         start: Long, end: Long, grav: List<GravitySample>,
         hr: List<HrSample>, rr: List<RrInterval>, resp: List<RespSample>,
@@ -214,11 +215,11 @@ object SleepStagerV2 {
      *  Measured on one wearer's 36 recorded nights, against the strap's own band `sleep_state` (an
      *  independent reference the recipe cannot contaminate — 21 nights, 15 554 epochs): sleep/wake kappa
      *  0.105 → 0.118 and wake sensitivity 16.0 % → 17.6 %, with the healthy-stratum wake fraction essentially
-     *  unmoved (9.43 % → 9.96 %, i.e. no repeat of the #437 blow-out). Confirmed afterwards against
-     *  human-scored PSG hypnograms (PhysioNet sleep-accel, 31 subjects / 26 773 epochs, #991): 4-class kappa
-     *  0.356 → 0.363, REM F1 0.569 → 0.575, wake sensitivity 30.42 % → 30.84 %, and the #437 stage-fraction
-     *  guard holds against truth as well. n = 1 wearer for the band figures; see `Tools/SleepBench` and the
-     *  PR for the full ablation and its limits. */
+     *  unmoved (9.43 % → 9.96 %, i.e. no repeat of the #437 blow-out) and first-REM latency MAE 53.9 → 41.6
+     *  min. Confirmed afterwards against human-scored PSG hypnograms (PhysioNet sleep-accel, 31 subjects /
+     *  26 773 epochs, #991): 4-class kappa 0.356 → 0.363, REM F1 0.569 → 0.575, wake sensitivity 30.42 % →
+     *  30.84 %, and the #437 stage-fraction guard holds against truth as well. n = 1 wearer for the band
+     *  figures; see `Tools/SleepBench` and the PR for the full ablation and its limits. */
     internal val transition: Map<String, Map<String, Double>> = mapOf(
         "deep" to mapOf("deep" to 0.86, "rem" to 0.007, "light" to 0.126, "awake" to 0.007),
         "rem" to mapOf("deep" to 0.005, "rem" to 0.88, "light" to 0.10, "awake" to 0.015),

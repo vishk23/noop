@@ -127,13 +127,22 @@ enum ScheduledDebugExport {
         return removed
     }
 
-    /// iOS BGTask identifier. Derived from the running bundle id (rather than hardcoded) so it tracks
-    /// BUNDLE_ID_PREFIX (see Config/BundleId.xcconfig) automatically and always matches the iOS target's
-    /// `BGTaskSchedulerPermittedIdentifiers` (Info.plist), which is built from `$(PRODUCT_BUNDLE_IDENTIFIER)`
-    /// the same way. Must also be registered at launch for `submit` to succeed — wired in the app entry point.
-    static let bgTaskIdentifier = (Bundle.main.bundleIdentifier ?? "com.noopapp.noop") + ".debugexport"
+    /// iOS BGTask identifier. Must also appear in the iOS target's `BGTaskSchedulerPermittedIdentifiers`
+    /// (Info.plist) and be registered at launch for `submit` to succeed — wired in the app entry point.
+    ///
+    /// Resolved from the bundle rather than hardcoded, because the permitted entries are namespaced
+    /// under the bundle id: a build under a different Apple ID (the documented "change it in one place"
+    /// path — see `APP_GROUP_ID` in project.yml) rewrites the plist side, and a literal here would go
+    /// stale and silently kill this lane. See `BGTaskIdentifier` for the full contract.
+    static let bgTaskIdentifier = BGTaskIdentifier.resolve(
+        suffix: "debugexport", upstream: "com.noopapp.noop.debugexport")
 
     static var isEnabled: Bool { UserDefaults.standard.bool(forKey: K.enabled) }
+
+    /// A delivered BGAppRefresh request is single-shot and should schedule its successor only while the
+    /// user still has scheduled exports enabled. Kept outside the iOS-only `register` block so the
+    /// disable-versus-delivery race is testable on every platform.
+    static func backgroundTaskShouldResubmit(enabled: Bool) -> Bool { enabled }
 
     /// Time-of-day to export, minutes since local midnight. Clamped to a valid minute. Default 07:00.
     static var timeMinutes: Int {
@@ -300,18 +309,29 @@ enum ScheduledDebugExport {
     /// the task. Both live in the iOS app target — call this from `StrandiOSApp.init()`. Safe to leave
     /// uncalled: `submitBackgroundRequest()` fails gracefully and the macOS path + "Run now" still work.
     static func register() {
-        BGTaskScheduler.shared.register(forTaskWithIdentifier: bgTaskIdentifier, using: nil) { task in
+        let registered = BGTaskScheduler.shared.register(forTaskWithIdentifier: bgTaskIdentifier, using: nil) { task in
             let completion = TaskCompletionGuard(task: task)
             // iOS can kill the process before our work below returns if the background budget runs out;
             // report that honestly as a failure (so the run is retried) instead of leaving the task
             // marked incomplete, and instead of the old hardcoded `success: true`.
             task.expirationHandler = { completion.finish(success: false) }
-            // Write the drop, then immediately request the next one (BGAppRefresh is single-shot).
-            // `catchUpIfDue()` already no-ops (returning true) when the feature is off.
+            // BGAppRefresh is single-shot. `setEnabled(false)` cancels the pending request, but iOS can
+            // already be delivering one when it does — `cancel` loses that race. Gate the successor on a
+            // fresh enabled read so a stale delivery can't resurrect a daily background wake the user
+            // turned off. Disabled is a terminal no-op: nothing to export, nothing to resubmit.
+            guard backgroundTaskShouldResubmit(enabled: isEnabled) else {
+                completion.finish(success: true)
+                return
+            }
+            // Write the drop, then immediately request the next one.
+            // `catchUpIfDue()` already no-ops (returning true) when nothing is due.
             let succeeded = catchUpIfDue()
             submitBackgroundRequest()
             completion.finish(success: succeeded)
         }
+        // `register` returns false when the identifier isn't on the permitted list — the one signal that
+        // this lane is dead. Discarding it is what let a bundle-id remap silently disable the drop.
+        BGTaskIdentifier.report(bgTaskIdentifier, registered: registered)
     }
 
     /// Guards `BGTask.setTaskCompleted` against being called twice — once from the normal completion

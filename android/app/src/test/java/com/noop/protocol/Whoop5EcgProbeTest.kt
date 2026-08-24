@@ -2,6 +2,7 @@ package com.noop.protocol
 
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotEquals
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -36,6 +37,7 @@ class Whoop5EcgProbeTest {
             label = "$name($cmd)",
             outcome = outcome,
             requestsRealtimeData = Whoop5Ecg.requestsRealtimeData(cmd, arg),
+            sentArgument = arg,
             replyHex = replyHex,
         )
     }
@@ -103,11 +105,11 @@ class Whoop5EcgProbeTest {
     @Test
     fun attestedResultCodesOutrankTheShapeHeuristic() {
         assertEquals(
-            Whoop5EcgProbe.Verdict.DataRequestRefused(listOf("TOGGLE_LABRADOR_DATA_GENERATION(124)")),
+            Whoop5EcgProbe.Verdict.DataRequestRefused(listOf("TOGGLE_LABRADOR_DATA_GENERATION(124) arg=1")),
             Whoop5EcgProbe.verdict(listOf(sent(124, 1, Whoop5EcgProbe.CommandOutcome.Failure)), 12, 30),
         )
         assertEquals(
-            Whoop5EcgProbe.Verdict.OpcodeUnsupported(listOf("TOGGLE_LABRADOR_FILTERED(139)")),
+            Whoop5EcgProbe.Verdict.OpcodeUnsupported(listOf("TOGGLE_LABRADOR_FILTERED(139) arg=1")),
             Whoop5EcgProbe.verdict(listOf(sent(139, 1, Whoop5EcgProbe.CommandOutcome.Unsupported)), 12, 30),
         )
         assertEquals(
@@ -159,7 +161,7 @@ class Whoop5EcgProbeTest {
             ),
         )
         assertEquals(
-            Whoop5EcgProbe.Verdict.NoDataRequested(listOf("SELECT_WRIST(123)")),
+            Whoop5EcgProbe.Verdict.NoDataRequested(listOf("SELECT_WRIST(123) arg=1")),
             Whoop5EcgProbe.verdict(steps, 0, 30),
         )
         val text = Whoop5EcgProbe.report(steps, 0, emptyList(), 30)
@@ -183,7 +185,7 @@ class Whoop5EcgProbeTest {
             ),
         )
         assertEquals(
-            Whoop5EcgProbe.Verdict.CommandRefused(listOf("SELECT_WRIST(123)")),
+            Whoop5EcgProbe.Verdict.CommandRefused(listOf("SELECT_WRIST(123) arg=0")),
             Whoop5EcgProbe.verdict(steps, 0, 30),
         )
         val text = Whoop5EcgProbe.report(steps, 0, emptyList(), 30)
@@ -203,9 +205,9 @@ class Whoop5EcgProbeTest {
         assertEquals(
             Whoop5EcgProbe.Verdict.NoDataRequested(
                 listOf(
-                    "TOGGLE_LABRADOR_DATA_GENERATION(124)",
-                    "TOGGLE_LABRADOR_RAW_SAVE(125)",
-                    "TOGGLE_LABRADOR_FILTERED(139)",
+                    "TOGGLE_LABRADOR_DATA_GENERATION(124) arg=0",
+                    "TOGGLE_LABRADOR_RAW_SAVE(125) arg=0",
+                    "TOGGLE_LABRADOR_FILTERED(139) arg=0",
                 ),
             ),
             Whoop5EcgProbe.verdict(steps, 0, 30),
@@ -217,7 +219,7 @@ class Whoop5EcgProbeTest {
         // RAW_SAVE names flash. A realtime listen window observes nothing from it even on total success,
         // so a raw-save-only run cannot be read as "accepted and then silent" (#891 hypothesis (b)).
         assertEquals(
-            Whoop5EcgProbe.Verdict.NoDataRequested(listOf("TOGGLE_LABRADOR_RAW_SAVE(125)")),
+            Whoop5EcgProbe.Verdict.NoDataRequested(listOf("TOGGLE_LABRADOR_RAW_SAVE(125) arg=1")),
             Whoop5EcgProbe.verdict(listOf(sent(125, 1, Whoop5EcgProbe.CommandOutcome.Success)), 0, 30),
         )
     }
@@ -232,7 +234,7 @@ class Whoop5EcgProbeTest {
         )
         assertEquals(
             Whoop5EcgProbe.Verdict.DataRequestNotAccepted(
-                listOf("TOGGLE_LABRADOR_FILTERED(139)", "TOGGLE_LABRADOR_DATA_GENERATION(124)"),
+                listOf("TOGGLE_LABRADOR_FILTERED(139) arg=1", "TOGGLE_LABRADOR_DATA_GENERATION(124) arg=1"),
             ),
             Whoop5EcgProbe.verdict(steps, 0, 30),
         )
@@ -273,7 +275,7 @@ class Whoop5EcgProbeTest {
     @Test
     fun verdictUnsupportedIsReportedAsItselfNotAsABlock() {
         assertEquals(
-            Whoop5EcgProbe.Verdict.OpcodeUnsupported(listOf("TOGGLE_LABRADOR_FILTERED(139)")),
+            Whoop5EcgProbe.Verdict.OpcodeUnsupported(listOf("TOGGLE_LABRADOR_FILTERED(139) arg=1")),
             Whoop5EcgProbe.verdict(listOf(sent(139, 1, Whoop5EcgProbe.CommandOutcome.Unsupported)), 0, 30),
         )
     }
@@ -348,11 +350,54 @@ class Whoop5EcgProbeTest {
         )
         val text = Whoop5EcgProbe.report(steps, 0, listOf("type=0x28 len=220"), 30)
         assertTrue(text.contains("DATA REQUEST REFUSED"))
-        assertTrue(text.contains("SELECT_WRIST(123): SUCCESS(1)"))
-        assertTrue(text.contains("TOGGLE_LABRADOR_DATA_GENERATION(124): FAILURE(0)"))
+        assertTrue(text.contains("SELECT_WRIST(123) arg=1: SUCCESS(1)"))
+        assertTrue(text.contains("TOGGLE_LABRADOR_DATA_GENERATION(124) arg=1: FAILURE(0)"))
         assertTrue(text.contains("type=0x28 len=220"))
         assertTrue(text.contains("aabb"))
         assertTrue(text.contains("not a medical measurement or a diagnosis"))
+    }
+
+    /**
+     * Twin of Swift `testStartAndRestartRunsRenderDistinguishably`. A START run and a RESTART run send
+     * the SAME three opcodes and differ in exactly one byte, so without the argument annotation their
+     * reports are character-for-character identical — and a report is the artefact that gets copied out
+     * of an app and pasted into an issue, long after the log that recorded the payload bytes is gone.
+     */
+    @Test
+    fun startAndRestartRunsRenderDistinguishably() {
+        fun run(control: Whoop5Ecg.ControlSignal): String = Whoop5EcgProbe.report(
+            listOf(
+                sent(139, 1, Whoop5EcgProbe.CommandOutcome.Success),
+                sent(125, 1, Whoop5EcgProbe.CommandOutcome.Success),
+                sent(124, control.raw, Whoop5EcgProbe.CommandOutcome.Success),
+            ),
+            0, emptyList(), 30,
+        )
+        val startText = run(Whoop5Ecg.ControlSignal.START)
+        val restartText = run(Whoop5Ecg.ControlSignal.RESTART)
+        assertTrue(startText.contains("TOGGLE_LABRADOR_DATA_GENERATION(124) arg=1: SUCCESS(1)"))
+        assertTrue(restartText.contains("TOGGLE_LABRADOR_DATA_GENERATION(124) arg=2: SUCCESS(1)"))
+        assertNotEquals(startText, restartText)
+        // Both are still the SAME verdict: restart asks for realtime data exactly like start does, so
+        // the annotation records what was sent without changing what the run is read as.
+        assertTrue(startText.contains("Accepted but SILENT"))
+        assertTrue(restartText.contains("Accepted but SILENT"))
+    }
+
+    /**
+     * An UNSOLICITED reply has no known argument — nothing in an app layer sent it — and the report must
+     * say nothing rather than invent a value.
+     */
+    @Test
+    fun anUnknownArgumentIsOmittedRatherThanGuessed() {
+        val step = Whoop5EcgProbe.Step(
+            label = "TOGGLE_LABRADOR_DATA_GENERATION(124)",
+            outcome = Whoop5EcgProbe.CommandOutcome.Success,
+            requestsRealtimeData = false,
+        )
+        assertNull(step.sentArgument)
+        assertEquals("TOGGLE_LABRADOR_DATA_GENERATION(124)", step.labelWithArgument)
+        assertFalse(Whoop5EcgProbe.report(listOf(step), 0, emptyList(), 30).contains("arg="))
     }
 
     /**
@@ -409,5 +454,134 @@ class Whoop5EcgProbeTest {
         for (token in EcgArrhythmiaCheckResult.entries.map { it.token }) {
             assertFalse("report must not name $token", text.lowercase().contains(token.lowercase()))
         }
+    }
+
+    // MARK: - Unclassified-frame census
+
+    private fun header(samples: Int): List<Int> = listOf(
+        2, 0x05, 1, 1, 0, 1, 0, 1, 42, 0, 61, 63, 812 and 0xFF, (812 shr 8) and 0xFF, 17,
+        samples and 0xFF, (samples shr 8) and 0xFF,
+    )
+
+    private fun puffinFrame(type: Int, payload: List<Int>): ByteArray =
+        Framing.puffinCommandFrame(
+            cmd = 0x00, seq = 0x01,
+            payload = payload.map { it.toByte() }.toByteArray(),
+            type = type,
+        )
+
+    /**
+     * The census exists for the frames the triage says NO to. A heuristic that logs only its own hits
+     * destroys the evidence for its own misses: the 2-bytes-per-sample assumption discarded every 3-byte
+     * frame, and the report then said, truthfully, that nothing passed.
+     */
+    @Test
+    fun censusRecordsAFrameTheTriageRejects() {
+        val frame = puffinFrame(0x1A, List(20) { 0xEE })
+        assertFalse("fixture must be a triage MISS", Whoop5Ecg.plausibleFilteredFrame(frame))
+
+        val census = Whoop5EcgProbe.FrameCensus()
+        census.record(frame)
+        assertEquals(1, census.framesSeen)
+        assertEquals(1, census.buckets.size)
+        assertEquals(0x1A, census.buckets[0].typeByte)
+        assertEquals(1, census.buckets[0].count)
+
+        val sample = census.buckets[0].samples[0]
+        assertEquals(frame.size, sample.frameLength)
+        assertEquals(21, sample.payloadLength)          // 20 + the envelope's pad4 byte
+        assertEquals(0xEEEE, sample.numberOfECGSamples) // read, not believed
+        assertTrue(sample.widths.isEmpty())
+        assertTrue(sample.headHex.startsWith("aa"))
+        assertEquals("  type=0x1a  frames=1", census.lines[0])
+        assertTrue(census.lines[1].contains("widths=none"))
+        assertTrue(census.lines[1].contains("payload=21"))
+    }
+
+    /** A HIT is censused too — the census is the whole record of the window, not a rejects bin. */
+    @Test
+    fun censusRecordsTriageHitsWithTheWidthThatAgreed() {
+        val frame = puffinFrame(0x28, header(samples = 4) + List(12) { 0x11 })
+        assertTrue(Whoop5Ecg.plausibleFilteredFrame(frame))
+        val census = Whoop5EcgProbe.FrameCensus()
+        census.record(frame)
+        assertEquals(listOf(3), census.buckets[0].samples[0].widths)
+        assertEquals(4, census.buckets[0].samples[0].numberOfECGSamples)
+        assertTrue(census.lines[1].contains("widths=3"))
+    }
+
+    /** A frame whose CRC does not check out yields no decoded field — only its shape and its bytes. */
+    @Test
+    fun censusReadsNoFieldOutOfAnUnverifiedFrame() {
+        val frame = puffinFrame(0x28, header(samples = 3) + listOf(1, 0, 2, 0, 3, 0))
+        frame[frame.size - 1] = (frame[frame.size - 1].toInt() xor 0xFF).toByte()
+        val census = Whoop5EcgProbe.FrameCensus()
+        census.record(frame)
+        assertNull(census.buckets[0].samples[0].payloadLength)
+        assertNull(census.buckets[0].samples[0].numberOfECGSamples)
+        assertTrue(census.buckets[0].samples[0].widths.isEmpty())
+        assertTrue(census.lines[1].contains("payload=? samples=? widths=none"))
+    }
+
+    /** A 1 Hz stream must not grow the report without bound — and nothing may be dropped in silence. */
+    @Test
+    fun censusCapsSamplesPerTypeButKeepsCounting() {
+        val frame = puffinFrame(0x30, List(20) { 0xEE })
+        val census = Whoop5EcgProbe.FrameCensus()
+        repeat(50) { census.record(frame) }
+        assertEquals(50, census.framesSeen)
+        assertEquals(1, census.buckets.size)
+        assertEquals(50, census.buckets[0].count)
+        assertEquals(Whoop5EcgProbe.FrameCensus.MAX_SAMPLES_PER_TYPE, census.buckets[0].samples.size)
+        assertTrue(census.lines.any { it.contains("+47 more of this type, not recorded") })
+    }
+
+    @Test
+    fun censusCapsDistinctTypesAndCountsTheOverflow() {
+        val census = Whoop5EcgProbe.FrameCensus()
+        for (type in 0 until Whoop5EcgProbe.FrameCensus.MAX_TYPES + 4) {
+            census.record(puffinFrame(type, List(20) { 0xEE }))
+        }
+        assertEquals(Whoop5EcgProbe.FrameCensus.MAX_TYPES, census.buckets.size)
+        assertEquals(4, census.framesBeyondTypeCap)
+        assertEquals(Whoop5EcgProbe.FrameCensus.MAX_TYPES + 4, census.framesSeen)
+        assertTrue(census.lines.any { it.contains("4 frame(s) of further type bytes past the") })
+    }
+
+    @Test
+    fun censusIgnoresBuffersTooShortToCarryATypeByte() {
+        val census = Whoop5EcgProbe.FrameCensus()
+        census.record(ByteArray(0))
+        census.record(ByteArray(8) { 0xAA.toByte() })
+        assertTrue(census.isEmpty)
+        assertTrue(census.buckets.isEmpty())
+    }
+
+    /** The census is only useful if the operator can COPY it: it belongs in the report sheet. */
+    @Test
+    fun reportCarriesTheCensusBesideTheTriageResult() {
+        val census = Whoop5EcgProbe.FrameCensus()
+        census.record(puffinFrame(0x1A, List(20) { 0xEE }))
+        val text = Whoop5EcgProbe.report(
+            steps = listOf(
+                sent(139, 1, Whoop5EcgProbe.CommandOutcome.Success),
+                sent(124, Whoop5Ecg.ControlSignal.START.raw, Whoop5EcgProbe.CommandOutcome.Success),
+            ),
+            ecgPacketsSeen = 0,
+            candidateFrames = emptyList(),
+            windowSeconds = 30,
+            census = census,
+        )
+        assertTrue(text.contains("Candidate packet types: none — no frame passed the structural triage."))
+        assertTrue(text.contains("Unclassified-frame census"))
+        assertTrue(text.contains("type=0x1a  frames=1"))
+        assertTrue(text.contains("widths=none"))
+        assertTrue(text.contains(census.buckets[0].samples[0].headHex))
+    }
+
+    @Test
+    fun reportSaysSoWhenNoUnclassifiedFrameArrivedAtAll() {
+        val text = Whoop5EcgProbe.report(emptyList(), 0, emptyList(), 30)
+        assertTrue(text.contains("no unclassified frame arrived at all"))
     }
 }

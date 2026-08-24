@@ -170,7 +170,7 @@ final class JournalWorkoutAppleCacheTests: XCTestCase {
         let w = WorkoutRow(startTs: 1_000, endTs: 4_600, sport: "run", source: "apple",
                            durationS: 3600, energyKcal: 520.5, avgHr: 148, maxHr: 176,
                            strain: 12.4, distanceM: 8000, zonesJSON: "{\"z1\":10,\"z2\":40}",
-                           notes: "easy")
+                           notes: "easy", steps: nil)
         try await store.upsertWorkouts([w], deviceId: "devA")
 
         var rows = try await store.workouts(deviceId: "devA", from: 0, to: 100_000, limit: 100)
@@ -180,7 +180,7 @@ final class JournalWorkoutAppleCacheTests: XCTestCase {
         // Re-upsert same natural key with updated values → no duplicate, value updated.
         let w2 = WorkoutRow(startTs: 1_000, endTs: 5_000, sport: "run", source: "whoop",
                             durationS: 4000, energyKcal: 600, avgHr: 150, maxHr: 180,
-                            strain: 14.0, distanceM: 9000, zonesJSON: nil, notes: nil)
+                            strain: 14.0, distanceM: 9000, zonesJSON: nil, notes: nil, steps: nil)
         try await store.upsertWorkouts([w2], deviceId: "devA")
         rows = try await store.workouts(deviceId: "devA", from: 0, to: 100_000, limit: 100)
         XCTAssertEqual(rows.count, 1, "same (deviceId,startTs,sport) must not duplicate")
@@ -194,10 +194,10 @@ final class JournalWorkoutAppleCacheTests: XCTestCase {
         try await store.upsertWorkouts([
             WorkoutRow(startTs: 1_000, endTs: 2_000, sport: "run", source: "apple",
                        durationS: nil, energyKcal: nil, avgHr: nil, maxHr: nil, strain: nil,
-                       distanceM: nil, zonesJSON: nil, notes: nil),
+                       distanceM: nil, zonesJSON: nil, notes: nil, steps: nil),
             WorkoutRow(startTs: 1_000, endTs: 2_000, sport: "cycle", source: "apple",
                        durationS: nil, energyKcal: nil, avgHr: nil, maxHr: nil, strain: nil,
-                       distanceM: nil, zonesJSON: nil, notes: nil),
+                       distanceM: nil, zonesJSON: nil, notes: nil, steps: nil),
         ], deviceId: "devA")
         let rows = try await store.workouts(deviceId: "devA", from: 0, to: 100_000, limit: 100)
         XCTAssertEqual(rows.count, 2, "same startTs but different sport are distinct rows")
@@ -272,7 +272,7 @@ final class JournalWorkoutAppleCacheTests: XCTestCase {
         let store = try await WhoopStore.inMemory()
         let w = WorkoutRow(startTs: 50, endTs: 60, sport: "yoga", source: "apple",
                            durationS: nil, energyKcal: nil, avgHr: nil, maxHr: nil, strain: nil,
-                           distanceM: nil, zonesJSON: nil, notes: nil)
+                           distanceM: nil, zonesJSON: nil, notes: nil, steps: nil)
         try await store.upsertWorkouts([w], deviceId: "devA")
         let rows = try await store.workouts(deviceId: "devA", from: 0, to: 100, limit: 10)
         XCTAssertEqual(rows.count, 1)
@@ -287,13 +287,13 @@ final class JournalWorkoutAppleCacheTests: XCTestCase {
         try await store.upsertWorkouts([
             WorkoutRow(startTs: 100, endTs: 200, sport: "run", source: "a", durationS: nil,
                        energyKcal: nil, avgHr: nil, maxHr: nil, strain: nil, distanceM: nil,
-                       zonesJSON: nil, notes: nil),
+                       zonesJSON: nil, notes: nil, steps: nil),
             WorkoutRow(startTs: 500, endTs: 600, sport: "run", source: "a", durationS: nil,
                        energyKcal: nil, avgHr: nil, maxHr: nil, strain: nil, distanceM: nil,
-                       zonesJSON: nil, notes: nil),
+                       zonesJSON: nil, notes: nil, steps: nil),
             WorkoutRow(startTs: 900, endTs: 1000, sport: "run", source: "a", durationS: nil,
                        energyKcal: nil, avgHr: nil, maxHr: nil, strain: nil, distanceM: nil,
-                       zonesJSON: nil, notes: nil),
+                       zonesJSON: nil, notes: nil, steps: nil),
         ], deviceId: "devA")
         let ranged = try await store.workouts(deviceId: "devA", from: 400, to: 1000, limit: 100)
         XCTAssertEqual(ranged.map { $0.startTs }, [500, 900])
@@ -309,7 +309,7 @@ final class JournalWorkoutAppleCacheTests: XCTestCase {
         func row(_ ts: Int, _ sport: String) -> WorkoutRow {
             WorkoutRow(startTs: ts, endTs: ts + 600, sport: sport, source: "devA-noop",
                        durationS: 600, energyKcal: nil, avgHr: nil, maxHr: nil, strain: nil,
-                       distanceM: nil, zonesJSON: nil, notes: nil)
+                       distanceM: nil, zonesJSON: nil, notes: nil, steps: nil)
         }
         try await store.upsertWorkouts([row(1_000, "detected"), row(2_000, "detected"),
                                         row(1_500, "run")], deviceId: "devA-noop")
@@ -322,6 +322,29 @@ final class JournalWorkoutAppleCacheTests: XCTestCase {
         XCTAssertEqual(left.map { $0.startTs }.sorted(), [1_500, 2_000])
         let other = try await store.workouts(deviceId: "devA", from: 0, to: 10_000, limit: 100)
         XCTAssertEqual(other.count, 1, "other device untouched")
+    }
+
+    func testWorkoutExists() async throws {
+        let store = try await WhoopStore.inMemory()
+        let w = WorkoutRow(startTs: 100, endTs: 700, sport: "running", source: "whoop", durationS: 600,
+                           energyKcal: nil, avgHr: nil, maxHr: nil, strain: nil, distanceM: nil,
+                           zonesJSON: nil, notes: nil, steps: nil)
+        try await store.upsertWorkouts([w], deviceId: "devA")
+
+        let exists = try await store.workoutExists(deviceId: "devA", startTs: 100, sport: "running")
+        XCTAssertTrue(exists)
+
+        // A mismatch on any single key column must miss.
+        let wrongSport = try await store.workoutExists(deviceId: "devA", startTs: 100, sport: "cycling")
+        XCTAssertFalse(wrongSport)
+        let wrongStart = try await store.workoutExists(deviceId: "devA", startTs: 200, sport: "running")
+        XCTAssertFalse(wrongStart)
+        let wrongDevice = try await store.workoutExists(deviceId: "devB", startTs: 100, sport: "running")
+        XCTAssertFalse(wrongDevice)
+
+        _ = try await store.deleteWorkouts(deviceId: "devA", sport: "running", from: 100, to: 100)
+        let afterDelete = try await store.workoutExists(deviceId: "devA", startTs: 100, sport: "running")
+        XCTAssertFalse(afterDelete, "a deleted workout must no longer report as existing")
     }
 
     // MARK: - appleDaily

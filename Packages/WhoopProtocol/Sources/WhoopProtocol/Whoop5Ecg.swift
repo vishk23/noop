@@ -23,7 +23,13 @@ import Foundation
 // What is NOT established, and is therefore never asserted:
 //   • The packet TYPE byte these records arrive under. No capture exists, and the repo's `PacketType`
 //     table has no Labrador entry. So this file decodes a PAYLOAD, and the app layer discovers the type
-//     empirically by running `plausibleFilteredPayload` over unclassified frames and logging the hits.
+//     empirically: it runs `filteredBytesPerSampleCandidates` over unclassified frames, and — because a
+//     heuristic that only logs its own hits destroys the evidence for its own misses — CENSUSES every
+//     unclassified frame by type byte whether the triage passed or not (`Whoop5EcgProbe.FrameCensus`).
+//   • The filtered stream's BYTES PER SAMPLE. `decodeFiltered` implements 2, which is what the filtered
+//     layout is documented with; the triage admits 2, 3 and 4, because a populated RAW record read off
+//     hardware turned out to be 3 bytes/sample and a hardcoded 2 in the triage silently discarded every
+//     frame that disagreed. See `filteredWidthCandidates`.
 //   • The `WristSelection` raw values. `right` is listed first in the client's enum, so right=0/left=1 is
 //     the natural reading — but it is an INFERENCE, not an attested fact, and it is labelled as such
 //     everywhere it surfaces (including in the UI, because picking the wrong one writes the wrong
@@ -203,12 +209,32 @@ public struct FilteredLabradorPacket: Equatable, Sendable {
 /// diagnostic arrays. The blob's bytes-per-sample is `rawECGDataRaw.count / numberOfECGSamples` — which
 /// means the blob's LENGTH is not itself on the wire, so a decode needs that width supplied or resolved
 /// (see `rawBytesPerSampleCandidates`).
+///
+/// BOTH variable-length-looking regions are really FIXED-SIZE containers with a count that says how many
+/// leading slots are valid:
+///   • the sample region — see `unusedSampleBytes` and `Whoop5Ecg.decodeRaw(payload:bytesPerSample:)`;
+///   • the leads-off block — `Whoop5Ecg.leadsOffSlotCount` slots for I and the same again for Q, with
+///     `numberOfLeadsOffSamples` selecting how many leading slots are valid.
+/// In both, the unused slots are dropped rather than carried, so a packet's arrays only ever hold values
+/// the record says are real.
 public struct RawLabradorPacket: Equatable, Sendable {
     public let header: EcgStatusHeader
     /// Opaque. The container width and encoding are unattested, so the bytes are carried verbatim.
+    ///
+    /// Exactly `numberOfECGSamples * bytesPerSample` bytes — the VALID part of the sample region, which on
+    /// a partly-filled record is shorter than the region itself.
     public let rawECGDataRaw: [UInt8]
+    /// Bytes of the fixed sample region that `numberOfECGSamples` did not fill. Zero for a full record.
+    ///
+    /// The strap zero-fills them, and the decoder requires that (a non-zero byte past the declared samples
+    /// is how a mis-placed record end is caught). They are counted, not carried, so
+    /// `headerLength + rawECGDataRaw.count + unusedSampleBytes` is where the leads-off block begins.
+    public let unusedSampleBytes: Int
     public let numberOfLeadsOffSamples: UInt8
+    /// The VALID leads-off I values — `numberOfLeadsOffSamples` of them, taken from the front of the
+    /// record's fixed `Whoop5Ecg.leadsOffSlotCount`-slot block. Unused slots are dropped, not carried.
     public let leadsOffIRaw: [UInt16]
+    /// The VALID leads-off Q values, on the same terms as `leadsOffIRaw`.
     public let leadsOffQRaw: [UInt16]
     public let padding: [UInt8]
 
@@ -219,10 +245,15 @@ public struct RawLabradorPacket: Equatable, Sendable {
         return rawECGDataRaw.count / n
     }
 
-    public init(header: EcgStatusHeader, rawECGDataRaw: [UInt8], numberOfLeadsOffSamples: UInt8,
+    /// The full sample region the record reserved, valid part plus unused capacity.
+    public var sampleRegionBytes: Int { rawECGDataRaw.count + unusedSampleBytes }
+
+    public init(header: EcgStatusHeader, rawECGDataRaw: [UInt8], unusedSampleBytes: Int = 0,
+                numberOfLeadsOffSamples: UInt8,
                 leadsOffIRaw: [UInt16], leadsOffQRaw: [UInt16], padding: [UInt8]) {
         self.header = header
         self.rawECGDataRaw = rawECGDataRaw
+        self.unusedSampleBytes = unusedSampleBytes
         self.numberOfLeadsOffSamples = numberOfLeadsOffSamples
         self.leadsOffIRaw = leadsOffIRaw
         self.leadsOffQRaw = leadsOffQRaw
@@ -244,7 +275,26 @@ public enum Whoop5Ecg {
     /// Trailing bytes tolerated after the last decoded field. The puffin inner record is padded to a
     /// 4-byte boundary (`puffinCommandFrame`'s pad4), so a well-formed record leaves at most 3 spare
     /// bytes. Callers scanning an unfamiliar layout can widen it.
+    ///
+    /// On the RAW side this is not just a tolerance but the search bound: `decodeRaw` locates the
+    /// leads-off block by trying each of these end positions, closest to the end of the payload first.
     public static let defaultMaxPadding = 3
+
+    /// Slots in the raw record's leads-off diagnostic block, per array.
+    ///
+    /// MEASURED FROM HARDWARE, not attested: two complete type-47 layout-16 flash records captured
+    /// 2026-08-06 (embedded verbatim in `Whoop5EcgRawHardwareTests`) show the block is FIXED-SIZE — the
+    /// count byte is followed by eleven i16 I slots and then eleven i16 Q slots, present in full whether
+    /// or not `numberOfLeadsOffSamples` fills them, with the unused tail slots zeroed. Both counts seen
+    /// in the capture (10 and 11) place the Q array at the same offset and leave the same single trailing
+    /// byte, which is what identifies the block as fixed rather than packed.
+    ///
+    /// Reading it as PACKED — `count` elements each — was the original assumption, and it is wrong in two
+    /// compounding ways whenever `count < 11`: Q is read two bytes early per missing slot (so it gains a
+    /// spurious leading value and loses its last real one), and the misplaced end-of-record leaves a
+    /// remainder over `defaultMaxPadding`, which discarded 227 of the capture's 351 populated records
+    /// before any field was read.
+    public static let leadsOffSlotCount = 11
 
     // MARK: Commands
     //
@@ -410,14 +460,45 @@ public enum Whoop5Ecg {
 
     // MARK: Raw decode
 
+    /// Bytes the raw record's leads-off block occupies: the count byte, then a full I array, then a full
+    /// Q array. Fixed — see `leadsOffSlotCount`.
+    public static let leadsOffBlockLength = 1 + leadsOffSlotCount * 4
+
     /// Decode a `RawLabradorPacket` from the inner record's PAYLOAD with an explicit sample width.
     ///
     /// `bytesPerSample` has to be supplied because the raw blob's length is NOT on the wire: the client
     /// derives the width by dividing the blob it already holds by `numberOfECGSamples`, which a
     /// byte-stream decoder cannot do until it knows where the blob ends. `rawBytesPerSampleCandidates`
     /// enumerates the widths a given buffer admits.
-    public static func decodeRaw(payload: [UInt8], bytesPerSample: Int) -> RawLabradorPacket? {
-        guard bytesPerSample > 0, let header = EcgStatusHeader(payload: payload) else { return nil }
+    ///
+    /// **The sample region is a fixed-size container, not `n * bytesPerSample` bytes.** MEASURED FROM
+    /// HARDWARE, on the same capture and by the same argument as `leadsOffSlotCount`: the capture's one
+    /// partly-filled record (`numberOfECGSamples == 245`, embedded in `Whoop5EcgRawHardwareTests`) is the
+    /// same 1584-byte frame as every full 500-sample record, its sample data stops after `245 * 3` bytes,
+    /// the rest of the region is zeroed, and its leads-off block sits at the SAME frame offset as every
+    /// other record's. So `numberOfECGSamples` says how many of the region's slots are valid in exactly
+    /// the way `numberOfLeadsOffSamples` says how many leads-off slots are — one field over, one layer up.
+    ///
+    /// That is why the leads-off block is located from the END of the payload rather than from
+    /// `headerLength + n * bytesPerSample`: the region's LENGTH is no more on the wire than the width is,
+    /// and a decoder that assumes the region is exactly full lands the count byte inside the zero fill
+    /// (which is what discarded this record — it read a zero as the count, an empty leads-off block, and
+    /// left 766 bytes of "padding"). No region length is hardcoded here; the block's own fixed size
+    /// anchors it.
+    ///
+    /// The candidate ends are tried closest-to-the-end first, so the record claims the least padding it
+    /// can — the puffin pad4 filler is minimal by construction, and a longer claim would eat real bytes.
+    /// That ordering is a tie-break, not a proof: an all-zero tail can also validate a block placed a
+    /// byte or two earlier (reading a zero as `numberOfLeadsOffSamples` and empty arrays), and the
+    /// tightest placement is the one that explains the most bytes rather than the fewest.
+    /// Two things then have to hold, and either failing moves the search on: the region must be long
+    /// enough for the declared samples, and every byte between them and the block must be ZERO. That
+    /// zero-fill check is what keeps the width enumeration honest — a width that under-reads the samples
+    /// leaves real sample bytes in the unused span and is rejected there.
+    public static func decodeRaw(payload: [UInt8], bytesPerSample: Int,
+                                 maxPadding: Int = defaultMaxPadding) -> RawLabradorPacket? {
+        guard bytesPerSample > 0, maxPadding >= 0,
+              let header = EcgStatusHeader(payload: payload) else { return nil }
         let n = Int(header.numberOfECGSamples)
         // `bytesPerSample` is caller-supplied on a public API, and `numberOfECGSamples` comes off the
         // wire — so BOTH the product and the following add are checked rather than assumed. Either would
@@ -426,32 +507,46 @@ public enum Whoop5Ecg {
         // the multiply alone is not enough.)
         let (blobLength, mulOverflow) = n.multipliedReportingOverflow(by: bytesPerSample)
         guard !mulOverflow else { return nil }
-        let (rawEnd, addOverflow) = headerLength.addingReportingOverflow(blobLength)
-        guard !addOverflow else { return nil }
-        // The leads-off count byte must itself be inside the buffer.
-        guard rawEnd >= headerLength, rawEnd < payload.count else { return nil }
-        let leadsOffCount = Int(payload[rawEnd])
-        let iStart = rawEnd + 1
-        let qStart = iStart + leadsOffCount * 2
-        let qEnd = qStart + leadsOffCount * 2
-        guard qEnd <= payload.count else { return nil }
+        let (sampleEnd, addOverflow) = headerLength.addingReportingOverflow(blobLength)
+        guard !addOverflow, sampleEnd >= headerLength, sampleEnd <= payload.count else { return nil }
 
-        var leadsOffI = [UInt16]()
-        var leadsOffQ = [UInt16]()
-        leadsOffI.reserveCapacity(leadsOffCount)
-        leadsOffQ.reserveCapacity(leadsOffCount)
-        for i in 0..<leadsOffCount {
-            let io = iStart + i * 2
-            let qo = qStart + i * 2
-            leadsOffI.append(UInt16(payload[io]) | (UInt16(payload[io + 1]) << 8))
-            leadsOffQ.append(UInt16(payload[qo]) | (UInt16(payload[qo + 1]) << 8))
+        for pad in 0...maxPadding {
+            let blockEnd = payload.count - pad
+            let countIndex = blockEnd - leadsOffBlockLength
+            // The block must sit entirely after the declared samples. This also bounds `countIndex` from
+            // below, since `sampleEnd >= headerLength >= 0`.
+            guard countIndex >= sampleEnd else { continue }
+            // Unused sample capacity is zero-filled on the wire. A non-zero byte here means the block is
+            // not at this offset — including the case where it holds the samples a wider width would read.
+            guard payload[sampleEnd..<countIndex].allSatisfy({ $0 == 0 }) else { continue }
+            let leadsOffCount = Int(payload[countIndex])
+            // The block holds `leadsOffSlotCount` slots per array; a count that overruns it is not a
+            // record this layout can describe, so it fails closed rather than reading past the block.
+            guard leadsOffCount <= leadsOffSlotCount else { continue }
+            // Both arrays are FIXED-SIZE and always fully present — see `leadsOffSlotCount`. The count
+            // byte selects how many leading slots are VALID; it does not size the block.
+            let iStart = countIndex + 1
+            let qStart = iStart + leadsOffSlotCount * 2
+
+            var leadsOffI = [UInt16]()
+            var leadsOffQ = [UInt16]()
+            leadsOffI.reserveCapacity(leadsOffCount)
+            leadsOffQ.reserveCapacity(leadsOffCount)
+            for i in 0..<leadsOffCount {
+                let io = iStart + i * 2
+                let qo = qStart + i * 2
+                leadsOffI.append(UInt16(payload[io]) | (UInt16(payload[io + 1]) << 8))
+                leadsOffQ.append(UInt16(payload[qo]) | (UInt16(payload[qo + 1]) << 8))
+            }
+            return RawLabradorPacket(header: header,
+                                     rawECGDataRaw: Array(payload[headerLength..<sampleEnd]),
+                                     unusedSampleBytes: countIndex - sampleEnd,
+                                     numberOfLeadsOffSamples: payload[countIndex],
+                                     leadsOffIRaw: leadsOffI,
+                                     leadsOffQRaw: leadsOffQ,
+                                     padding: Array(payload[blockEnd...]))
         }
-        return RawLabradorPacket(header: header,
-                                 rawECGDataRaw: Array(payload[headerLength..<rawEnd]),
-                                 numberOfLeadsOffSamples: payload[rawEnd],
-                                 leadsOffIRaw: leadsOffI,
-                                 leadsOffQRaw: leadsOffQ,
-                                 padding: Array(payload[qEnd...]))
+        return nil
     }
 
     /// Every sample width in `widths` that yields a structurally consistent raw record leaving at most
@@ -460,13 +555,16 @@ public enum Whoop5Ecg {
     /// This is a DISAMBIGUATION helper, not a claim: when it returns more than one width the buffer
     /// genuinely does not determine the answer, and the honest move is to keep the bytes and wait for a
     /// capture rather than pick the prettiest candidate.
+    ///
+    /// A PARTLY-FILLED record is one of those buffers, and that is a fact about the record rather than a
+    /// gap in this helper: 245 samples inside a 1500-byte region is equally consistent with 3 bytes per
+    /// sample and with 4, so the capture's short record reports `[3, 4]` and `decodeRaw(payload:)` below
+    /// declines it. The width is a property of the STREAM, not of one record — the 350 full records in the
+    /// same capture resolve to `[3]` on their own, and every record then decodes at that explicit width.
     public static func rawBytesPerSampleCandidates(payload: [UInt8],
                                                    widths: [Int] = [1, 2, 3, 4],
                                                    maxPadding: Int = defaultMaxPadding) -> [Int] {
-        widths.filter { width in
-            guard let packet = decodeRaw(payload: payload, bytesPerSample: width) else { return false }
-            return packet.padding.count <= maxPadding
-        }
+        widths.filter { decodeRaw(payload: payload, bytesPerSample: $0, maxPadding: maxPadding) != nil }
     }
 
     /// Decode a raw record only when the buffer admits exactly ONE sample width. Ambiguous or
@@ -476,17 +574,74 @@ public enum Whoop5Ecg {
                                  maxPadding: Int = defaultMaxPadding) -> RawLabradorPacket? {
         let candidates = rawBytesPerSampleCandidates(payload: payload, widths: widths, maxPadding: maxPadding)
         guard candidates.count == 1 else { return nil }
-        return decodeRaw(payload: payload, bytesPerSample: candidates[0])
+        return decodeRaw(payload: payload, bytesPerSample: candidates[0], maxPadding: maxPadding)
     }
 
     /// CRC-gated raw decode straight off a complete 5/MG frame, with an explicit sample width.
     public static func decodeRawFrame(_ frame: [UInt8], bytesPerSample: Int,
-                                      payloadStart: Int = puffinPayloadStart) -> RawLabradorPacket? {
+                                      payloadStart: Int = puffinPayloadStart,
+                                      maxPadding: Int = defaultMaxPadding) -> RawLabradorPacket? {
         guard let payload = innerPayload(frame, payloadStart: payloadStart) else { return nil }
-        return decodeRaw(payload: payload, bytesPerSample: bytesPerSample)
+        return decodeRaw(payload: payload, bytesPerSample: bytesPerSample, maxPadding: maxPadding)
     }
 
     // MARK: Discovery
+
+    /// The bytes-per-sample widths the FILTERED triage admits, in the order it reports them.
+    ///
+    /// 2 leads because it is the width `decodeFiltered` implements and the width the filtered stream is
+    /// documented with, so the triage's existing behaviour is a strict subset of the widened one.
+    ///
+    /// 3 and 4 are here because the 2-byte assumption was, on this repo's own evidence, unsafe. A
+    /// populated RAW flash record read off real hardware carried `numberOfECGSamples = 500` against a
+    /// 1500-byte sample blob — **3 bytes per sample**. Nothing attests that the FILTERED stream uses the
+    /// same width, and nothing rules it out either; what a hardcoded 2 does is make the difference
+    /// unobservable, because a 3-byte frame fails the length agreement and is discarded before anyone can
+    /// look at it. `rawBytesPerSampleCandidates` has enumerated widths on the raw side from the start;
+    /// this is the filtered side getting the same treatment.
+    ///
+    /// Widening the WIDTH is the only loosening: the four Bool-typed bytes, the two classifier enums, the
+    /// signal-quality range and `n > 0` are all unchanged, so a buffer that failed those still fails.
+    public static let filteredWidthCandidates = [2, 3, 4]
+
+    /// Every width in `widths` under which `payload` could be a filtered Labrador payload — i.e. the
+    /// widths whose length agreement holds, once the buffer has passed the field guards.
+    ///
+    /// Empty means "not a filtered payload under any admitted width", and is the triage's rejection. More
+    /// than one width means the buffer genuinely does not determine the answer; like
+    /// `rawBytesPerSampleCandidates` this REPORTS the ambiguity rather than picking a favourite.
+    public static func filteredBytesPerSampleCandidates(_ payload: [UInt8],
+                                                        widths: [Int] = filteredWidthCandidates,
+                                                        maxPadding: Int = defaultMaxPadding) -> [Int] {
+        guard let header = EcgStatusHeader(payload: payload) else { return [] }
+        guard header.signalQualityRaw <= 3,
+              header.heartKeyArrhythmiaCheckResult != nil,
+              header.heartKeyArrhythmiaCheckStatus != nil else { return [] }
+        // The four booleans are Bool-typed on the wire, so anything but 0/1 rules the buffer out.
+        guard payload[2] <= 1, payload[3] <= 1, payload[4] <= 1, payload[5] <= 1 else { return [] }
+        let n = Int(header.numberOfECGSamples)
+        guard n > 0 else { return [] }
+        return widths.filter { width in
+            // `widths` is caller-supplied and `n` comes off the wire, so both the multiply and the add are
+            // checked — the same discipline `decodeRaw` uses, for the same reason: either would trap in
+            // Swift and wrap NEGATIVE in the Kotlin twin.
+            guard width > 0 else { return false }
+            let (blobLength, mulOverflow) = n.multipliedReportingOverflow(by: width)
+            guard !mulOverflow else { return false }
+            let (end, addOverflow) = headerLength.addingReportingOverflow(blobLength)
+            guard !addOverflow else { return false }
+            return end <= payload.count && payload.count - end <= maxPadding
+        }
+    }
+
+    /// The frame-level form of `filteredBytesPerSampleCandidates`, CRC-gated.
+    public static func filteredBytesPerSampleCandidates(frame: [UInt8],
+                                                        payloadStart: Int = puffinPayloadStart,
+                                                        widths: [Int] = filteredWidthCandidates,
+                                                        maxPadding: Int = defaultMaxPadding) -> [Int] {
+        guard let payload = innerPayload(frame, payloadStart: payloadStart) else { return [] }
+        return filteredBytesPerSampleCandidates(payload, widths: widths, maxPadding: maxPadding)
+    }
 
     /// A cheap structural triage for "could these bytes be a filtered Labrador payload?".
     ///
@@ -494,18 +649,12 @@ public enum Whoop5Ecg {
     /// is armed, every unclassified 5/MG frame is run through this and the hits are logged with their
     /// type. It is a HEURISTIC — four booleans, three enum ranges and a length agreement — not a
     /// classifier, and nothing downstream may treat a hit as proof.
+    ///
+    /// A pass under ANY width in `filteredWidthCandidates` is a pass; callers that need to know WHICH
+    /// width agreed call `filteredBytesPerSampleCandidates` instead of re-deriving it.
     public static func plausibleFilteredPayload(_ payload: [UInt8],
                                                 maxPadding: Int = defaultMaxPadding) -> Bool {
-        guard let header = EcgStatusHeader(payload: payload) else { return false }
-        guard header.signalQualityRaw <= 3,
-              header.heartKeyArrhythmiaCheckResult != nil,
-              header.heartKeyArrhythmiaCheckStatus != nil else { return false }
-        // The four booleans are Bool-typed on the wire, so anything but 0/1 rules the buffer out.
-        guard payload[2] <= 1, payload[3] <= 1, payload[4] <= 1, payload[5] <= 1 else { return false }
-        let n = Int(header.numberOfECGSamples)
-        guard n > 0 else { return false }
-        let end = headerLength + n * 2
-        return end <= payload.count && payload.count - end <= maxPadding
+        !filteredBytesPerSampleCandidates(payload, maxPadding: maxPadding).isEmpty
     }
 
     /// The frame-level form of `plausibleFilteredPayload`, CRC-gated. This is what the app layer runs

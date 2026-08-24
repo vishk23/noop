@@ -53,16 +53,38 @@ public enum SleepStagerV2 {
         // farthest reach of any per-epoch window (the 11-min HR-flatness window: 330 s back, 390 s forward —
         // see `padLo`/`padHi` below). On the first post-sync pass (~21 nights cold) and the full-history Effort
         // rescore (up to 4000 nights cold) those out-of-window rows are what blow the per-second dictionaries
-        // and the sort allocations up to OOM. The streams arrive sorted by ts, so we lower/upper-bound slice
-        // each to the read window BEFORE fingerprinting and BEFORE the uncached recipe. This is output-identical
-        // (we drop only rows `features()` could never touch) and it also tightens the fingerprint to the rows
-        // that matter. PAD_LO/PAD_HI are the SAME values the Android twin (R1) clips with.
-        let gravW = clipToWindow(grav, lo: start - Self.padLo, hi: end + Self.padHi, ts: { $0.ts })
-        let hrW = clipToWindow(hr, lo: start - Self.padLo, hi: end + Self.padHi, ts: { $0.ts })
-        let rrW = clipToWindow(rr, lo: start - Self.padLo, hi: end + Self.padHi, ts: { $0.ts })
+        // and the sort allocations up to OOM. Establish timestamp order defensively, then lower/upper-bound
+        // slice each stream to the read window BEFORE fingerprinting and BEFORE the uncached recipe. This is
+        // output-identical for sorted callers (and stable for same-second rows), drops only rows `features()`
+        // could never touch, and tightens the fingerprint to the rows that matter. PAD_LO/PAD_HI are the SAME
+        // values the Android twin (R1) clips with.
+        let stableOrder: (Int, (Int) -> Int) -> [Int]? = { count, tsAt in
+            if count < 2 { return nil }
+            var hasInversion = false
+            for i in 1..<count where tsAt(i - 1) > tsAt(i) {
+                hasInversion = true
+                break
+            }
+            if !hasInversion { return nil }
+            return (0..<count).sorted { lhs, rhs in
+                let lts = tsAt(lhs), rts = tsAt(rhs)
+                return lts == rts ? lhs < rhs : lts < rts
+            }
+        }
+        let gravO = stableOrder(grav.count, { grav[$0].ts }).map { $0.map { grav[$0] } } ?? grav
+        let hrO = stableOrder(hr.count, { hr[$0].ts }).map { $0.map { hr[$0] } } ?? hr
+        let rrO = stableOrder(rr.count, { rr[$0].ts }).map { $0.map { rr[$0] } } ?? rr
+        let gravW = clipToWindow(gravO,
+                                 lo: start - Self.padLo, hi: end + Self.padHi, ts: { $0.ts })
+        let hrW = clipToWindow(hrO,
+                               lo: start - Self.padLo, hi: end + Self.padHi, ts: { $0.ts })
+        let rrW = clipToWindow(rrO,
+                               lo: start - Self.padLo, hi: end + Self.padHi, ts: { $0.ts })
         let key = V2Key(
             start: start, end: end,
-            grav: StreamFingerprint.of(gravW, ts: { $0.ts }, quant: { Int(($0.x + $0.y + $0.z) * 1024) }),
+            grav: StreamFingerprint.of(gravW, ts: { $0.ts }, quant: {
+                StreamFingerprint.gravityQuant(x: $0.x, y: $0.y, z: $0.z)
+            }),
             hr: StreamFingerprint.of(hrW, ts: { $0.ts }, quant: { Int($0.bpm) }),
             rr: StreamFingerprint.of(rrW, ts: { $0.ts }, quant: { Int($0.rrMs) }))
         return stageCache.value(key) {
@@ -109,13 +131,8 @@ public enum SleepStagerV2 {
     /// in front of it; behaviour is byte-identical (a cache miss runs exactly this).
     private static func stageSessionUncached(start: Int, end: Int, grav: [GravitySample],
                                              hr: [HRSample], rr: [RRInterval], resp: [RespSample]) -> [StageSegment] {
-        // Sort defensively so the windowed features behave regardless of caller ordering (V1's stageSession
-        // assumes its callers pass roughly-sorted streams; we make no such assumption here).
-        let gravS = grav.sorted { $0.ts < $1.ts }
-        let hrS = hr.sorted { $0.ts < $1.ts }
-        let rrS = rr.sortedByTsStable()   // stable: keeps #823 emission order within a second
-
-        let feats = features(start: start, end: end, grav: gravS, hr: hrS, rr: rrS)
+        // The public veneer has already established stable timestamp order before clipping.
+        let feats = features(start: start, end: end, grav: grav, hr: hr, rr: rr)
         if feats.isEmpty { return [StageSegment(start: start, end: end, stage: "light")] }
         let labels = stageEpochs(feats)
 
@@ -193,11 +210,11 @@ public enum SleepStagerV2 {
     /// Measured on one wearer's 36 recorded nights, against the strap's own band `sleep_state` (an
     /// independent reference the recipe cannot contaminate — 21 nights, 15 554 epochs): sleep/wake kappa
     /// 0.105 → 0.118 and wake sensitivity 16.0 % → 17.6 %, with the healthy-stratum wake fraction essentially
-    /// unmoved (9.43 % → 9.96 %, i.e. no repeat of the #437 blow-out). Confirmed afterwards against
-    /// human-scored PSG hypnograms (PhysioNet sleep-accel, 31 subjects / 26 773 epochs, #991): 4-class kappa
-    /// 0.356 → 0.363, REM F1 0.569 → 0.575, wake sensitivity 30.42 % → 30.84 %, and the #437 stage-fraction
-    /// guard holds against truth as well. n = 1 wearer for the band figures; see `Tools/SleepBench` and the
-    /// PR for the full ablation and its limits.
+    /// unmoved (9.43 % → 9.96 %, i.e. no repeat of the #437 blow-out) and first-REM latency MAE 53.9 → 41.6
+    /// min. Confirmed afterwards against human-scored PSG hypnograms (PhysioNet sleep-accel, 31 subjects /
+    /// 26 773 epochs, #991): 4-class kappa 0.356 → 0.363, REM F1 0.569 → 0.575, wake sensitivity 30.42 % →
+    /// 30.84 %, and the #437 stage-fraction guard holds against truth as well. n = 1 wearer for the band
+    /// figures; see `Tools/SleepBench` and the PR for the full ablation and its limits.
     static let transition: [String: [String: Double]] = [
         "deep":  ["deep": 0.86, "rem": 0.007, "light": 0.126, "awake": 0.007],
         "rem":   ["deep": 0.005, "rem": 0.88, "light": 0.10, "awake": 0.015],

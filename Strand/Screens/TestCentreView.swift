@@ -2,6 +2,7 @@ import SwiftUI
 import StrandDesign
 import StrandAnalytics
 import StrandImport
+import PolarProtocol
 import WhoopStore
 
 /// Settings -> Test Centre. The single home for every diagnostic, log and test control (spec section 7).
@@ -38,11 +39,33 @@ struct TestCentreView: View {
     /// The strap model the user last picked, the same key SettingsView's showFiveMGControls gate reads.
     @AppStorage("selectedWhoopModel") private var selectedWhoopModelRaw = WhoopModel.whoop4.rawValue
 
+    // #polar-debug: the Polar strap-identity diagnostic toggle. Only rendered when a Polar strap is paired.
+    @AppStorage(AppModel.polarDebugLoggingKey) private var polarDebugLogging = false
+
+    /// The model NOOP auto-detects for a PAIRED Polar strap, from its stored advertised name (no live
+    /// connection needed) — e.g. "Polar H10 identified — PMD ecg,acc; HRV via standard R-R". `nil` when no
+    /// Polar strap is paired, which hides the whole toggle so a non-Polar user never sees Polar debug.
+    private var polarIdentity: String? {
+        let name = model.deviceRegistry?.devices.first { PolarModel.isPolar(advertisedName: $0.model) }?.model
+        return PolarModel.debugIdentification(advertisedName: name)
+    }
+
+    // #1284 residual 3: experimental Oura 0x49-onset keying, only offered when an Oura ring is paired.
+    @AppStorage(AppModel.ouraOnsetKeyingKey) private var ouraOnsetKeying = false
+    private var ouraPaired: Bool { model.deviceRegistry?.devices.contains { $0.brand == "Oura" } ?? false }
+
     // Section 4: Experimental algorithms. Bound to the SAME PuffinExperiment keys the Android card writes, so
     // the platforms stay in lockstep. The PPG-HR sub-lag interpolation variant and the HRV-readiness readout,
     // both default OFF.
     @AppStorage(PuffinExperiment.ppgHrSubLagInterpKey) private var ppgHrSubLagInterpEnabled = false
     @AppStorage(PuffinExperiment.hrvReadinessKey) private var hrvReadinessEnabled = false
+
+    #if CLOUD_SYNC
+    // Section 5: the page-replication trial. Bound to the SAME UserDefaults key SyncReplicationTrial
+    // reads at launch, so this toggle IS the switch rather than a mirror of it. Default false, which is
+    // what a missing key reads as, so a fresh install and an explicit "off" are the same state.
+    @AppStorage(SyncReplicationTrial.enabledKey) private var replicationTrialEnabled = false
+    #endif
 
     /// True when the connected strap is a 5/MG, so the 5/MG experimental block shows. Mirrors the
     /// SettingsView gate (#22): a confident 4.0 owner never sees controls that cannot touch their strap.
@@ -63,6 +86,9 @@ struct TestCentreView: View {
                 diagnosticToolsCard.staggeredAppear(index: 1)
                 exportCard.staggeredAppear(index: 2)
                 experimentalAlgorithmsCard.staggeredAppear(index: 3)
+                #if CLOUD_SYNC
+                replicationTrialCard.staggeredAppear(index: 4)
+                #endif
             }
         }
         .id(refreshToken)
@@ -160,6 +186,35 @@ struct TestCentreView: View {
                 // surfaced as a copyable readout (spec section 3.4).
                 NoopButton("Copy environment dump", systemImage: "info.circle", kind: .secondary) {
                     PlatformPasteboard.copy(live.exportableLogText())
+                }
+
+                // #polar-debug: only when a Polar strap is paired. The caption is the model auto-detected
+                // from the paired record; the toggle also writes it to the strap log on each connect.
+                if let identity = polarIdentity {
+                    Divider().overlay(StrandPalette.hairline)
+                    Toggle(isOn: $polarDebugLogging) {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("Polar debug logging").font(StrandFont.body)
+                            Text("\(identity). Logs this to the strap log on each connect, so a Polar bug report shows the model NOOP resolved your strap to.")
+                                .font(StrandFont.caption).foregroundStyle(StrandPalette.textTertiary)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
+                    }
+                    .tint(StrandPalette.accent)
+                }
+
+                // #1284 residual 3: experimental Oura onset keying, only when an Oura ring is paired.
+                if ouraPaired {
+                    Divider().overlay(StrandPalette.hairline)
+                    Toggle(isOn: $ouraOnsetKeying) {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("Oura onset keying (experimental)").font(StrandFont.body)
+                            Text("Keys each Oura sleep night on its stable 0x49 onset and suppresses duplicate re-serves at the source, instead of the shipped end-anchored persist (#1284). Off by default — a hardware-validation toggle. Watch the strap log for \u{201C}onset-key(#1284)\u{201D} lines.")
+                                .font(StrandFont.caption).foregroundStyle(StrandPalette.textTertiary)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
+                    }
+                    .tint(StrandPalette.accent)
                 }
             }
         }
@@ -345,6 +400,60 @@ struct TestCentreView: View {
         }
     }
 
+    // MARK: - Section 5: Page-replication trial (CLOUD_SYNC only, opt-in, off by default)
+
+    #if CLOUD_SYNC
+    /// The one UI for `SyncReplicationTrial`. Until this existed the switch was a bare `UserDefaults`
+    /// key with no way to flip it short of attaching a debugger, which meant the measurement it exists
+    /// to produce could not be started on the device that has the data.
+    ///
+    /// Three things are shown, deliberately, because they are three different facts:
+    ///
+    /// - the **intent** (this toggle, i.e. the persisted flag);
+    /// - the **reality** (`SyncReplicationTrial.statusLine`, which reports what the store actually
+    ///   opened with) — these differ for the whole of the launch you flip the toggle in, because
+    ///   `wal_autocheckpoint` is applied at pool-open time and cannot be changed on a live pool; and
+    /// - the **result so far** (the telemetry aggregate, carried inside `statusLine`).
+    ///
+    /// Reading only the first would let a user conclude the trial is running when it is not.
+    @ViewBuilder private var replicationTrialCard: some View {
+        NoopCard {
+            VStack(alignment: .leading, spacing: NoopMetrics.space3) {
+                Text("PAGE REPLICATION TRIAL")
+                    .font(StrandFont.overline).tracking(StrandFont.overlineTracking)
+                    .foregroundStyle(StrandPalette.textSecondary)
+                Text("Measures whether shipping only the changed pages of your database could replace the whole-database Cloud Sync upload. Opt-in, off by default.")
+                    .font(StrandFont.caption).foregroundStyle(StrandPalette.textTertiary)
+                    .fixedSize(horizontal: false, vertical: true)
+
+                Toggle(isOn: $replicationTrialEnabled) {
+                    Text("Hand WAL checkpointing to the replicator")
+                        .font(StrandFont.subhead).foregroundStyle(StrandPalette.textPrimary)
+                }
+                .toggleStyle(.switch).tint(StrandPalette.accent)
+                .accessibilityLabel("Page replication trial")
+
+                Text("When on, NOOP stops letting SQLite checkpoint the write-ahead log on its own and records one measurement per Cloud Sync upload. It does NOT change what gets uploaded: today's full-database upload is untouched, so the worst case is a larger write-ahead log between syncs. Takes effect the next time NOOP starts.")
+                    .font(StrandFont.caption).foregroundStyle(StrandPalette.textTertiary)
+                    .fixedSize(horizontal: false, vertical: true)
+
+                Divider().overlay(StrandPalette.hairline)
+
+                // The state actually in force, which is NOT the toggle above until the next launch.
+                Text(SyncReplicationTrial.statusLine)
+                    .font(StrandFont.caption).foregroundStyle(StrandPalette.textSecondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .textSelection(.enabled)
+
+                if replicationTrialEnabled, !SyncReplicationTrial.isInForce {
+                    Text("Restart NOOP to start measuring.")
+                        .font(StrandFont.caption).foregroundStyle(StrandPalette.statusWarning)
+                }
+            }
+        }
+    }
+    #endif
+
     // MARK: - Shared actions (same calls as the SettingsView controls these re-host)
 
     /// Re-anchor every baseline that feeds Charge from now, via the single cross-platform source of
@@ -390,20 +499,22 @@ struct TestCentreView: View {
     }
 
     private func runScheduledExportNow() {
-        model.ble.flushPuffinCaptures()
-        let url = ScheduledDebugExport.runNow(captureURL: live.puffinCaptureURL)
-        if let url {
-            infoTitle = String(localized: "Strap log exported")
-            #if os(iOS)
-            infoMessage = String(localized: "Saved \(url.lastPathComponent) to NOOP's folder in the Files app.")
-            #else
-            infoMessage = String(localized: "Saved \(url.lastPathComponent) to your Documents folder.")
-            #endif
-        } else {
-            infoTitle = String(localized: "Export failed")
-            infoMessage = String(localized: "Couldn't write the strap log right now.")
+        Task { @MainActor in
+            await model.ble.flushPuffinCaptures()
+            let url = ScheduledDebugExport.runNow(captureURL: live.puffinCaptureURL)
+            if let url {
+                infoTitle = String(localized: "Strap log exported")
+                #if os(iOS)
+                infoMessage = String(localized: "Saved \(url.lastPathComponent) to NOOP's folder in the Files app.")
+                #else
+                infoMessage = String(localized: "Saved \(url.lastPathComponent) to your Documents folder.")
+                #endif
+            } else {
+                infoTitle = String(localized: "Export failed")
+                infoMessage = String(localized: "Couldn't write the strap log right now.")
+            }
+            showInfo = true
         }
-        showInfo = true
     }
 }
 
@@ -774,6 +885,9 @@ private struct ReportReviewSheet: View {
                             .frame(maxWidth: .infinity, alignment: .leading)
                             .textSelection(.enabled)
                     }
+                    #if os(iOS)
+                    .scrollBounceBehavior(.basedOnSize, axes: .horizontal)
+                    #endif
                     .frame(maxHeight: 360)
                 }
                 HStack(spacing: NoopMetrics.space3) {

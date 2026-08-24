@@ -318,6 +318,9 @@ data class DailyMetric(
     // (imports/cloud never carry them), so old rows + non-4.0 nights stay null.
     val spo2Red: Int? = null,           // mean raw red PPG ADC during detected sleep
     val spo2Ir: Int? = null,            // mean raw IR PPG ADC during detected sleep
+    // Five-minute SDNN index (ms), separate from avgHrv (RMSSD). Strap rows compute it from in-bed R-R;
+    // Apple Health rows mirror the source SDNN. Health Connect RMSSD does not populate this column.
+    val avgSdnn: Double? = null,
 )
 
 /**
@@ -414,8 +417,8 @@ data class MetricSeriesRow(
 )
 
 /**
- * Provider provenance for one NOOP-computed score. Separate from `dayOwnership`: ownership controls
- * raw-input resolution, while this records the source actually used for a persisted metric.
+ * Provenance for one NOOP-computed score. [sourceId] normally records the provider actually used, while
+ * `vo2max_est` records its estimator id. Separate from `dayOwnership`, which controls input resolution.
  */
 @Entity(
     tableName = "scoreInputProvenance",
@@ -428,6 +431,22 @@ data class ScoreInputProvenanceRow(
     @ColumnInfo(name = "key") val key: String,
     val sourceId: String,
 )
+
+/** Estimator identity persisted beside a `vo2max_est` point in [ScoreInputProvenanceRow.sourceId].
+ *  Existing points have no such row and therefore remain explicitly unknown; never infer their method
+ *  from the user's current profile because a waist measurement may have changed since they were scored. */
+enum class Vo2MaxEstimator(val provenanceId: String) {
+    NES("nes"),
+    UTH("uth");
+
+    companion object {
+        fun fromProvenanceId(value: String?): Vo2MaxEstimator? = entries.firstOrNull {
+            it.provenanceId == value
+        }
+
+        fun forWaistCm(waistCm: Double): Vo2MaxEstimator = if (waistCm > 0.0) NES else UTH
+    }
+}
 
 /**
  * Lab Book marker reading (Health Records pillar). Swift `labMarker` (Database.swift v17 /
@@ -576,6 +595,28 @@ data class AppleDaily(
 )
 
 /**
+ * Cached hourly Apple-Health step count (v38 / MIGRATION_30_31). Swift `appleStepHour` (WhoopStore
+ * Database.swift `v38-apple-step-hour` migration). `ts` is the hour-BUCKET START (wall-clock unix
+ * seconds, local-hour aligned by the HealthKit collection query); `steps` is the cumulative step sum
+ * within that hour. Natural key (deviceId, ts) mirrors every other per-sample table so the hourly
+ * upsert is idempotent. [AppleDaily.steps] answers "how many steps that day"; this table answers
+ * "which HOURS were recorded", so a dead/absent phone for part of a day is visible instead of a single
+ * flattened daily total.
+ *
+ * Fields are declared in the SAME order as the Swift GRDB schema (deviceId, ts, steps) so the
+ * migration's CREATE TABLE column order matches Room's generated shape. SCHEMA-ONLY twin: the
+ * Apple-Health IMPORT that populates it is iOS-only (HealthKit has no Android analogue), so Android
+ * carries the table for `.noopbak` byte-parity but no importer writes to it — exactly as it already
+ * does for [AppleDaily].
+ */
+@Entity(tableName = "appleStepHour", primaryKeys = ["deviceId", "ts"])
+data class AppleStepHour(
+    val deviceId: String,
+    val ts: Long,
+    val steps: Int,
+)
+
+/**
  * The RAW WHOOP 5.0 v26 optical PPG waveform, one record per second (v27 / MIGRATION_18_19, issue #156
  * follow-up). Swift `ppgWaveformSample` (WhoopStore Database.swift `v27-ppg-waveform` migration). The
  * strap's 24 Hz buffer was fully decoded but only ever used to derive [PpgHrSample]; the samples
@@ -587,26 +628,29 @@ data class AppleDaily(
  * keeping a v26-heavy night to roughly the same order of magnitude as ONE extra per-second stream. The
  * BLOB format is byte-identical to the Swift GRDB `WhoopStore.packPpgSamples` so a `.noopbak` round-trips.
  * PK (deviceId, ts) mirrors every other per-second stream; a truncated frame can decode fewer than 24
- * samples. Fields are declared in the SAME order as the GRDB schema (deviceId, ts, samples) so the
- * migration's CREATE TABLE column order matches Room's generated shape.
+ * samples. Fields are declared in the SAME order as the GRDB schema
+ * (deviceId, ts, samples, burstIndex) so Room's generated shape stays byte-identical.
  */
 @Entity(tableName = "ppgWaveformSample", primaryKeys = ["deviceId", "ts"])
 data class PpgWaveformSampleEntity(
     val deviceId: String,
     val ts: Long,
     val samples: ByteArray,
+    val burstIndex: Int? = null,
 ) {
     // ByteArray needs structural equals/hashCode (the generated identity ones break round-trip asserts).
     override fun equals(other: Any?): Boolean {
         if (this === other) return true
         if (other !is PpgWaveformSampleEntity) return false
-        return deviceId == other.deviceId && ts == other.ts && samples.contentEquals(other.samples)
+        return deviceId == other.deviceId && ts == other.ts && samples.contentEquals(other.samples) &&
+            burstIndex == other.burstIndex
     }
 
     override fun hashCode(): Int {
         var result = deviceId.hashCode()
         result = 31 * result + ts.hashCode()
         result = 31 * result + samples.contentHashCode()
+        result = 31 * result + (burstIndex ?: 0)
         return result
     }
 }
@@ -619,6 +663,12 @@ data class PpgWaveformSampleEntity(
  * Instrument-first + bounded: written only when raw capture is enabled, and pruned to a rolling recent
  * window ([WhoopRepository.RAW_IMU_RETENTION_ROWS]). Twin of the GRDB `rawImuSample` table. Natural key
  * (deviceId, ts) = one row per strap-second.
+ *
+ * CONSUMER STATUS (#978): deliberately none yet — instrument-first, the same stance as `v18AuxSample`. The
+ * writer runs only with raw capture enabled + a 5/MG deep-data unlock; nothing scores, gates or shows a row.
+ * The [WhoopRepository.rawImuSamples] / [WhoopDao.rawImuSamples] reader is intentionally dormant (zero
+ * callers) — the eventual cross-check seam, NOT dead code, so do not delete it. The GRDB twin has no reader
+ * yet by the same rule: one lands WITH a validated consumer, not before.
  */
 @Entity(tableName = "rawImuSample", primaryKeys = ["deviceId", "ts"])
 data class RawImuSampleEntity(
@@ -723,3 +773,42 @@ data class V18AuxSampleEntity(
         return result
     }
 }
+
+/**
+ * One in-band `@82` SpO2 percentage from a WHOOP 5/MG v18 record, banked DURABLY
+ * (MIGRATION_33_34 / Swift GRDB `v34-spo2-pct-durable`).
+ *
+ * WHY THIS EXISTS AS ITS OWN TABLE. The byte is already carried raw inside [V18AuxSampleEntity.fields]
+ * (slot [V18AuxSlot.AUX_BYTE_82]), but `v18AuxSample` is CAPPED at
+ * [WhoopRepository.V18_AUX_RETENTION_ROWS] (604,800 rows/device, ~7 days at 1 Hz) because the aux blob
+ * costs ~30 MB/day. So every SpO2 reading rolled off after a week and was gone permanently: the strap
+ * trims its own history the moment an offload is acked, so no second copy exists anywhere. Raising the
+ * aux cap is the wrong fix — it buys a year of SpO2 at the price of ~11 GB of unrelated aux bytes. The
+ * in-band signal is only ~2,000 samples/week (~100k rows/year), so this narrow sibling retains it forever
+ * at trivial cost while the wide aux capture stays capped and unchanged.
+ *
+ * WHY NOT EXTEND [Spo2Sample] (the v3 table). Wrong shape, and extending it would corrupt a live reader:
+ * `spo2Sample` is `(deviceId, ts, red, ir)`, two NOT NULL raw ADC channels off the WHOOP 4.0 v24 layout,
+ * and [com.noop.analytics.AnalyticsEngine.nightlySpo2RawMeans] averages them into `spo2Red`/`spo2Ir`.
+ * We have a computed PERCENTAGE and no red/IR at all, so every insert would have to fabricate zeros and
+ * drag those means toward zero. Two different physical quantities from two device generations.
+ *
+ * [pct] is the RAW in-band byte ([SPO2_CANDIDATE_IN_BAND], 70..100), stored verbatim. Run grouping and
+ * acquisition-ramp trimming are READ-TIME policies (see
+ * [com.noop.analytics.AnalyticsEngine.nightlySpo2Pct]) — they have already changed once on the cloud
+ * reader, and a store that baked the old policy in would have destroyed the evidence needed to change
+ * them again. The only thing applied on the way in is the [SPO2_CANDIDATE_IN_BAND] demultiplex, which is
+ * not a policy but the definition of which values on `@82` are percentages at all.
+ *
+ * NOT PRUNED, by design — the same "durable decoded biometric history" class as `hrSample` and
+ * `ppgWaveformSample`. The `v18AuxSample` rolling sweep deletes only `FROM v18AuxSample`, so this table
+ * is untouched by it. PK (deviceId, ts) and field order (deviceId, ts, pct) mirror the GRDB schema, so a
+ * `.noopbak` round-trips.
+ */
+@Entity(tableName = "spo2PctSample", primaryKeys = ["deviceId", "ts"])
+data class Spo2PctSampleEntity(
+    val deviceId: String,
+    val ts: Long,
+    /** The raw in-band `@82` byte, 70..100. Never a sentinel, never a diagnostic code, never 0. */
+    val pct: Int,
+)
