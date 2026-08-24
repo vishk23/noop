@@ -5,11 +5,11 @@ import WhoopProtocol
 final class CloudTombstoneTests: XCTestCase {
     func testWorkoutTombstoneBlocksResurrection() async throws {
         let store = try await WhoopStore.inMemory()
-        _ = try await store.upsertWorkouts([WorkoutRow(startTs: 100, endTs: 200, sport: "running", source: "whoop", durationS: 100, energyKcal: nil, avgHr: nil, maxHr: nil, strain: nil, distanceM: nil, zonesJSON: nil, notes: nil)], deviceId: "d1")
+        _ = try await store.upsertWorkouts([WorkoutRow(startTs: 100, endTs: 200, sport: "running", source: "whoop", durationS: 100, energyKcal: nil, avgHr: nil, maxHr: nil, strain: nil, distanceM: nil, zonesJSON: nil, notes: nil, steps: nil)], deviceId: "d1")
         try await store.addTombstone(kind: "workout", deviceId: "d1", startTs: 100, endTs: nil, sport: "running", day: nil, key: nil, editSeq: 7)
         _ = try await store.deleteWorkouts(deviceId: "d1", sport: "running", from: 100, to: 100)
         // Re-import attempts to resurrect — the guard must drop it.
-        let n = try await store.upsertWorkouts([WorkoutRow(startTs: 100, endTs: 200, sport: "running", source: "whoop", durationS: 100, energyKcal: nil, avgHr: nil, maxHr: nil, strain: nil, distanceM: nil, zonesJSON: nil, notes: nil)], deviceId: "d1")
+        let n = try await store.upsertWorkouts([WorkoutRow(startTs: 100, endTs: 200, sport: "running", source: "whoop", durationS: 100, energyKcal: nil, avgHr: nil, maxHr: nil, strain: nil, distanceM: nil, zonesJSON: nil, notes: nil, steps: nil)], deviceId: "d1")
         XCTAssertEqual(n, 0)
         // Idempotent tombstone insert (same kind+editSeq).
         try await store.addTombstone(kind: "workout", deviceId: "d1", startTs: 100, endTs: nil, sport: "running", day: nil, key: nil, editSeq: 7)
@@ -68,7 +68,7 @@ final class CloudTombstoneTests: XCTestCase {
         let store = try await WhoopStore.inMemory()
         let workout = WorkoutRow(startTs: 100, endTs: 200, sport: "running", source: "whoop",
                                   durationS: 100, energyKcal: nil, avgHr: nil, maxHr: nil, strain: nil,
-                                  distanceM: nil, zonesJSON: nil, notes: nil)
+                                  distanceM: nil, zonesJSON: nil, notes: nil, steps: nil)
         _ = try await store.upsertWorkouts([workout], deviceId: "d1")
         try await store.addTombstone(kind: "workout", deviceId: "d1", startTs: 100, endTs: nil,
                                       sport: "running", day: nil, key: nil, editSeq: 21)

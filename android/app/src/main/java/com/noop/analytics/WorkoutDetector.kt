@@ -107,6 +107,125 @@ object WorkoutDetector {
     }
 
     /**
+     * #1545: why a day produced no workout, counted at each gate the detector actually applies.
+     *
+     * The `effort bout` line explains a bout that EXISTS. It is silent when none does — and "no workouts at
+     * all" is the harder report to answer, because every gate looks equally plausible from outside. A
+     * reporter with 37 days and zero detected bouts previously had nothing to send that could distinguish
+     * "the strap never registered motion" (a WHOOP 4.0 banks it coarsely, #345/#28) from "HR never cleared
+     * resting + 15" from "the efforts were real but under five minutes".
+     *
+     * Counted during the detector's OWN walk, never recomputed alongside it: a funnel free to disagree with
+     * the code it describes is worse than no funnel, because it will be believed. Byte-parity twin of Swift
+     * `WorkoutDetector.DetectionFunnel`.
+     */
+    data class DetectionFunnel(
+        /** Inputs the day actually had. */
+        var hrSamples: Int = 0,
+        var motionSamples: Int = 0,
+        /** The bar a sample had to clear, in bpm — resting + [hrMarginBPM]. */
+        var restingHR: Double? = null,
+        var hrFloor: Double? = null,
+        /** Motion samples whose smoothed intensity cleared [motionThreshold]. */
+        var motionPassed: Int = 0,
+        /** Of those, how many had NO HR sample within [alignToleranceS] (a sensor gap, not a quiet body). */
+        var hrMissing: Int = 0,
+        /** Of those, how many had HR at or below [hrFloor] (moving, but not working). */
+        var hrTooLow: Int = 0,
+        /** Samples that cleared BOTH gates. */
+        var active: Int = 0,
+        /** Contiguous runs after gap-merging, and after the #303 HR-gated bridge. */
+        var runs: Int = 0,
+        var bridged: Int = 0,
+        /** Runs rejected by each qualification gate, and the survivors. */
+        var droppedShort: Int = 0,
+        var droppedNoHR: Int = 0,
+        var droppedLowIntensity: Int = 0,
+        var kept: Int = 0,
+    )
+
+    /**
+     * #1545: the always-on per-day line naming where the detector lost every candidate workout.
+     *
+     * Byte-identical string to the Swift twin. No PII: a day key and counts, plus the two bpm thresholds the
+     * day was measured against — the same privacy class as the sibling `sleep day=` line.
+     */
+    fun detectionFunnelLine(day: String, f: DetectionFunnel): String =
+        "effort detect day=$day hr=${f.hrSamples} motion=${f.motionSamples} " +
+            "restHR=${round0(f.restingHR)} floor=${round0(f.hrFloor)} " +
+            "motionOK=${f.motionPassed} hrMissing=${f.hrMissing} hrTooLow=${f.hrTooLow} " +
+            "active=${f.active} runs=${f.runs} bridged=${f.bridged} " +
+            "short=${f.droppedShort} noHR=${f.droppedNoHR} lowIntensity=${f.droppedLowIntensity} " +
+            "kept=${f.kept}"
+
+    /**
+     * #1545: how much of [start]..[end] the HR sensor actually covered, as a percentage of
+     * [bucketSeconds]-wide buckets holding at least one reading.
+     *
+     * Bucketed rather than sample-counted on purpose. A WHOOP 5/MG sends live HR only about every 30 s, so
+     * counting samples against a 1 Hz expectation would report ~3% for a perfectly captured bout, which is
+     * worse than no number. A bucket is either seen or not, so a 30 s cadence reads as full coverage and a
+     * genuine dropout reads as the gap it is. Byte-parity twin of Swift `hrCoveragePct`.
+     */
+    fun hrCoveragePct(sampleTs: List<Long>, start: Long, end: Long, bucketSeconds: Long = 60L): Double? {
+        if (end <= start || bucketSeconds <= 0) return null
+        val buckets = maxOf(1L, ((end - start) + bucketSeconds - 1) / bucketSeconds)
+        val seen = HashSet<Long>()
+        for (ts in sampleTs) if (ts in start until end) seen.add((ts - start) / bucketSeconds)
+        return seen.size.toDouble() / buckets.toDouble() * 100.0
+    }
+
+    /**
+     * #1545: the always-on per-bout line naming what this workout's Effort was actually scored against.
+     *
+     * HRmax is the single biggest determinant of an Effort score -- it sets every zone boundary, so being
+     * wrong by a few bpm can move real work across the 50% floor and score it zero -- and until this line
+     * existed a user could not see which number had been used, or whether it came from their own setting
+     * or an age formula. Working that out previously meant reversing the arithmetic from the displayed
+     * score, which is what #1545 took to diagnose.
+     *
+     * No PII: a day key, a duration, bpm and percentages. Byte-identical string to the Swift twin.
+     */
+    fun boutCalibrationLine(
+        day: String, durMin: Int, hrmax: Double?, hrmaxSource: String,
+        avgHRRPct: Double?, hrCoveragePct: Double?, strain: Double?,
+    ): String =
+        "effort bout day=$day durMin=$durMin hrmax=${round0(hrmax)} src=$hrmaxSource " +
+            "avgHRR=${round0(avgHRRPct)} cover=${round0(hrCoveragePct)} effort=${round1(strain)}"
+
+    /**
+     * The two numeric formatters this line uses, written as integer arithmetic over the value's MAGNITUDE
+     * rather than %.0f / %.1f.
+     *
+     * Three things this shape avoids, all of which would break a line whose entire job is being comparable
+     * between two users' logs — and between an iOS log and an Android one:
+     *
+     * - The positive tie. C printf (Swift) breaks a rounding tie to even; Java's String.format
+     *   (Kotlin) breaks it up. A bout at exactly 52.5% HRR would print 52 on iOS and 53 on Android.
+     * - The negative tie. Swift's .rounded() is half-AWAY-from-zero and Java's Math.round is
+     *   half-UP, so they disagree on -4.5 (-5 vs -4). Rounding abs(v) and re-applying the sign makes the
+     *   two identical in both directions; it also keeps the minus sign, which integer / and % truncating
+     *   toward zero would otherwise drop (-0.4 printing as 0.4).
+     * - The trap. Swift's Int(_: Double) CRASHES on a finite value past Int.max while Kotlin's
+     *   Math.round silently saturates to Long.MAX_VALUE. Today's caller can't produce one (the detector
+     *   gates maxHR > restingHR before computing %HRR), but this is public API, and a diagnostic that kills
+     *   the process is the worst possible way for one to fail. Past the bound both platforms print nil,
+     *   which is also the more honest answer: such a value is not a heart rate, a percentage or an Effort.
+     */
+    internal const val PRINTABLE_MAGNITUDE_LIMIT = 1e15
+
+    internal fun round0(v: Double?): String {
+        if (v == null || !v.isFinite() || abs(v) >= PRINTABLE_MAGNITUDE_LIMIT) return "nil"
+        return (if (v < 0) "-" else "") + Math.round(abs(v)).toString()
+    }
+
+    internal fun round1(v: Double?): String {
+        if (v == null || !v.isFinite() || abs(v) >= PRINTABLE_MAGNITUDE_LIMIT) return "nil"
+        val t = Math.round(abs(v) * 10.0)
+        return "${if (v < 0) "-" else ""}${t / 10}.${t % 10}"
+    }
+
+    /**
      * Value whose ts is nearest to [ts] within [tol] seconds, else null. Ties go
      * to the later timestamp (matches the Python <= behaviour).
      */
@@ -276,126 +395,157 @@ object WorkoutDetector {
         maxHR: Double? = null,
         age: Double? = null,
         profile: UserProfile? = null,
+        // #1545: TRIMP recipe for each bout's Effort. Defaults to EDWARDS so every existing caller and
+        // test is byte-identical; the app threads the user's choice so a bout and the day it sits in are
+        // never scored by different recipes, which would be worse than either one being "wrong".
+        effortMethod: StrainScorer.Method = StrainScorer.Method.EDWARDS,
+        // #1545: receives the gate-by-gate counts for THIS call. null (the default) keeps every existing
+        // caller and test byte-identical — nothing is computed that the detector was not already
+        // computing, the counters just record it.
+        funnel: ((DetectionFunnel) -> Unit)? = null,
     ): List<ExerciseSession> {
-        val hrSeg = cleanHR(hr)
-        val motion = activitySeries(gravity)
-        if (hrSeg.isEmpty() || motion.isEmpty()) return emptyList()
+        // try/finally (Swift uses `defer`) so the funnel is reported on EVERY exit, including the early
+        // returns below. A day that bails at "no motion rows at all" is precisely the day whose report
+        // matters most, and it is the one a happy-path-only emit would stay silent about.
+        val f = DetectionFunnel()
+        try {
+            val hrSeg = cleanHR(hr)
+            val motion = activitySeries(gravity)
+            f.hrSamples = hrSeg.size
+            f.motionSamples = motion.size
+            if (hrSeg.isEmpty() || motion.isEmpty()) return emptyList()
 
-        val restHR = restingHR ?: deriveRestingHR(hrSeg)
-        val hrFloor = restHR + hrMarginBPM
+            val restHR = restingHR ?: deriveRestingHR(hrSeg)
+            val hrFloor = restHR + hrMarginBPM
+            f.restingHR = restHR
+            f.hrFloor = hrFloor
 
-        val effMaxHR: Double?
-        val hrmaxSource: String
-        if (maxHR != null) {
-            effMaxHR = maxHR
-            hrmaxSource = "caller"
-        } else {
-            val (est, src) = StrainScorer.estimateHRmax(hrSeg.map { it.bpm.toDouble() }, age)
-            effMaxHR = if (est == 0.0) null else est
-            hrmaxSource = src
-        }
-
-        val hrTs = hrSeg.map { it.ts }
-        val hrBpm = hrSeg.map { it.bpm.toDouble() }
-        val smooth = smoothedIntensity(motion, motionSmoothS)
-        val motionTs = motion.map { it.ts }
-
-        // Walk the gravity timeline; flag samples where BOTH gates hold.
-        val activeTs = ArrayList<Long>()
-        for (idx in motion.indices) {
-            val p = motion[idx]
-            val inten = smooth[idx]
-            if (inten <= motionThreshold) continue
-            val bpm = nearest(hrTs, hrBpm, p.ts, alignToleranceS) ?: continue
-            if (bpm <= hrFloor) continue
-            activeTs.add(p.ts)
-        }
-        if (activeTs.isEmpty()) return emptyList()
-
-        // Group contiguous active samples into runs, merging gaps < MERGE_GAP_S.
-        val rawRuns = ArrayList<Pair<Long, Long>>()
-        var runStart = activeTs[0]
-        var prev = activeTs[0]
-        for (k in 1 until activeTs.size) {
-            val ts = activeTs[k]
-            if ((ts - prev).toDouble() > mergeGapS) {
-                rawRuns.add(runStart to prev)
-                runStart = ts
-            }
-            prev = ts
-        }
-        rawRuns.add(runStart to prev)
-
-        // Second pass (#303): bridge adjacent runs across a brief, still-elevated-HR
-        // lull so a sustained effort isn't shattered by coasting / junctions / sensor
-        // gaps. Runs over a genuine rest (HR falls to resting) are NOT bridged.
-        val runs = bridgeRuns(rawRuns, hrSeg, hrFloor)
-
-        val minDurS = minExerciseMin * 60.0
-        val sessions = ArrayList<ExerciseSession>()
-        for ((idx, run) in runs.withIndex()) {
-            val (start, end) = run
-            // Onset latency tolerance equal to the smoothing window.
-            if ((end - start).toDouble() < minDurS - motionSmoothS) continue
-            // Qualify on the HR-elevated CORE (unchanged gates) so the warm-up's low intensity
-            // can't dilute a real workout below the zone-2 bar and drop it (#148).
-            val core = hrSeg.filter { it.ts in start..end }
-            if (core.isEmpty()) continue
-
-            var zonePct: Map<Int, Double> = emptyMap()
-            var avgHRR: Double? = null
-            val m = effMaxHR
-            if (m != null && m > restHR) {
-                val (zp, ah) = boutIntensity(core, restHR, m)
-                zonePct = zp
-                avgHRR = ah
+            val effMaxHR: Double?
+            val hrmaxSource: String
+            if (maxHR != null) {
+                effMaxHR = maxHR
+                hrmaxSource = "caller"
+            } else {
+                val (est, src) = StrainScorer.estimateHRmax(hrSeg.map { it.bpm.toDouble() }, age)
+                effMaxHR = if (est == 0.0) null else est
+                hrmaxSource = src
             }
 
-            // Intensity qualification: require ≥ MIN_INTENSITY_Z2PLUS in zone 2+.
-            if (zonePct.isNotEmpty()) {
-                val z2plus = (2..5).sumOf { zonePct[it] ?: 0.0 } / 100.0
-                if (z2plus < minIntensityZ2Plus) continue
+            val hrTs = hrSeg.map { it.ts }
+            val hrBpm = hrSeg.map { it.bpm.toDouble() }
+            val smooth = smoothedIntensity(motion, motionSmoothS)
+            val motionTs = motion.map { it.ts }
+
+            // Walk the gravity timeline; flag samples where BOTH gates hold.
+            val activeTs = ArrayList<Long>()
+            for (idx in motion.indices) {
+                val p = motion[idx]
+                val inten = smooth[idx]
+                if (inten <= motionThreshold) continue
+                f.motionPassed++
+                // Split the HR rejection two ways: no sample within tolerance is a SENSOR GAP, a sample at or
+                // below the floor is a body that simply was not working. They read identically in a bout count
+                // of zero and call for opposite responses.
+                val bpm = nearest(hrTs, hrBpm, p.ts, alignToleranceS)
+                if (bpm == null) { f.hrMissing++; continue }
+                if (bpm <= hrFloor) { f.hrTooLow++; continue }
+                activeTs.add(p.ts)
             }
+            f.active = activeTs.size
+            if (activeTs.isEmpty()) return emptyList()
 
-            // Qualified → back-date the start over the warm-up and report stats on the full window (#148).
-            // Never back-date past the previous run's end: a continuous-motion stretch whose HR dipped to
-            // resting BETWEEN two efforts (so bridgeRuns kept them separate) must not overlap the earlier one.
-            val floor = if (idx > 0) runs[idx - 1].second + 1 else Long.MIN_VALUE
-            val effStart = maxOf(backdatedStart(start, motionTs, smooth), floor)
-            val window = hrSeg.filter { it.ts in effStart..end }
-            if (window.isEmpty()) continue
-            val bpms = window.map { it.bpm.toDouble() }
-
-            var kcal: Double? = null
-            var kj: Double? = null
-            if (profile != null) {
-                val (k, j) = Calories.estimateBoutCalories(window, profile, effMaxHR, restHR)
-                kcal = k
-                kj = j
+            // Group contiguous active samples into runs, merging gaps < MERGE_GAP_S.
+            val rawRuns = ArrayList<Pair<Long, Long>>()
+            var runStart = activeTs[0]
+            var prev = activeTs[0]
+            for (k in 1 until activeTs.size) {
+                val ts = activeTs[k]
+                if ((ts - prev).toDouble() > mergeGapS) {
+                    rawRuns.add(runStart to prev)
+                    runStart = ts
+                }
+                prev = ts
             }
+            rawRuns.add(runStart to prev)
+            f.runs = rawRuns.size
 
-            val avg = bpms.sum() / bpms.size.toDouble()
-            val peak = window.maxOf { it.bpm }
-            val strain = StrainScorer.strain(window, effMaxHR, restHR)
+            // Second pass (#303): bridge adjacent runs across a brief, still-elevated-HR
+            // lull so a sustained effort isn't shattered by coasting / junctions / sensor
+            // gaps. Runs over a genuine rest (HR falls to resting) are NOT bridged.
+            val runs = bridgeRuns(rawRuns, hrSeg, hrFloor)
+            f.bridged = runs.size
 
-            sessions.add(
-                ExerciseSession(
-                    start = effStart,
-                    end = end,
-                    avgHR = avg,
-                    peakHR = peak,
-                    strain = strain,
-                    durationS = (end - effStart).toDouble(),
-                    zoneTimePct = zonePct,
-                    avgHRRPct = avgHRR,
-                    hrmax = effMaxHR,
-                    hrmaxSource = hrmaxSource,
-                    caloriesKcal = kcal,
-                    caloriesKJ = kj,
+            val minDurS = minExerciseMin * 60.0
+            val sessions = ArrayList<ExerciseSession>()
+            for ((idx, run) in runs.withIndex()) {
+                val (start, end) = run
+                // Onset latency tolerance equal to the smoothing window.
+                if ((end - start).toDouble() < minDurS - motionSmoothS) { f.droppedShort++; continue }
+                // Qualify on the HR-elevated CORE (unchanged gates) so the warm-up's low intensity
+                // can't dilute a real workout below the zone-2 bar and drop it (#148).
+                val core = hrSeg.filter { it.ts in start..end }
+                if (core.isEmpty()) { f.droppedNoHR++; continue }
+
+                var zonePct: Map<Int, Double> = emptyMap()
+                var avgHRR: Double? = null
+                val m = effMaxHR
+                if (m != null && m > restHR) {
+                    val (zp, ah) = boutIntensity(core, restHR, m)
+                    zonePct = zp
+                    avgHRR = ah
+                }
+
+                // Intensity qualification: require ≥ MIN_INTENSITY_Z2PLUS in zone 2+.
+                if (zonePct.isNotEmpty()) {
+                    val z2plus = (2..5).sumOf { zonePct[it] ?: 0.0 } / 100.0
+                    if (z2plus < minIntensityZ2Plus) { f.droppedLowIntensity++; continue }
+                }
+
+                // Qualified → back-date the start over the warm-up and report stats on the full window (#148).
+                // Never back-date past the previous run's end: a continuous-motion stretch whose HR dipped to
+                // resting BETWEEN two efforts (so bridgeRuns kept them separate) must not overlap the earlier one.
+                val floor = if (idx > 0) runs[idx - 1].second + 1 else Long.MIN_VALUE
+                val effStart = maxOf(backdatedStart(start, motionTs, smooth), floor)
+                val window = hrSeg.filter { it.ts in effStart..end }
+                if (window.isEmpty()) { f.droppedNoHR++; continue }
+                val bpms = window.map { it.bpm.toDouble() }
+
+                var kcal: Double? = null
+                var kj: Double? = null
+                if (profile != null) {
+                    val (k, j) = Calories.estimateBoutCalories(window, profile, effMaxHR, restHR)
+                    kcal = k
+                    kj = j
+                }
+
+                val avg = bpms.sum() / bpms.size.toDouble()
+                val peak = window.maxOf { it.bpm }
+                val strain = StrainScorer.strain(
+                    window, effMaxHR, restHR, effortMethod, profile?.sex ?: "male")
+
+                sessions.add(
+                    ExerciseSession(
+                        start = effStart,
+                        end = end,
+                        avgHR = avg,
+                        peakHR = peak,
+                        strain = strain,
+                        durationS = (end - effStart).toDouble(),
+                        zoneTimePct = zonePct,
+                        avgHRRPct = avgHRR,
+                        hrmax = effMaxHR,
+                        hrmaxSource = hrmaxSource,
+                        caloriesKcal = kcal,
+                        caloriesKJ = kj,
+                        hrCoveragePct = hrCoveragePct(window.map { it.ts }, effStart, end),
+                    )
                 )
-            )
+            }
+            f.kept = sessions.size
+            return sessions
+        } finally {
+            funnel?.invoke(f)
         }
-        return sessions
     }
 }
 
@@ -414,26 +564,40 @@ object Calories {
         /** Applied to height in METRES. */
         val restingHeight: Double,
         val restingAge: Double,
+        // Keytel 2005 base (fitness-blind) active model: EE(kJ/min) = alpha + hr·HR + wt·W + age·A.
         val workoutHR: Double,
         val workoutWeight: Double,
         val workoutAge: Double,
         val workoutAlpha: Double,
+        // Keytel 2005 fitness-ADJUSTED active model, which reads VO2max and is the more accurate form
+        // the authors published: EE(kJ/min) = fitAlpha + fitHR·HR + fitVO2·VO2max + fitWeight·W + fitAge·A.
+        // Used only when a resting HR is known (so a Uth VO2max can be derived); otherwise the base
+        // workout* model above, unchanged. (Keytel et al. 2005, J. Sports Sci. 23(3).)
+        val fitHR: Double,
+        val fitVO2: Double,
+        val fitWeight: Double,
+        val fitAge: Double,
+        val fitAlpha: Double,
     )
 
     val male = Coeffs(
         restingAlpha = 88.362, restingWeight = 13.397, restingHeight = 479.9,
         restingAge = 5.677, workoutHR = 0.6309, workoutWeight = 0.1988,
         workoutAge = 0.2017, workoutAlpha = -55.0969,
+        fitHR = 0.634, fitVO2 = 0.404, fitWeight = 0.394, fitAge = 0.271, fitAlpha = -95.7735,
     )
     val female = Coeffs(
         restingAlpha = 447.593, restingWeight = 9.247, restingHeight = 309.8,
         restingAge = 4.33, workoutHR = 0.4472, workoutWeight = -0.1263,
         workoutAge = 0.0740, workoutAlpha = -20.4022,
+        fitHR = 0.450, fitVO2 = 0.380, fitWeight = 0.103, fitAge = 0.274, fitAlpha = -59.3954,
     )
+    // Nonbinary = the male/female midpoint, the same convention the base workout* coeffs use.
     val nonbinary = Coeffs(
         restingAlpha = 267.9775, restingWeight = 11.322, restingHeight = 394.85,
         restingAge = 5.0035, workoutHR = 0.53905, workoutWeight = 0.03625,
         workoutAge = 0.13785, workoutAlpha = -37.74955,
+        fitHR = 0.542, fitVO2 = 0.392, fitWeight = 0.2485, fitAge = 0.2725, fitAlpha = -77.58445,
     )
 
     const val activeHRRFraction: Double = 0.30
@@ -463,9 +627,31 @@ object Calories {
         return maxOf(0.0, bmr) / 86_400.0
     }
 
-    fun activeKcalPerS(c: Coeffs, hr: Double, hrmax: Double, weightKg: Double, age: Double): Double {
-        val eeKjMin = c.workoutHR * minOf(hr, hrmax) + c.workoutWeight * weightKg +
-            c.workoutAge * age + c.workoutAlpha
+    /**
+     * Uth–Sørensen VO2max estimate (ml·kg⁻¹·min⁻¹) ≈ 15.3 · HRmax / HRrest. Returns null when no
+     * usable resting HR — the caller then keeps the base (fitness-blind) Keytel model, so a strap with
+     * no resting baseline is scored exactly as before. A function of HRmax + resting HR ONLY, so every
+     * call site resolves it locally and day derivation stays deterministic (no cross-day dependency).
+     * (Uth et al. 2004, Eur. J. Appl. Physiol. 91.)
+     */
+    fun vo2maxFor(hrmax: Double, restingHR: Double?): Double? {
+        if (restingHR == null || restingHR <= 0.0 || hrmax <= 0.0) return null
+        return 15.3 * hrmax / restingHR
+    }
+
+    /**
+     * Active energy rate (kcal/s). With [vo2max] present, uses the Keytel 2005 fitness-ADJUSTED
+     * equation (personalizes beyond age/weight/sex); with null, the base fitness-blind Keytel model,
+     * byte-identical to before. HR is capped at HRmax in both, as the base model always did.
+     */
+    fun activeKcalPerS(c: Coeffs, hr: Double, hrmax: Double, weightKg: Double, age: Double, vo2max: Double? = null): Double {
+        val eeKjMin = if (vo2max != null) {
+            c.fitHR * minOf(hr, hrmax) + c.fitVO2 * vo2max + c.fitWeight * weightKg +
+                c.fitAge * age + c.fitAlpha
+        } else {
+            c.workoutHR * minOf(hr, hrmax) + c.workoutWeight * weightKg +
+                c.workoutAge * age + c.workoutAlpha
+        }
         return maxOf(0.0, eeKjMin) / workoutDivisor
     }
 
@@ -501,6 +687,9 @@ object Calories {
         val activeThreshold = effResting + activeHRRFraction * (effHRmax - effResting)
 
         val restingRate = restingKcalPerS(coeffs, weightKg, heightCm, age)
+        // Fitness anchor (Uth VO2max) when a resting HR is known → the Keytel fitness-adjusted rate;
+        // null restingHR → base model, unchanged. Computed once (constant across the bout).
+        val vo2max = vo2maxFor(effHRmax, restingHR)
 
         // Weight each sample by the ACTUAL elapsed time to the next sample, not a flat 1 s.
         // restingRate / activeKcalPerS are per-SECOND rates, so summing one per sample only
@@ -523,7 +712,7 @@ object Calories {
             totalKcal += if (bpm < activeThreshold) {
                 restingRate * dur
             } else {
-                activeKcalPerS(coeffs, bpm, effHRmax, weightKg, age) * dur
+                activeKcalPerS(coeffs, bpm, effHRmax, weightKg, age, vo2max) * dur
             }
         }
         return totalKcal to (totalKcal * 4.184)
@@ -580,6 +769,9 @@ object Calories {
         val activeThreshold = effResting + dayActiveHRRFraction * (effHRmax - effResting)
 
         val restingRate = restingKcalPerS(coeffs, weightKg, heightCm, age)
+        // Fitness anchor (Uth VO2max) when a resting HR is known → Keytel fitness-adjusted rate; null
+        // restingHR → base model, unchanged. Constant across the day.
+        val vo2max = vo2maxFor(effHRmax, restingHR)
 
         var totalKcal = 0.0
         for (s in hrSamples) {
@@ -590,7 +782,7 @@ object Calories {
                 // Floor the active rate at the resting BMR rate: a worn day-second never
                 // burns LESS than resting metabolism, even where the Keytel value dips low
                 // for some profiles just above the gate.
-                maxOf(restingRate, activeKcalPerS(coeffs, bpm, effHRmax, weightKg, age))
+                maxOf(restingRate, activeKcalPerS(coeffs, bpm, effHRmax, weightKg, age, vo2max))
             }
         }
         return totalKcal
