@@ -250,6 +250,26 @@ struct StrandiOSApp: App {
                 // timer or an incidental reconnect. Floored at 90s and never clock/empty-streak-suppressed
                 // (BackfillPolicy.shouldRun's .foreground case), so this is a safe no-op on rapid re-opens.
                 model.ble.requestSync(.foreground)
+                #if CLOUD_SYNC
+                // Cloud catch-up on FOREGROUND ACTIVATION, not just cold launch (2026-08-24): the
+                // 20h on-launch catch-up lives in RootTabView's `.task`, which never re-runs when a
+                // suspended app is merely brought back to the foreground — so a warm re-open kicked
+                // the strap sync above while the cloud mirror stayed as stale as iOS kept the
+                // process alive (observed: 23h, with the user pulling-to-refresh at a gesture that
+                // never touches this lane). Reuses `backgroundSyncIfDue`'s existing 4h gate — the
+                // same "opportunistic and comparatively cheap" reasoning applies to an app open, and
+                // skip-unchanged upload means most runs that do fire ship little — so rapid re-opens
+                // are a UserDefaults read and nothing else. Overlap with the launch `.task`'s
+                // `autoSyncIfDue` (both fire on a cold start) is CloudSyncGate's job, as everywhere.
+                let cloudSync = CloudSyncModel()
+                let cloudIntelligence = model.intelligence
+                let cloudRepo = model.repo
+                cloudSync.postApplyRefresh = {
+                    await cloudIntelligence.analyzeRecent()
+                    await cloudRepo.refresh()
+                }
+                Task { await cloudSync.backgroundSyncIfDue(repo: cloudRepo) }
+                #endif
                 Task {
                     health.refreshAuthIfPreviouslyGranted()
                     await health.sync()
