@@ -20,14 +20,14 @@ val requestedReleaseBuild = gradle.startParameter.taskNames.any {
 
 android {
     namespace = "com.noop"
-    compileSdk = 34
+    compileSdk = 35
 
     defaultConfig {
         applicationId = "com.noop.whoop"
         minSdk = 26
         targetSdk = 34
-        versionCode = 307
-        versionName = "9.3.1"
+        versionCode = 357
+        versionName = "10.5.1"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         vectorDrawables {
@@ -276,6 +276,7 @@ dependencies {
 
     // --- Unit / instrumentation tests ---
     testImplementation("junit:junit:4.13.2")
+    testImplementation("org.jacoco:org.jacoco.core:0.8.12")
     testImplementation("org.jetbrains.kotlinx:kotlinx-coroutines-test:1.8.1")
     testImplementation("org.json:json:20240303") // real org.json for JVM unit tests (android.jar ships throwing stubs)
     testImplementation("net.sf.kxml:kxml2:2.3.0") // real XmlPullParser for JVM tests (android.util.Xml is a throwing stub)

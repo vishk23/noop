@@ -115,6 +115,11 @@ struct RawHistoryArchive {
         self.maxBytes = maxBytes
         self.perVersionFloor = perVersionFloor
         self.zeroPayloadFloor = zeroPayloadFloor
+        #if os(iOS)
+        // Migrate an archive created by an older build while launch is normally foreground/unlocked.
+        // The write path repeats this before every append so a first background write is covered too.
+        try? prepareStorageForBackgroundAccess()
+        #endif
     }
 
     /// The archive file URL (does not create anything).
@@ -147,6 +152,14 @@ struct RawHistoryArchive {
     func archive(_ frames: [[UInt8]], trim: UInt32, family: DeviceFamily) -> Result {
         guard !frames.isEmpty else { return .written(count: 0) }
         let url = fileURL
+        // Ensure the directory exists AND (on iOS) carries after-first-unlock protection before the reads
+        // below, so a locked background wake can read the existing archive and rewrite it rather than
+        // failing the mandatory pre-ack write. Directory creation is the only hard failure here.
+        do {
+            try prepareStorageForBackgroundAccess()
+        } catch {
+            return .failed
+        }
         let capturedAtMs = Date().timeIntervalSince1970 * 1000
         // Build the new JSONL lines (each newline-terminated). The version that drives floor-aware
         // retention (#344) is re-derived per line from the stored frame inside `evictLines`.
@@ -189,8 +202,8 @@ struct RawHistoryArchive {
                                                floor: perVersionFloor, zeroFloor: zeroPayloadFloor)
         let data = Data(kept.joined().utf8)
         do {
-            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
             try data.write(to: url, options: .atomic)   // atomic rewrite; durable before the ack
+            applyBackgroundProtectionToArchive()        // atomic replace makes a new inode — re-protect it
             return .written(count: frames.count)
         } catch {
             return .failed
@@ -199,7 +212,7 @@ struct RawHistoryArchive {
 
     /// Append `data` to `url`, fsyncing before returning so it is durable BEFORE the trim ack.
     private func appendDurably(_ data: Data, to url: URL) throws {
-        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        try prepareStorageForBackgroundAccess()
         if FileManager.default.fileExists(atPath: url.path) {
             let handle = try FileHandle(forWritingTo: url)
             defer { try? handle.close() }
@@ -208,7 +221,39 @@ struct RawHistoryArchive {
             try handle.synchronize()   // durable BEFORE the ack — the point of the archive
         } else {
             try data.write(to: url, options: .atomic)
+            applyBackgroundProtectionToArchive()   // new file — set its protection (existing files keep theirs)
         }
+    }
+
+    /// Make the reject archive readable after the first unlock, matching the primary SQLite store's policy
+    /// in `StorePaths`. Background BLE can be woken while the phone is locked; the iOS default (complete)
+    /// protection would otherwise make this mandatory pre-ack write fail and force the strap to resend the
+    /// same history chunk. Applied to the directory (future files inherit it) and any archive left by an
+    /// older build. Non-iOS platforms only need the directory created — protection classes don't apply.
+    private func prepareStorageForBackgroundAccess() throws {
+        let fm = FileManager.default
+        try fm.createDirectory(at: directory, withIntermediateDirectories: true)
+        #if os(iOS)
+        let protection: [FileAttributeKey: Any] = [
+            .protectionKey: FileProtectionType.completeUntilFirstUserAuthentication,
+        ]
+        try? fm.setAttributes(protection, ofItemAtPath: directory.path)
+        if fm.fileExists(atPath: fileURL.path) {
+            try? fm.setAttributes(protection, ofItemAtPath: fileURL.path)
+        }
+        #endif
+    }
+
+    /// Atomic replacement creates a NEW inode, so re-apply the file protection after every fresh write
+    /// rather than relying on directory inheritance alone. Best-effort — the directory policy is the
+    /// durable guarantee; this closes the window on the specific file.
+    private func applyBackgroundProtectionToArchive() {
+        #if os(iOS)
+        try? FileManager.default.setAttributes(
+            [.protectionKey: FileProtectionType.completeUntilFirstUserAuthentication],
+            ofItemAtPath: fileURL.path
+        )
+        #endif
     }
 
     /// How one archived line is classified for retention: which version bucket it belongs to, and
@@ -228,9 +273,9 @@ struct RawHistoryArchive {
 
     /// The frame bytes + family of one archived JSONL line, or `nil` if the line is malformed.
     /// Hand-parsed to match the hand-built writer: the only dynamic fields are `family` and the
-    /// [0-9a-f] `frameHex`. Shared by `readAll` and retention so both agree on exactly which lines are
-    /// readable — retention must never protect a line the read-back would then skip. Twin of the Android
-    /// `RawHistoryArchive.parseArchiveLine`.
+    /// [0-9a-f] `frameHex`. Shared by `readAll`, retention, and the operator summary so all three agree
+    /// on exactly which lines are readable — retention must never protect a line the read-back would then
+    /// skip. Twin of the Android `RawHistoryArchive.parseArchiveLine`.
     static func parseArchiveLine<S: StringProtocol>(_ line: S) -> (frame: [UInt8], family: DeviceFamily)? {
         guard let fr = line.range(of: "\"family\":\""),
               let hr = line.range(of: "\"frameHex\":\"") else { return nil }
@@ -321,6 +366,73 @@ struct RawHistoryArchive {
         guard let text = try? String(contentsOf: fileURL, encoding: .utf8) else { return [] }
         return text.split(separator: "\n").compactMap { RawHistoryArchive.parseArchiveLine($0) }
     }
+
+    // MARK: - operator inspection (#77 / #91 follow-up)
+
+    /// A rendered, copy-pasteable snapshot of what the archive currently holds — the affordance for
+    /// answering, right after an experiment, the one question the strap log cannot: did the frames I was
+    /// hunting actually land, or did retention already bin them?
+    ///
+    /// Reports counts per layout version split by informative vs entirely-zero payload (so an
+    /// `enable_raw_data_w_ecg` placeholder flood is visible as such rather than as a healthy-looking
+    /// line count), plus the newest `newest` captures with their phone-clock timestamps — the column you
+    /// match against the electrode-contact window. Read-only; touches no strap state.
+    func summaryText(newest: Int = 8) -> String {
+        let text = (try? String(contentsOf: fileURL, encoding: .utf8)) ?? ""
+        let lines = text.split(separator: "\n", omittingEmptySubsequences: true).map(String.init)
+        let size = (try? FileManager.default.attributesOfItem(atPath: fileURL.path))
+            .flatMap { $0[.size] as? Int } ?? 0
+        return "\(fileURL.path)\n\(RawHistoryArchive.summaryText(lines: lines, sizeBytes: size, newest: newest))"
+    }
+
+    /// The pure renderer behind `summaryText()` — takes the raw JSONL lines so it is unit-testable
+    /// without a file. `lines` is oldest-first, exactly as stored.
+    static func summaryText(lines: [String], sizeBytes: Int, newest: Int = 8) -> String {
+        guard !lines.isEmpty else { return "Raw history archive: EMPTY (no frames archived yet)." }
+        struct Bucket { var informative = 0; var zero = 0 }
+        var buckets: [String: Bucket] = [:]
+        var malformed = 0
+        var rows: [String] = []
+        for line in lines {
+            guard let (frame, family) = parseArchiveLine(line) else { malformed += 1; continue }
+            let version = versionByte(frame, family: family)
+            let label = "\(family.rawValue) v\(version)"
+            let isZero = hasZeroPayload(frame, family: family)
+            var b = buckets[label] ?? Bucket()
+            if isZero { b.zero += 1 } else { b.informative += 1 }
+            buckets[label] = b
+            // Sliding window over the newest `newest` readable lines (the file is oldest-first).
+            if newest > 0 {
+                if rows.count == newest { rows.removeFirst() }
+                rows.append("  \(stamp(line))  \(label)  \(frame.count) B  \(isZero ? "zero-payload" : "INFORMATIVE")")
+            }
+        }
+        var out = "Raw history archive: \(lines.count) line(s), \(sizeBytes / 1024) KB"
+        out += "\n\nBy layout version:"
+        for label in buckets.keys.sorted() {
+            let b = buckets[label]!
+            out += "\n  \(label)  \(b.informative + b.zero) line(s)  —  \(b.informative) informative, \(b.zero) all-zero payload"
+        }
+        if malformed > 0 { out += "\n  (malformed)  \(malformed) line(s)" }
+        if !rows.isEmpty {
+            out += "\n\nNewest \(rows.count) capture(s), phone clock:\n" + rows.joined(separator: "\n")
+        }
+        return out
+    }
+
+    /// `capturedAtMs` of one archived line rendered in the phone's local time, or `?` when unreadable.
+    private static func stamp(_ line: String) -> String {
+        guard let r = line.range(of: "\"capturedAtMs\":"),
+              let ms = Double(line[r.upperBound...].prefix { $0 == "." || ("0"..."9").contains($0) })
+        else { return "????-??-?? ??:??:??" }
+        return stampFormatter.string(from: Date(timeIntervalSince1970: ms / 1000))
+    }
+
+    private static let stampFormatter: DateFormatter = {
+        let f = DateFormatter()
+        f.dateFormat = "yyyy-MM-dd HH:mm:ss"
+        return f
+    }()
 
     /// Re-decode every archived frame through the CURRENT decoder and insert whatever now decodes.
     /// The strap freed these records when they were acked, so this archive is the ONLY way banked

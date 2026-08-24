@@ -1,7 +1,7 @@
 import Foundation
 import GRDB
 
-// MARK: - v27 store: hourly Apple Health step counts
+// MARK: - v38 store: hourly Apple Health step counts
 // Mirrors OuraRawStore: an idempotent ON CONFLICT upsert keyed by the natural key (deviceId, ts), and
 // a range read — all GRDB work via syncWrite/syncRead. `appleDaily.steps` already answers "how many
 // steps that day"; this table answers "which HOURS were recorded", so the UI can show retroactively

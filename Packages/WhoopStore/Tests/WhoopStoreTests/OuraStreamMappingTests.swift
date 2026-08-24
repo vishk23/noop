@@ -41,8 +41,9 @@ final class OuraStreamMappingTests: XCTestCase {
         let ev = s.events[0]
         XCTAssertEqual(ev.kind, OuraStreamMapping.hrvEventKind)
         XCTAssertEqual(ev.kind, "OURA_HRV")
-        // Bucket 0 sits at the record time; later buckets walk back 5 min each (see below).
-        XCTAssertEqual(ev.ts, ts)
+        // #1167: a 1-pair record's single bucket is the span [ts-300, ts) — its five minutes END at the
+        // record time, so it is stamped 300 s before it.
+        XCTAssertEqual(ev.ts, ts - 300)
         // The byte->unit scaling is now pinned (u8 bpm, u8 ms), so the fields are honestly labelled.
         // Keys + values match the Kotlin twin exactly.
         XCTAssertEqual(ev.payload["pair_index"], .int(0))
@@ -87,22 +88,38 @@ final class OuraStreamMappingTests: XCTestCase {
     // MARK: - HRV 0x5D -> events (per-bucket 5-min timestamps)
 
     // Each 5-min bucket must land on its OWN timestamp: the event key is (deviceId, ts, kind), so pairs
-    // sharing the record `ts` would collide on insert and only one survive. Buckets walk backward from the
-    // record time at the 5-min cadence, so bucket `index` sits 300 s * index before `ts` — distinct rows,
-    // ordered oldest-last, none dropped. Twin of the Kotlin OuraStreamMapping test.
+    // sharing the record `ts` would collide on insert and only one survive. #1167: the record's FIRST pair
+    // is its OLDEST bucket and the record `ts` marks the END of the covered span, so pair `index` sits
+    // `(count - index) * 300` s before `ts` and the LAST pair's five minutes end exactly at `ts`.
+    // Twin of the Kotlin OuraStreamMapping test.
     func testHRVMultiBucketGetsDistinctFiveMinTimestamps() {
         let s = OuraStreamMapping.streams(from: [
-            .hrv(OuraHRV(ringTimestamp: 100, index: 0, hrBpm: 52, rmssdMs: 47)),
-            .hrv(OuraHRV(ringTimestamp: 100, index: 1, hrBpm: 54, rmssdMs: 44)),
-            .hrv(OuraHRV(ringTimestamp: 100, index: 2, hrBpm: 55, rmssdMs: 41)),
+            .hrv(OuraHRV(ringTimestamp: 100, index: 0, hrBpm: 52, rmssdMs: 47, count: 3)),
+            .hrv(OuraHRV(ringTimestamp: 100, index: 1, hrBpm: 54, rmssdMs: 44, count: 3)),
+            .hrv(OuraHRV(ringTimestamp: 100, index: 2, hrBpm: 55, rmssdMs: 41, count: 3)),
         ], at: ts)
         XCTAssertEqual(s.events.count, 3)
-        // Distinct, 300 s apart, stepping back from the record time.
-        XCTAssertEqual(s.events.map { $0.ts }, [ts, ts - 300, ts - 600])
+        // Distinct, 300 s apart, ascending in time, ending at the record time.
+        XCTAssertEqual(s.events.map { $0.ts }, [ts - 900, ts - 600, ts - 300])
         XCTAssertEqual(Set(s.events.map { $0.ts }).count, 3)
         XCTAssertEqual(s.events.map { $0.payload["pair_index"] }, [.int(0), .int(1), .int(2)])
         XCTAssertEqual(s.events.map { $0.payload["hr_bpm"] }, [.int(52), .int(54), .int(55)])
         XCTAssertEqual(s.events.map { $0.payload["rmssd_ms"] }, [.int(47), .int(44), .int(41)])
+    }
+
+    // #1167 + #1131 together: a dropped `00 00` pad must still be COUNTED, or every surviving bucket in
+    // that record slides. Here the record had 4 pairs and the decoder dropped index 1, so the survivors
+    // must keep the exact slots they would have had with the pad present — a 300 s hole at `ts - 600`,
+    // NOT three buckets closing up. This is the mid-record shape observed in the field on 2026-08-08.
+    func testHRVDroppedPaddingPairStillConsumesItsSlot() {
+        let s = OuraStreamMapping.streams(from: [
+            .hrv(OuraHRV(ringTimestamp: 100, index: 0, hrBpm: 52, rmssdMs: 47, count: 4)),
+            // index 1 was the `00 00` pad — never emitted by the decoder.
+            .hrv(OuraHRV(ringTimestamp: 100, index: 2, hrBpm: 55, rmssdMs: 41, count: 4)),
+            .hrv(OuraHRV(ringTimestamp: 100, index: 3, hrBpm: 56, rmssdMs: 39, count: 4)),
+        ], at: ts)
+        XCTAssertEqual(s.events.map { $0.ts }, [ts - 1200, ts - 600, ts - 300])
+        XCTAssertEqual(s.events.map { $0.payload["pair_index"] }, [.int(0), .int(2), .int(3)])
     }
 
     // MARK: - SpO2 -> spo2:[SpO2Sample]
@@ -241,9 +258,71 @@ final class OuraStreamMappingTests: XCTestCase {
             // 0x50 activity/MET (PR #960): decoded but Tier-B/unvalidated - in particular it must never
             // mint a `steps` row (MET is not a step count; the per-source day-owner rules stay intact).
             .activityInfo(OuraActivityInfo(ringTimestamp: 100, state: 0x41, met: [1.8, 1.9])),
+            // 0x7E/0x7F real_steps_features: decoded but Tier-B - must never mint a `steps` row either.
+            // Ground truth showed no field is a count; they are model inputs (see OuraRealStepsFields).
+            .realStepsFields(OuraRealStepsFields(tag: 0x7E, ringTimestamp: 100, fields: Array(0..<14))),
         ], at: ts)
         XCTAssertTrue(s.isEmpty, "Tier-B and diagnostic events must not produce any durable stream row")
-        XCTAssertTrue(s.steps.isEmpty, "activity/MET must never fabricate a steps row")
+        XCTAssertTrue(s.steps.isEmpty, "activity/MET/real_steps must never fabricate a steps row")
+    }
+
+    // MARK: - 0x6A sleep_period_info → respiration instrumentation
+
+    /// `breath` becomes ONE `resp` row, in milli-bpm, at the record's own ts — and nothing else about
+    /// the record reaches a durable stream. The other fields are the whole reason the record was
+    /// dropped wholesale before: `averageHrBpm` at a ~5-min cadence would sit in the same series as the
+    /// beat-derived HR channel with no way to tell them apart afterwards.
+    func testSleepPeriodInfoMapsBreathToRespirationAndNothingElse() {
+        let s = OuraStreamMapping.streams(from: [
+            .sleepPeriodInfo(OuraSleepPeriodInfo(ringTimestamp: 100, averageHrBpm: 53.0, hrTrend: -0.625,
+                                                 mzci: 3.75, dzci: 1.75, breathsPerMin: 14.375,
+                                                 breathVariability: 4.625, motionCount: 0, sleepState: 1,
+                                                 cv: 0.25)),
+        ], at: ts)
+        XCTAssertEqual(s.resp.count, 1)
+        XCTAssertEqual(s.resp[0].ts, ts)
+        XCTAssertEqual(s.resp[0].raw, 14_375, "breath is stored in milli-bpm, exactly (14.375 → 14375)")
+        XCTAssertEqual(s.resp[0].unit, "milli_bpm")
+        XCTAssertTrue(s.hr.isEmpty, "0x6A average_hr must never land in the beat-derived HR series")
+        XCTAssertTrue(s.rr.isEmpty)
+        XCTAssertTrue(s.events.isEmpty, "no event row: breath is a stream value, the rest stays in the log")
+        XCTAssertTrue(s.steps.isEmpty)
+        XCTAssertTrue(s.skinTemp.isEmpty)
+        XCTAssertTrue(s.spo2.isEmpty)
+    }
+
+    /// Every value the wire can express survives the round trip exactly — the point of the milli scale.
+    /// The field is a `u8 / 8`, so the whole alphabet is 0…31.875 bpm in 0.125 steps.
+    func testEveryWireBreathValueRoundTripsExactly() {
+        for byte in 0...255 {
+            let bpm = Double(byte) / 8.0
+            let s = OuraStreamMapping.streams(from: [
+                .sleepPeriodInfo(OuraSleepPeriodInfo(ringTimestamp: 100, averageHrBpm: 53.0, hrTrend: 0,
+                                                     mzci: 0, dzci: 0, breathsPerMin: bpm,
+                                                     breathVariability: 0, motionCount: 0, sleepState: 0,
+                                                     cv: 0)),
+            ], at: ts)
+            XCTAssertEqual(s.resp[0].raw, byte * 125, "raw must be the wire byte × 125, losslessly")
+            XCTAssertEqual(OuraRespScale.breathsPerMin(raw: s.resp[0].raw), bpm, accuracy: 1e-12)
+        }
+    }
+
+    /// Each record keeps its OWN anchored second, so a night's ~5-min windows land where they were
+    /// measured. The rows are keyed (deviceId, ts), so two records sharing a second would collapse to
+    /// one — the failure mode that cost 92 % of an overnight's SpO2 before #1070.
+    func testSleepPeriodInfoRecordsKeepTheirOwnTimestamps() {
+        let batches = [(ts, 14.375), (ts + 296, 14.5), (ts + 592, 15.0)]
+        var rows: [RespSample] = []
+        for (at, bpm) in batches {
+            rows += OuraStreamMapping.streams(from: [
+                .sleepPeriodInfo(OuraSleepPeriodInfo(ringTimestamp: 100, averageHrBpm: 53.0, hrTrend: 0,
+                                                     mzci: 0, dzci: 0, breathsPerMin: bpm,
+                                                     breathVariability: 0, motionCount: 0, sleepState: 0,
+                                                     cv: 0)),
+            ], at: at).resp
+        }
+        XCTAssertEqual(rows.map(\.ts), [ts, ts + 296, ts + 592])
+        XCTAssertEqual(rows.map(\.raw), [14_375, 14_500, 15_000])
     }
 
     // MARK: - Batching a record's events into one insert (#1072, root cause for #823)
