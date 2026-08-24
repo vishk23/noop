@@ -313,7 +313,8 @@ enum CloudEditApplier {
                 startTs: finalStartTs, endTs: finalEndTs, sport: p.patch.sport ?? p.sport,
                 source: before.source ?? "manual", durationS: Double(finalEndTs - finalStartTs),
                 energyKcal: p.patch.energyKcal ?? before.energyKcal, avgHr: nil, maxHr: nil, strain: nil,
-                distanceM: p.patch.distanceM ?? before.distanceM, zonesJSON: nil, notes: nil)
+                distanceM: p.patch.distanceM ?? before.distanceM, zonesJSON: nil, notes: nil,
+                steps: nil)
             _ = try await store.upsertWorkouts([corrected], deviceId: cloudDeviceId)
 
             _ = try await store.deleteWorkouts(deviceId: p.deviceId, sport: p.sport, from: p.startTs, to: p.startTs)
@@ -347,7 +348,7 @@ enum CloudEditApplier {
             let row = WorkoutRow(startTs: p.startTs, endTs: p.endTs, sport: p.sport, source: "manual",
                                   durationS: Double(p.endTs - p.startTs), energyKcal: p.energyKcal,
                                   avgHr: nil, maxHr: nil, strain: nil, distanceM: p.distanceM,
-                                  zonesJSON: nil, notes: p.notes)
+                                  zonesJSON: nil, notes: p.notes, steps: nil)
             _ = try await store.upsertWorkouts([row], deviceId: cloudDeviceId)
             summary.applied += 1
             summary.touchedWorkouts = true
