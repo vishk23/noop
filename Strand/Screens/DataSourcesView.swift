@@ -472,6 +472,15 @@ struct DataSourcesView: View {
             } else if let last = CloudSyncModel.lastPersistedStatus {
                 Text("Last sync: \(last)").font(StrandFont.subhead).foregroundStyle(StrandPalette.textSecondary)
             }
+            // The question the status line above can't answer (it reports the last ATTEMPT, success
+            // or failure alike): when did the server last verifiably hold this device's current
+            // data? Shown whenever a sync has ever confirmed it, so a run of failed attempts reads
+            // as a failure line PLUS an aging "current as of", not as silence (2026-08-24: the
+            // mirror sat 23h stale with nothing on the phone saying so).
+            if let at = CloudSyncModel.lastUploadConfirmedAt {
+                Text("Cloud mirror current as of \(at.formatted(.relative(presentation: .named)))")
+                    .font(StrandFont.caption).foregroundStyle(StrandPalette.textTertiary)
+            }
         }
     }
     #endif // CLOUD_SYNC

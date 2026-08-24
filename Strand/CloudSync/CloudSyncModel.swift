@@ -19,17 +19,53 @@ import UIKit
 /// process-wide singleton shape here — `shared` is the one gate for the whole process.
 actor CloudSyncGate {
     static let shared = CloudSyncGate()
-    private var inFlight = false
 
-    /// Claims the gate if it's free. Returns false (and claims nothing) if a sync is already running.
-    func begin() -> Bool {
-        if inFlight { return false }
+    /// How long a hold may stand before `begin()` treats it as abandoned and reclaims it. A hold can
+    /// be abandoned for real: iOS can suspend the process mid-sync (a push-wake's background window
+    /// expiring, the user backgrounding a foreground sync with no strap connected to keep the
+    /// process alive), and the liters push is a synchronous FFI call whose network waits are not
+    /// bounded by URLSession's timeouts — a hang there parks `inFlight` forever in a process that
+    /// `bluetooth-central` keeps alive for days. Every later sync (launch catch-up, push, manual
+    /// tap) then bails "already in progress" with nothing anywhere saying why (2026-08-24: a
+    /// request_sync push produced no sync and left no evidence — this was one of the two candidate
+    /// causes, and was unfalsifiable precisely because nothing recorded the gate's state).
+    /// 30 minutes clears a wedged gate the same day while staying far above the longest legitimate
+    /// sync observed (a full ~390 MB snapshot upload).
+    static let staleHoldS: TimeInterval = 30 * 60
+
+    /// Diagnosis-only breadcrumb (same idiom as `CloudSyncAppDelegate.registrationBreadcrumbKey`):
+    /// when a stale hold was last reclaimed. A reclaim means a sync died without releasing —
+    /// worth a person's attention, and `NSLog` on an unattached phone goes nowhere readable.
+    static let reclaimBreadcrumbKey = "cloudsync.gate.lastReclaim"
+
+    private var inFlight = false
+    private var heldSince: TimeInterval = 0
+    /// Monotonic claim id. `end` requires the CURRENT claim so a sync whose hold was reclaimed
+    /// (it was presumed dead but later resumed) cannot release the gate out from under the sync
+    /// that legitimately holds it now.
+    private var currentClaim = 0
+
+    /// Claims the gate. Returns a claim token to pass to `end`, or nil if a sync is already running.
+    /// A hold older than `staleHoldS` is treated as abandoned and reclaimed (see its doc comment).
+    /// `now` is injectable for tests only.
+    func begin(now: TimeInterval = Date().timeIntervalSince1970) -> Int? {
+        if inFlight {
+            guard now - heldSince >= Self.staleHoldS else { return nil }
+            NSLog("CloudSyncGate: reclaiming a hold %.0fs old — a previous sync never released",
+                  now - heldSince)
+            UserDefaults.standard.set("reclaimed after \(Int(now - heldSince))s \(Date())",
+                                      forKey: Self.reclaimBreadcrumbKey)
+        }
         inFlight = true
-        return true
+        heldSince = now
+        currentClaim += 1
+        return currentClaim
     }
 
-    /// Releases the gate. Must be called exactly once for every `begin()` that returned true.
-    func end() {
+    /// Releases the gate. Must be called exactly once for every `begin()` that returned a claim.
+    /// A stale claim (the hold was reclaimed while this sync was presumed dead) is a no-op.
+    func end(_ claim: Int) {
+        guard claim == currentClaim else { return }
         inFlight = false
     }
 }
@@ -149,12 +185,12 @@ final class CloudSyncModel: ObservableObject {
     /// again and immediately see it as already held by the very call chain it's part of, bailing with
     /// "Sync already in progress" on every auto-sync).
     private func runGatedSync(repo: Repository, url: URL, token: String) async {
-        guard await CloudSyncGate.shared.begin() else {
+        guard let claim = await CloudSyncGate.shared.begin() else {
             statusText = "Sync already in progress"
             return
         }
         await performSync(repo: repo, url: url, token: token)
-        await CloudSyncGate.shared.end()
+        await CloudSyncGate.shared.end(claim)
     }
 
     /// The actual pull + upload work, gated by `runGatedSync` — never called directly. Byte-identical
@@ -256,6 +292,10 @@ final class CloudSyncModel: ObservableObject {
         statusText = line
         if succeeded {
             UserDefaults.standard.set(Date().timeIntervalSince1970, forKey: Self.lastAutoSyncKey)
+            // `succeeded` is only reached past the upload section, and every branch of it means the
+            // server verifiably holds this device's current content: bytes were shipped, liters
+            // verified "in sync", or the content token still matches the last delivered upload.
+            UserDefaults.standard.set(Date().timeIntervalSince1970, forKey: Self.lastUploadConfirmedAtKey)
         }
         Self.persistLastStatus(line)
         await repo.refresh()
@@ -303,6 +343,22 @@ final class CloudSyncModel: ObservableObject {
     /// auto-sync that ran on a throwaway `CloudSyncModel` instance (see `CloudSyncGate`'s doc comment)
     /// is still visible on the card's own instance, whose `statusText` never saw it happen.
     private static let lastStatusKey = "cloudsync.lastStatus"
+
+    /// UserDefaults key for the last moment this device VERIFIED the cloud mirror holds its current
+    /// content (an upload delivered, liters answered "in sync", or the content token matched the
+    /// last delivered upload — all three are server-current). Distinct from `lastStatusKey`, which
+    /// records the outcome LINE of the last attempt success or failure, and from `lastAutoSyncKey`,
+    /// which only paces the catch-up gates: neither answers the question VK actually asks of the
+    /// Data Sources card ("how stale is the mirror right now?" — 2026-08-24, when the mirror sat
+    /// 23h stale with nothing on the phone saying so).
+    static let lastUploadConfirmedAtKey = "cloudsync.lastUploadConfirmedAt"
+
+    /// When the cloud mirror was last verified current, or nil if no sync ever confirmed one.
+    /// A plain synchronous UserDefaults read on render, same rationale as `lastPersistedStatus`.
+    static var lastUploadConfirmedAt: Date? {
+        let t = UserDefaults.standard.double(forKey: lastUploadConfirmedAtKey)
+        return t > 0 ? Date(timeIntervalSince1970: t) : nil
+    }
 
     /// The last sync's outcome, formatted for display ("<line> · <short time>"), or nil if no sync
     /// has ever completed on this device. A plain synchronous UserDefaults read — deliberately not

@@ -400,12 +400,42 @@ struct TestCentreView: View {
                     .fixedSize(horizontal: false, vertical: true)
                     .textSelection(.enabled)
 
+                // The push lane's breadcrumbs (2026-08-24): registration (did APNs hand us a token
+                // and did the server accept it), receipt (did iOS ever DELIVER a push — the fact the
+                // server side cannot observe, since APNs answers 200 for zombie tokens too), and the
+                // gate reclaim (did a wedged sync silently block later ones). Until these were
+                // readable here, a request_sync that produced no sync was undiagnosable without a
+                // debugger attached to the phone.
+                Text(Self.pushLaneStatus)
+                    .font(StrandFont.caption).foregroundStyle(StrandPalette.textSecondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .textSelection(.enabled)
+
                 if replicationTrialEnabled, !SyncReplicationTrial.isInForce {
                     Text("Restart NOOP to start measuring.")
                         .font(StrandFont.caption).foregroundStyle(StrandPalette.statusWarning)
                 }
             }
         }
+    }
+
+    /// The push lane's three breadcrumbs, one per line, "none recorded" when a key was never
+    /// written — an absent line and an absent EVENT must not look alike. Plain synchronous
+    /// UserDefaults reads on render, same rationale as `SyncReplicationTrial.statusLine` above.
+    /// Registration/receipt are iOS-only facts (the APNs AppDelegate shim doesn't exist on macOS);
+    /// the gate breadcrumb is cross-platform.
+    private static var pushLaneStatus: String {
+        let d = UserDefaults.standard
+        var lines: [String] = []
+        #if os(iOS)
+        lines.append("push registration: "
+                     + (d.string(forKey: CloudSyncAppDelegate.registrationBreadcrumbKey) ?? "none recorded"))
+        lines.append("push receipt: "
+                     + (d.string(forKey: CloudSyncAppDelegate.receiptBreadcrumbKey) ?? "none recorded"))
+        #endif
+        lines.append("gate reclaim: "
+                     + (d.string(forKey: CloudSyncGate.reclaimBreadcrumbKey) ?? "none recorded"))
+        return lines.joined(separator: "\n")
     }
     #endif
 
